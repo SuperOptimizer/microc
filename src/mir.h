@@ -14,6 +14,9 @@
 #define MF_SXTW 4  /* indexed memory access: index is a sign-extended 32-bit value */
 #define MF_UXTW 8  /* indexed memory access: index is a zero-extended 32-bit value */
 #define MF_LO12 16 /* memory access: base holds the page of symbol sym + imm; add the offset within it */
+#define MF_TIED 0x40  /* two-address: d is written over s0 (x86), so s0's register is the place for d when s0 dies here */
+#define MF_COMMUT 0x08 /* with MF_TIED: s0 and s1 commute, so s1's register will do as well */
+#define MF_NOTS1 0x80 /* two-address, not commutative: d had better not get s1's register (it would take a copy of s1 first) */
 
 typedef struct MIns {
     u16 op;

@@ -84,6 +84,7 @@ typedef struct Tag {
 typedef struct Scope {
     Sym *syms;
     Tag *tags;
+    int dw; /* -g: a block of the function's body (dwarf_scope_open) */
 } Scope;
 
 typedef struct Expr {
@@ -661,12 +662,17 @@ static Sym *bind(Sym *s)
     return s;
 }
 
+static u32 dw_fn_level; /* -g: the level of the parameters of the function being defined, 0 none */
+
 static void push_scope(void)
 {
     if (++level >= MAX_SCOPES)
         error_at(tok.loc, "blocks nested too deeply");
     scopes[level].syms = 0;
     scopes[level].tags = 0;
+    scopes[level].dw = opt_debug && dw_fn_level && level > dw_fn_level && F == fn_func && !inl_on();
+    if (scopes[level].dw)
+        dwarf_scope_open(F->sym, tok.loc);
 }
 
 static void pop_scope(void)
@@ -683,6 +689,9 @@ static void pop_scope(void)
             if (l->local == level && l->name)
                 l->name = 0; /* a local label goes out of scope */
     }
+    if (scopes[level].dw)
+        dwarf_scope_close(tok.loc);
+    scopes[level].dw = 0;
     level--;
 }
 
@@ -1130,26 +1139,281 @@ static void mg_type(Buf *b, Type *t)
     mg_s(b, t->kind <= TY_LDOUBLE ? code[t->kind] : "u");
 }
 
-/* The symbol of a function with C++ linkage: its name, what a template was given, its parameters. */
-static u32 mg_func(u32 name, const char *targs, Type *ft)
-{
+/* ---- symbols of C++ functions as the Itanium C++ ABI writes them, which is what nvcc's kernel names are (so that nsys / ncu
+   profiles of an mcc build and an nvcc build name their kernels alike): a function template's instance has its template arguments
+   (a value with its type: Li4E, Ln3E, Lb1E), then its return type, then its parameters as the template declares them (T_, T0_
+   for its type parameters); top-level qualifiers of parameters are left out; every type that is not a builtin one (and the
+   template's name) is a candidate for substitution, written S_, S0_, S1_ ... where it comes again. In CUDA __half and
+   __nv_bfloat16 are classes (6__half, 13__nv_bfloat16). Left out: namespaces, member functions (mcc's names of its own). */
+#define TP_SENT 0x40000000UL /* a value parameter not yet known stands as this + its number */
+typedef struct Mgx {
     Buf b;
-    u32 k, id;
-    memset(&b, 0, sizeof b);
-    mg_s(&b, "_Z");
-    mg_u(&b, intern_len(name));
-    mg_s(&b, intern_str(name));
-    if (targs) {
-        mg_s(&b, "I");
-        mg_s(&b, targs);
-        mg_s(&b, "E");
+    char **sub; /* the candidates so far, each as written without substitutions */
+    u32 nsub, cap;
+} Mgx;
+
+static int mgx_builtin(Type *t)
+{
+    if (opt_cuda && (t->kind == TY_FLOAT16 || t->kind == TY_BF16))
+        return 0;
+    return t->kind <= TY_LDOUBLE;
+}
+
+static void mgx_code(Buf *b, Type *t)
+{
+    static const char *const code[] = {"v", "b", "c", "a", "h", "s", "t", "i", "j", "l", "m", "x", "y", "n", "o",
+                                       "DF16b", "DF16_", "f", "d", "e"};
+    mg_s(b, t->kind <= TY_LDOUBLE ? code[t->kind] : "i");
+}
+
+static void mgx_tparam(Buf *b, u64 k)
+{
+    mg_s(b, "T");
+    if (k)
+        mg_u(b, k - 1);
+    mg_s(b, "_");
+}
+
+static void mgx_lit(Buf *b, Type *vty, i64 v)
+{
+    mg_s(b, "L");
+    mgx_code(b, vty && vty->kind <= TY_LDOUBLE ? vty : ty_int);
+    if (vty && vty->kind == TY_BOOL)
+        v = v != 0;
+    if (v < 0) {
+        mg_s(b, "n");
+        mg_u(b, (u64)-v);
+    } else {
+        mg_u(b, (u64)v);
     }
-    for (k = 0; k < ft->nparams; k++)
-        mg_type(&b, ft->params[k]);
-    if (!ft->nparams)
-        mg_s(&b, "v");
-    id = intern((const char *)b.p, b.len);
-    buf_free(&b);
+    mg_s(b, "E");
+}
+
+static void mgx_type(Mgx *m, Type *t, int dropq);
+
+/* The plain spelling of a type (no substitutions): what candidates are compared by. */
+static void mgx_raw(Buf *b, Type *t, int dropq)
+{
+    Mgx tmp;
+    memset(&tmp, 0, sizeof tmp);
+    mgx_type(&tmp, t, dropq);
+    buf_put(b, tmp.b.p, tmp.b.len);
+    buf_free(&tmp.b);
+    while (tmp.nsub)
+        free(tmp.sub[--tmp.nsub]);
+    free(tmp.sub);
+}
+
+/* raw: a candidate written plainly; 1 and an S..._ written when it is one already */
+static int mgx_sub(Mgx *m, const char *raw, u32 len)
+{
+    u32 k;
+    char t[16];
+    if (!m->cap && !m->sub)
+        return 0;
+    for (k = 0; k < m->nsub; k++)
+        if (strlen(m->sub[k]) == len && memcmp(m->sub[k], raw, len) == 0)
+            break;
+    if (k == m->nsub)
+        return 0;
+    if (k == 0) {
+        mg_s(&m->b, "S_");
+        return 1;
+    }
+    {
+        u32 n = k - 1, i = 0, j;
+        char d[16];
+        do {
+            d[i++] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[n % 36];
+            n /= 36;
+        } while (n);
+        t[0] = 'S';
+        for (j = 0; j < i; j++)
+            t[1 + j] = d[i - 1 - j];
+        t[1 + i] = '_';
+        t[2 + i] = 0;
+    }
+    mg_s(&m->b, t);
+    return 1;
+}
+
+static void mgx_add(Mgx *m, const char *raw, u32 len)
+{
+    char *c;
+    if (!m->cap && !m->sub)
+        return; /* (a plain spelling: no candidates) */
+    if (m->nsub == m->cap) {
+        m->cap = m->cap * 2 + 8;
+        m->sub = (char **)xrealloc(m->sub, m->cap * sizeof(char *));
+    }
+    c = (char *)xmalloc(len + 1);
+    memcpy(c, raw, len);
+    c[len] = 0;
+    m->sub[m->nsub++] = c;
+}
+
+static void mgx_targs(Mgx *m, Tmpl *tm, const TArgs *a)
+{
+    u32 k;
+    mg_s(&m->b, "I");
+    for (k = 0; k < a->n; k++) {
+        if (a->a[k].ty)
+            mgx_type(m, a->a[k].ty, 0);
+        else
+            mgx_lit(&m->b, tm && k < tm->nparams && tm->params[k].vty ? unqual(tm->params[k].vty) : ty_int, a->a[k].val);
+    }
+    mg_s(&m->b, "E");
+}
+
+static void mgx_name(Mgx *m, u32 name)
+{
+    mg_u(&m->b, intern_len(name));
+    mg_s(&m->b, intern_str(name));
+}
+
+static void mgx_type(Mgx *m, Type *t, int dropq)
+{
+    int q = dropq ? 0 : t->quals & (Q_CONST | Q_VOLATILE), subs = m->sub != 0 || m->cap != 0;
+    Buf raw;
+    u32 k;
+    if (!q && mgx_builtin(t)) {
+        mgx_code(&m->b, t);
+        return;
+    }
+    memset(&raw, 0, sizeof raw);
+    if (subs) {
+        mgx_raw(&raw, t, dropq);
+        if (mgx_sub(m, (const char *)raw.p, raw.len)) {
+            buf_free(&raw);
+            return;
+        }
+    }
+    if (q) {
+        if (q & Q_VOLATILE)
+            mg_s(&m->b, "V");
+        if (q & Q_CONST)
+            mg_s(&m->b, "K");
+        mgx_type(m, t, 1);
+    } else {
+        switch (t->kind) {
+        case TY_PTR: mg_s(&m->b, "P"); mgx_type(m, t->base, 0); break;
+        case TY_REF: mg_s(&m->b, "R"); mgx_type(m, t->base, 0); break;
+        case TY_ARRAY:
+            mg_s(&m->b, "A");
+            mg_u(&m->b, t->len);
+            mg_s(&m->b, "_");
+            mgx_type(m, t->base, 0);
+            break;
+        case TY_TPARAM: mgx_tparam(&m->b, t->len); break;
+        case TY_FUNC:
+            mg_s(&m->b, "F");
+            mgx_type(m, t->base, 1);
+            for (k = 0; k < t->nparams; k++)
+                mgx_type(m, t->params[k], 1);
+            if (!t->nparams)
+                mg_s(&m->b, "v");
+            mg_s(&m->b, "E");
+            break;
+        case TY_FLOAT16: mg_s(&m->b, "6__half"); break;
+        case TY_BF16: mg_s(&m->b, "13__nv_bfloat16"); break;
+        case TY_STRUCT:
+        case TY_UNION: {
+            Type *c = t->canon ? t->canon : t;
+            if (c->vkind) {
+                mg_s(&m->b, c->vkind == 1 ? "Dv" : "C");
+                if (c->vkind == 1) {
+                    mg_u(&m->b, c->len);
+                    mg_s(&m->b, "_");
+                }
+                mgx_type(m, c->base, 0);
+            } else if (c->ctm && c->cti) {
+                Tmpl *tm = (Tmpl *)c->ctm;
+                Buf nb;
+                memset(&nb, 0, sizeof nb);
+                mg_u(&nb, intern_len(tm->name));
+                mg_s(&nb, intern_str(tm->name));
+                if (!(subs && mgx_sub(m, (const char *)nb.p, nb.len))) {
+                    buf_put(&m->b, nb.p, nb.len);
+                    if (subs)
+                        mgx_add(m, (const char *)nb.p, nb.len);
+                }
+                buf_free(&nb);
+                mgx_targs(m, tm, &((TInst *)c->cti)->args);
+            } else {
+                if (!c->tag && !c->lname) {
+                    static u32 seq;
+                    char tmp[32];
+                    sprintf(tmp, "__anon%u", seq++);
+                    c->lname = intern_cstr(tmp);
+                }
+                mgx_name(m, c->tag ? c->tag : c->lname);
+            }
+            break;
+        }
+        default: mgx_code(&m->b, t); break;
+        }
+    }
+    if (subs)
+        mgx_add(m, (const char *)raw.p, raw.len);
+    buf_free(&raw);
+}
+
+/* A function template's type as declared (T_ for its type parameters), when it can be had and fits the instance's. */
+static Type *tmpl_pattern(Tmpl *t);
+static int mgx_pat_ok(Type *p)
+{
+    for (; p; p = p->base) {
+        if (p->kind == TY_ARRAY && p->len >= TP_SENT)
+            return 0; /* (an array whose length is a value parameter: its Itanium spelling is an expression) */
+        if (p->kind == TY_FUNC) {
+            u32 k;
+            for (k = 0; k < p->nparams; k++)
+                if (!mgx_pat_ok(p->params[k]))
+                    return 0;
+        }
+        if (p->kind != TY_PTR && p->kind != TY_REF && p->kind != TY_ARRAY && p->kind != TY_FUNC)
+            break;
+    }
+    return 1;
+}
+
+/* The symbol of a function with C++ linkage: its name, then for a template's instance (tm, ti) its arguments and return type,
+   then its parameters. */
+static u32 mg_func(u32 name, Tmpl *tm, TInst *ti, Type *ft)
+{
+    Mgx m;
+    Type *sig = ft;
+    u32 k, id;
+    memset(&m, 0, sizeof m);
+    m.cap = 8;
+    m.sub = (char **)xmalloc(m.cap * sizeof(char *));
+    mg_s(&m.b, "_Z");
+    mgx_name(&m, name);
+    if (tm && ti) {
+        Type *p;
+        Buf nb;
+        memset(&nb, 0, sizeof nb);
+        mg_u(&nb, intern_len(name));
+        mg_s(&nb, intern_str(name));
+        mgx_add(&m, (const char *)nb.p, nb.len); /* the template's name */
+        buf_free(&nb);
+        mgx_targs(&m, tm, &ti->args);
+        p = tm->head && !tm->is_class ? tmpl_pattern(tm) : 0;
+        if (p && p->kind == TY_FUNC && p->nparams == ft->nparams && p->variadic == ft->variadic && mgx_pat_ok(p))
+            sig = p;
+        mgx_type(&m, sig->base, 1);
+    }
+    for (k = 0; k < sig->nparams; k++)
+        mgx_type(&m, sig->params[k], 1);
+    if (sig->variadic)
+        mg_s(&m.b, "z");
+    else if (!sig->nparams)
+        mg_s(&m.b, "v");
+    id = intern((const char *)m.b.p, m.b.len);
+    buf_free(&m.b);
+    while (m.nsub)
+        free(m.sub[--m.nsub]);
+    free(m.sub);
     return id;
 }
 
@@ -2901,6 +3165,27 @@ static void call(Expr *e)
         }
         set_expr(e, ty_void, 0, 0);
         return;
+    }
+    /* x86-64 host code: memcpy and memset (to 0) of a small constant size are block operations, as their builtins would be: the
+       memcpy(&bits, &x, 4) of a type pun then becomes a register move once the two locals are values (a call kept
+       both in memory, and cost a call: surfcomp's float_ulp, the f16 / volcomp bit readers) */
+    if (!flags && nargs == 3 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && F->ins[callee].op == OP_ADDR && !F->ins[callee].b && O->syms[F->ins[callee].a].name) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        u64 n, c0;
+        if (opt_target != TARGET_LINUX && cn[0] == '_')
+            cn++;
+        if (ir_is_const(F, args[2], &n) && n > 0 && n <= 64) {
+            if (strcmp(cn, "memcpy") == 0) {
+                emit_mem(OP_MEMCPY, args[0], args[1], n, 1);
+                set_expr(e, ret, args[0], 0);
+                return;
+            }
+            if (strcmp(cn, "memset") == 0 && ir_is_const(F, args[1], &c0) && (c0 & 255) == 0) {
+                emit_mem(OP_MEMZERO, args[0], 0, n, 1);
+                set_expr(e, ret, args[0], 0);
+                return;
+            }
+        }
     }
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
     v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? (vec_mem(ret) == M_V256 ? IT_V256 : IT_V128) : type_ir(ret), callee, args, nargs,
@@ -4913,6 +5198,8 @@ static Type *class_inst(Tmpl *t, TArgs *a)
     mg_s(&b, intern_str(ti->key));
     mg_s(&b, "E");
     ti->ty = type_record(t->rkind, intern((const char *)b.p, b.len));
+    ti->ty->ctm = t;
+    ti->ty->cti = ti;
     buf_free(&b);
     if (!t->toks)
         return ti->ty; /* declared only */
@@ -4951,7 +5238,6 @@ static Type *tmpl_class_use(Sym *s)
     return class_inst(s->tmpl, &a);
 }
 
-#define TP_SENT 0x40000000UL /* a value parameter not yet known stands as this + its number */
 /* A function template's type with its parameters left open. */
 static Type *tmpl_pattern(Tmpl *t)
 {
@@ -5059,7 +5345,7 @@ static Sym *fn_inst(Tmpl *t, TArgs *a)
     if (ty->kind != TY_FUNC)
         error_at(tok.loc, "template '%s' is not a function", intern_str(t->name));
     fn = new_sym(t->name, SK_VAR, ty);
-    fn->asmname = mg_func(t->name, intern_str(ti->key), ty);
+    fn->asmname = mg_func(t->name, t, ti, ty);
     fn->is_static = t->has_body;
     fn->is_cx = (u8)is_cx;
     fn->itm = t;
@@ -6476,7 +6762,7 @@ static void class_statics(void *cls, Type *base, int storage)
             at.flags |= dcl_attr.flags;
             decl_suffix(&at);
             s = new_sym(name, SK_VAR, ty);
-            s->asmname = mg_func(intern_cstr(nm), 0, ty);
+            s->asmname = mg_func(intern_cstr(nm), 0, 0, ty);
             s->is_static = 1;
             s->is_cx = (u8)is_cx;
             s->itm = cinst_t;
@@ -7893,7 +8179,7 @@ static Sym *declare_global(u32 name, Type *ty, int storage, u32 loc)
         s->is_static = storage == KW(KW_STATIC) || anon_ns > 0;
         s->c_link = extern_c > 0 || name == id_main || pp_in_system(loc);
         if (!s->c_link)
-            s->asmname = mg_func(name, 0, ty);
+            s->asmname = mg_func(name, 0, 0, ty);
         if (last)
             last->over = s;
         else
@@ -8208,6 +8494,8 @@ static void template_spec(void)
             mg_s(&b, intern_str(ti->key));
             mg_s(&b, "E");
             ti->ty = type_record(kind, intern((const char *)b.p, b.len));
+            ti->ty->ctm = t;
+            ti->ty->cti = ti;
             buf_free(&b);
         }
         ti->spec = 1;
@@ -8513,7 +8801,7 @@ static Sym *spec_or_inst(u32 name, Type *ty, int is_inline, u32 loc)
     ti = inst_find(t, &a, 1);
     if (!ti->fn) {
         fn = new_sym(name, SK_VAR, ty);
-        fn->asmname = mg_func(name, intern_str(ti->key), ty);
+        fn->asmname = mg_func(name, t, ti, ty);
         fn->is_static = (u8)(is_inline != 0);
         ti->fn = fn;
     }
@@ -10444,7 +10732,7 @@ static void cgoto_tree(u32 val, const u32 *blks, u32 lo, u32 hi)
 
 static void func_def(Sym *s, Type *ty, u32 loc)
 {
-    u32 i, v;
+    u32 i, v, dw_fn_save;
     Label *l;
 
     if (s->defined)
@@ -10484,6 +10772,8 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     break_blk = cont_blk = 0;
     cur_switch = 0;
     push_scope();
+    dw_fn_save = dw_fn_level;
+    dw_fn_level = level;
 
     /* K&R parameter declarations */
     while (ty->oldstyle && tok.kind != T_LBRACE) {
@@ -10598,6 +10888,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     expect(T_LBRACE);
     compound(0);
     pop_scope();
+    dw_fn_level = dw_fn_save;
 
     if (F->cur) {
         if (cur_ret->kind == TY_VOID || type_is_record(cur_ret) || type_is_128(cur_ret))

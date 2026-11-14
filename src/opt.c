@@ -1812,7 +1812,8 @@ static void run_passes(Func *fn)
 {
     int round;
     f = fn;
-    if (opt_cuda && !opt_nosplit) {
+    /* x86-64 too: records and arrays of a few scalars, and the locals of memcpy type puns, become values */
+    if ((opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1)) && !opt_nosplit) {
         opt_split(f);
         if (opt_slotcheck)
             slot_check(fn, "first split");

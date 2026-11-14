@@ -36,6 +36,9 @@ static int mixed;  /* x86-64: elements of different sizes, all in lanes of four 
 int opt_x64_sse41; /* x86-64: SSE4.1 may be used (pmulld, pmaxsd, ...); -msse4.1, -mavx2, -march=native ... */
 Obj *opt_obj;
 static u32 *base, *cnt, *map, *lpos;
+static u32 *ioff; /* an index or address (K_IDX, K_ADDR): the value from outside the loop added to the counter before it
+                     was widened (bit 31: taken away), as in a[i + k]; 0 if none */
+static u32 idx_off, walk_off; /* that of the index is_idx and the access walks found */
 static u32 L;
 static u32 iv;  /* the induction variable that indexes arrays, if any */
 static int ext; /* how the body widens it when it is 32 bits wide */
@@ -94,6 +97,7 @@ static int index_iv(u32 x, int ty)
 
 static int is_idx(u32 x, u32 *sh)
 {
+    idx_off = !INV(x) && kind[x] == K_IDX ? ioff[x] : 0;
     if (!INV(x) && kind[x] == K_IDX) {
         *sh = shift[x];
         return 1;
@@ -194,9 +198,11 @@ static int distinct(u32 a, u32 b)
 static int walks(u32 a, u32 size, u32 *key)
 {
     int k;
+    walk_off = 0;
     if (INV(a))
         return 0;
     if (kind[a] == K_ADDR) {
+        walk_off = ioff[a];
         *key = base[a];
         return size == (u32)1 << shift[a];
     }
@@ -391,10 +397,16 @@ static int vmath_of(u32 v)
 
 int opt_vec_report; /* say what was and was not vectorised */
 
+static u32 missv; /* the instruction being looked at, for the report */
 #define MISS(why) \
     do { \
-        if (opt_vec_report) \
-            fprintf(stderr, "%s: loop not vectorised: %s\n", f->name, why); \
+        if (opt_vec_report) { \
+            fprintf(stderr, "%s: loop not vectorised: %s", f->name, why); \
+            if (opt_vec_report > 1 && missv) \
+                fprintf(stderr, " [op %d ty %d; operands' ops %d %d]", f->ins[missv].op, f->ins[missv].ty, \
+                        f->ins[f->ins[missv].a].op, ir_opcount_tab[f->ins[missv].op] >= 2 && ir_opcount_tab[f->ins[missv].op] != 255 ? f->ins[f->ins[missv].b].op : -1); \
+            fputc('\n', stderr); \
+        } \
         return 0; \
     } while (0)
 
@@ -405,6 +417,7 @@ static int try_loop(u32 l, u32 n0)
     int red_op[MAX_RED];
     u32 keys[MAX_BASES], start[MAX_BASES], nkeys = 0, key, ivvec[MAX_IV];
     u8 stored[MAX_BASES], keysz[MAX_BASES], klsh[MAX_BASES];
+    u32 koff[MAX_BASES];
     u32 maxmem = 0, offn[4];
     u32 pa[MAX_PAIRS], pb[MAX_PAIRS], np = 0;
     u8 pka[MAX_PAIRS], pkb[MAX_PAIRS];
@@ -414,6 +427,7 @@ static int try_loop(u32 l, u32 n0)
     Ins *ci;
 
     L = l;
+    missv = 0;
     if (f->blk[l].term != TERM_BR || f->blk[l].succ[0] != l || f->blk[l].succ[1] == l || f->blk[l].npreds != 2)
         return 0;
     pl = f->blk[l].preds[0] == l ? 0 : 1;
@@ -434,6 +448,7 @@ static int try_loop(u32 l, u32 n0)
         cnt[v] = 0;
         kind[v] = K_NONE;
         mmk[v] = 0;
+        ioff[v] = 0;
         if (f->ins[v].op == OP_LOAD && f->ins[f->ins[v].a].blk != l && nlinv < MAX_LINV) {
             kind[v] = K_LINV;
             linv[nlinv++] = v;
@@ -457,8 +472,14 @@ static int try_loop(u32 l, u32 n0)
     for (v = f->blk[l].first; v; v = f->ins[v].next) {
         Ins *i = &f->ins[v];
         u32 *ops, nops;
-        if (i->op == OP_CALL && !vmath_of(v))
-            MISS("it calls a function");
+        if (i->op == OP_CALL && !vmath_of(v)) {
+            if (opt_vec_report && opt_obj && f->ins[i->c].op == OP_ADDR && !(i->flags & (IF_ASM | IF_ATOMIC | IF_ALLOCA)))
+                fprintf(stderr, "%s: loop not vectorised: it calls a function (%s)\n", f->name,
+                        intern_str(opt_obj->syms[f->ins[f->ins[v].c].a].name));
+            else
+                MISS("it calls a function");
+            return 0;
+        }
         IR_OPS(f, i, ops, nops);
         for (k = 0; k < nops; k++)
             if (!INV(ops[k]))
@@ -523,6 +544,27 @@ static int try_loop(u32 l, u32 n0)
     c = iv_index(t);
     if (c < 0)
         MISS("the loop test is not on a counter");
+    /* sext (i + k) and sext (i - k) that only index: the addition is folded into where the array starts */
+    for (v = f->blk[l].first; v; v = f->ins[v].next) {
+        Ins *i = &f->ins[v], *a = &f->ins[i->a];
+        if (i->op == OP_SEXT32 && !INV(i->a) && kind[i->a] == K_IVNEXT && a->ty == IT_I32 && a->op == OP_ADD && a->a == iv_phi[iv_index(i->a)]) {
+            base[v] = a->a; /* a[i + 1] where i + 1 is the counter's next value */
+            ioff[v] = a->b;
+            continue;
+        }
+        if (i->op != OP_SEXT32 || INV(i->a) || (a->op != OP_ADD && a->op != OP_SUB) || a->ty != IT_I32 || cnt[i->a] != 1)
+            continue;
+        if (!INV(a->a) && kind[a->a] == K_IVPHI && INV(a->b) && f->ins[a->b].ty == IT_I32) {
+            base[v] = a->a;
+            ioff[v] = a->b | (a->op == OP_SUB ? 0x80000000U : 0);
+        } else if (a->op == OP_ADD && !INV(a->b) && kind[a->b] == K_IVPHI && INV(a->a) && f->ins[a->a].ty == IT_I32) {
+            base[v] = a->b;
+            ioff[v] = a->a;
+        } else {
+            continue;
+        }
+        kind[i->a] = K_SKIP;
+    }
 
     lanesz = 0;
     mixed = 0;
@@ -532,6 +574,7 @@ static int try_loop(u32 l, u32 n0)
     ext = 0;
     for (v = f->blk[l].first; v; v = f->ins[v].next) {
         Ins *i = &f->ins[v];
+        missv = v;
         if (v == cond || kind[v] == K_IVNEXT || kind[v] == K_SKIP || kind[v] == K_LINV)
             continue;
         if (kind[v] == K_RED) {
@@ -544,6 +587,15 @@ static int try_loop(u32 l, u32 n0)
         switch (i->op) {
         case OP_SEXT32:
         case OP_ZEXT32:
+            if (ioff[v]) {
+                /* a[i + k]: signed, so i + k does not wrap, and widened it is i widened plus k widened */
+                if (!index_iv(base[v], IT_I32) || (ext && ext != i->op))
+                    MISS("an index of an unsupported kind");
+                ext = i->op;
+                kind[v] = K_IDX;
+                shift[v] = 0;
+                break;
+            }
             if (!index_iv(i->a, IT_I32) || (ext && ext != i->op))
                 MISS("an index of an unsupported kind");
             ext = i->op;
@@ -551,11 +603,20 @@ static int try_loop(u32 l, u32 n0)
             shift[v] = 0;
             break;
         case OP_SHL:
+            if (!INV(i->a) && kind[i->a] == K_ADDR && !shift[i->a] && !ioff[i->a] && f->ins[i->b].op == OP_CONST &&
+                f->ins[i->b].a <= 3 && f->ins[i->b].a) {
+                /* (i + k) << s with i + k 64 bits wide (size_t indexes): k folded into where the array starts */
+                kind[v] = K_IDX;
+                ioff[v] = base[i->a] | 0x40000000U;
+                shift[v] = (u8)f->ins[i->b].a;
+                break;
+            }
             if (!is_idx(i->a, &sh))
                 goto vshift;
             if (f->ins[i->b].op != OP_CONST || f->ins[i->b].b != 0 || f->ins[i->b].a + sh > 3)
                 MISS("an index of an unsupported kind");
             kind[v] = K_IDX;
+            ioff[v] = idx_off;
             shift[v] = (u8)(sh + f->ins[i->b].a);
             break;
         case OP_LOAD:
@@ -569,12 +630,13 @@ static int try_loop(u32 l, u32 n0)
             }
             if ((u32)mem_size(i->mem) > maxmem)
                 maxmem = (u32)mem_size(i->mem);
-            for (k = 0; k < nkeys && keys[k] != key; k++)
+            for (k = 0; k < nkeys && !(keys[k] == key && koff[k] == walk_off); k++)
                 ;
             if (k == nkeys) {
                 if (nkeys == MAX_BASES)
                     MISS("too many arrays");
                 stored[k] = 0;
+                koff[k] = walk_off;
                 keysz[nkeys] = (u8)mem_size(i->mem);
                 keys[nkeys++] = key;
             }
@@ -594,8 +656,20 @@ static int try_loop(u32 l, u32 n0)
                 MISS("too many values from outside the loop");
             break;
         case OP_ADD:
+            if (i->ty == IT_I64 && (INV(i->a) || INV(i->b))) {
+                u32 x = INV(i->a) ? i->b : i->a, y = INV(i->a) ? i->a : i->b;
+                if (!INV(x) && kind[x] == K_ADDR && !shift[x] && !ioff[x]) {
+                    /* p + (i + k), bytes: k folded into where the array starts */
+                    kind[v] = K_ADDR;
+                    shift[v] = 0;
+                    base[v] = y;
+                    ioff[v] = base[x] | 0x40000000U;
+                    break;
+                }
+            }
             if (i->ty == IT_I64 && ((INV(i->b) && is_idx(i->a, &sh)) || (INV(i->a) && is_idx(i->b, &sh)))) {
                 kind[v] = K_ADDR;
+                ioff[v] = idx_off;
                 shift[v] = (u8)sh;
                 base[v] = INV(i->b) ? i->b : i->a;
                 break;
@@ -847,6 +921,10 @@ static int try_loop(u32 l, u32 n0)
         if (INV(keys[k])) {
             q = iv_index(iv);
             v = f->ins[iv].ty == IT_I32 ? mk(P, ext, IT_I64, iv_init[q], 0) : iv_init[q];
+            if (koff[k] & 0x40000000U)
+                v = mk(P, OP_ADD, IT_I64, v, outside(koff[k] & 0x3fffffffU)); /* already 64 bits wide */
+            else if (koff[k])
+                v = mk(P, koff[k] >> 31 ? OP_SUB : OP_ADD, IT_I64, v, mk(P, OP_SEXT32, IT_I64, outside(koff[k] & 0x7fffffffU), 0));
             if (klsh[k])
                 v = mk(P, OP_SHL, IT_I64, v, C64(klsh[k]));
             start[k] = mk(P, OP_ADD, IT_I64, outside(keys[k]), v);
@@ -993,7 +1071,7 @@ static int try_loop(u32 l, u32 n0)
             } else if (in.op == OP_LOAD || in.op == OP_STORE) {
                 u32 off = offv;
                 walks(in.a, (u32)mem_size(in.mem), &key);
-                for (k = 0; keys[k] != key; k++)
+                for (k = 0; !(keys[k] == key && koff[k] == walk_off); k++)
                     ;
                 if (mixed && klsh[k] < 2) {
                     if (!offn[klsh[k]])
@@ -1106,10 +1184,11 @@ int opt_vectorise(Func *fn)
     kind = (u8 *)xmalloc((size_t)n0 * 3);
     shift = kind + n0;
     mmk = shift + n0;
-    base = (u32 *)xmalloc((size_t)n0 * 4 * sizeof(u32));
+    base = (u32 *)xmalloc((size_t)n0 * 5 * sizeof(u32));
     cnt = base + n0;
     map = cnt + n0;
     lpos = map + n0;
+    ioff = lpos + n0;
     for (b = 1; b < nblk; b++)
         if (f->blk[b].term == TERM_BR)
             done += try_loop(b, n0);

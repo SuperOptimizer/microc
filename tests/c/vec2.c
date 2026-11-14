@@ -117,6 +117,17 @@ static void droots(double *o, const double *a, int n) { int i; for (i = 0; i < n
 static unsigned long lr(const double *a, const float *b, int n)
 { int i; unsigned long s = 0; for (i = 0; i < n; i++) s = s * 3 + (unsigned long)lrint(a[i] * 2.5) + (unsigned long)lrintf(b[i] * 1.5f); return s; }
 
+/* a[i + k]: offsets folded into where each array starts; overlapping ones checked when the loop is entered */
+static void stencil(float *o, const float *a, int k, int n) { int i; for (i = 1; i < n; i++) o[i] = a[i - 1] * 0.25f + a[i + 1] * 0.5f + a[i + k]; }
+static void shiftw(int *o, const int *a, int k, int n) { int i; for (i = 0; i < n; i++) o[i + k] = a[i] * 3 - a[k + i]; }
+static void fwd(int *a, int n) { int i; for (i = 0; i < n; i++) a[i] = a[i + 1] + 1; }
+static void rec(int *a, int n) { int i; for (i = 0; i < n; i++) a[i + 4] = a[i] + 1; }
+static void rec2(int *a, int k, int n) { int i; for (i = 0; i < n; i++) a[i + k] = a[i] * 2 + 1; }
+
+static void plane(float *o, const float *a, unsigned long z, unsigned long m, unsigned long n)
+{ unsigned long j; for (j = 0; j < n; j++) o[z * m + j] += 0.5f * a[(z + 1) * m + j] - a[j + 3]; }
+static void bplane(unsigned char *o, const unsigned char *a, long z, long n) { long j; for (j = 0; j < n; j++) o[z + j] = (unsigned char)(a[j + z * 2] + 1); }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -173,6 +184,10 @@ int main(void)
                bsumw(ua, ub, n));
         for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 41) * 0.7f - 13.f; da[i] = (double)((i * 11) % 23) * 0.9 - 9.0; }
         roots(fc, fa, n); droots(db, da, n);
+        stencil(fb, fa, 3, n); shiftw(ib, ia, 5, n); fwd(ia, n); rec(ia + 2, n); rec2(ib, 2, n / 2); rec2(ib + 40, 9, n / 2);
+        plane(fb, fa, 1, 20, (unsigned long)n / 3); plane(fc, fb, 0, 9, (unsigned long)n / 2); bplane(ua, ub, 3, n / 2); bplane(ub, ub, 1, n / 3);
+        printf("   %lx %lx %lx %lx %lx\n", check(fb, sizeof fb), check(ia, sizeof ia), check(ib, sizeof ib), check(fc, sizeof fc),
+               check(ua, sizeof ua) ^ check(ub, sizeof ub));
         printf("   %lx %lx %lu\n", check(fc, sizeof fc), check(db, sizeof db), lr(da, fa, n));
         printf("   %d %u %d %d %d %d %ld %g %g %lx\n", imx(ia, n), umn(qa, n), busum(ua, n), bssum(sa, n), wusum(wa, n), hssum(ha, n),
                lsum2(la, n), (double)fsum(fa, n), dsum(da, n), check(fb, sizeof fb));

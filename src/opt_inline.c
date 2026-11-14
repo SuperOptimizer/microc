@@ -335,7 +335,7 @@ static u32 map_value(u32 yv)
         vmap[yv] = ir_slot_addr(f, smap[i->a], (i32)i->b);
         break;
     default:
-        die("internal: inlining met an unmapped value");
+        die("internal: inlining met an unmapped value (op %d, v%u)", i->op, yv);
     }
     return vmap[yv];
 }
@@ -458,6 +458,7 @@ static u32 inline_one(u32 b, u32 v)
         for (k = 0; k < ybb->npreds; k++)
             ir_add_pred(f, nb, bmap[ybb->preds[k]]);
         f->blk[nb].term = ybb->term;
+        f->blk[nb].nounroll = ybb->nounroll;
         if (ybb->term == TERM_RET) {
             rets[nrets] = nb;
             retvals[nrets++] = ybb->arg ? map_value(ybb->arg) : 0;

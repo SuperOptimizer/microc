@@ -412,8 +412,14 @@ static int grabbing;
 #define UNROLL_AUTO_N 32      /* a loop unrolled unasked runs at most this often */
 #define UNROLL_AUTO_SIZE 1200 /* and is at most this many tokens when unrolled */
 #define UNROLL_AUTO_INS 600   /* and this many instructions, as the body is first read */
+/* host code at -O3: loops of a few trips (for d < 3 over coordinates), so the loop around them is one block the
+   vectoriser takes, and the counter is a constant in each copy */
+#define UNROLL_HOST_N 8
+#define UNROLL_HOST_INS 160
 static u32 au_n;
 static u32 auto_n; /* loops unrolled unasked so far (debugging: MCC_AUTOMAX, MCC_AUTOLOG) */
+static Sym *unroll_probe; /* C: the counter read as its constant while an unasked unroll reads the condition (C++ reads every
+                             constant variable so) */
 static u32 unroll_req; /* the for statement that follows was asked to be unrolled: so many times at most */
 static u32 id_mcc_unroll;
 
@@ -5683,6 +5689,10 @@ static void primary(Expr *e)
     case SK_TYPEDEF:
         error_at(loc, "unexpected type name '%s'", intern_str(s->name));
     }
+    if (s == unroll_probe && s->cv == 1) {
+        set_int(e, s->ty, (u64)s->val);
+        return;
+    }
     if (s->local) {
         u32 addr = ir_slot_addr(F, s->slot, 0);
         if (s->byref)
@@ -9795,7 +9805,7 @@ static void statement(void)
         /* the condition guards the loop and is tested again after each step */
         u32 ur = unroll_req > 1 && !opt_nounroll ? unroll_req : 0;
         /* device code: a short loop that counts to a constant is unrolled unasked, as nvcc does */
-        int au = !ur && !unroll_req && cur_fn_dev && !opt_nounroll && !opt_size && !opt_noauto && au_n++ < opt_aumax;
+        int au = !ur && !unroll_req && (cur_fn_dev || opt_level >= 3) && !opt_nounroll && !opt_size && !opt_noauto && au_n++ < opt_aumax;
         u32 for_loc = tok.loc;
         u32 body = ur || au ? 0 : ir_new_block(F), step = ur || au ? 0 : ir_new_block(F), end = ur || au ? 0 : ir_new_block(F), n = 0, depth = 0, test = 0;
         Token *ct = 0;
@@ -9849,12 +9859,14 @@ static void statement(void)
                 i64 v = uval;
                 u32 k, keep = F->cur;
                 F->cur = ir_new_block(F); /* what reading the condition writes is never run */
-                for (k = 0; k <= UNROLL_AUTO_N; k++) {
+                for (k = 0; k <= (cur_fn_dev ? UNROLL_AUTO_N : UNROLL_HOST_N); k++) {
                     v = unroll_fit(uv->ty, v);
                     uv->cv = 1;
                     uv->val = v;
                     replay(ctk, cn);
+                    unroll_probe = uv;
                     expr(&e);
+                    unroll_probe = 0;
                     rvalue(&e);
                     c = to_bool(&e);
                     expect(T_SEMI);
@@ -9877,7 +9889,7 @@ static void statement(void)
                             break_level = s_bl;
                             cont_level = s_cl;
                             grown = F->nins - n0;
-                            if ((u64)grown * k <= UNROLL_AUTO_INS) {
+                            if ((u64)grown * k <= (cur_fn_dev ? UNROLL_AUTO_INS : UNROLL_HOST_INS)) {
                                 auto_n++;
                                 ur = k + 1;
                                 if (opt_autolog)
@@ -9902,7 +9914,9 @@ static void statement(void)
                 uv->cv = (u8)(ur != 0);
                 uv->val = uval;
                 replay(ctk, cn);
+                unroll_probe = uv;
                 expr(&e);
+                unroll_probe = 0;
                 rvalue(&e);
                 c = to_bool(&e);
                 expect(T_SEMI);
@@ -10974,3 +10988,4 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
         dwarf_finish(O);
     ir_loc = 0;
 }
+

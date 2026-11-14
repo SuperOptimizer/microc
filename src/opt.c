@@ -749,6 +749,41 @@ static int cheap_block(u32 b)
     return 1;
 }
 
+/* -O3: the two arms of the branch at the end of b (each reached only from b) start with the same computation, as
+   (c ? a[i] : 1 - a[i]) reads a[i] in both: it moves up into b, once. What moves is an instruction at the start of
+   the first arm that the second computes from the same values before it stores or calls anything, so both paths
+   did it at that point anyway (a load included). The arms then are often cheap enough to become selects. */
+static int hoist_arms(u32 b)
+{
+    u32 t = f->blk[b].succ[0], e = f->blk[b].succ[1], x, y, k, n = 0;
+    if (t == e || t == b || e == b || f->blk[t].npreds != 1 || f->blk[e].npreds != 1 || f->blk[t].phis || f->blk[e].phis)
+        return 0;
+    while ((x = f->blk[t].first) != 0 && n < 16) {
+        Ins *xi = &f->ins[x];
+        u32 nx = ir_opcount(f, x);
+        if (!(is_pure(xi->op) || xi->op == OP_SELECT || xi->op == OP_LOAD) || nx > 3)
+            break;
+        for (y = f->blk[e].first; y; y = f->ins[y].next) {
+            Ins *yi = &f->ins[y];
+            if (yi->op == OP_STORE || yi->op == OP_CALL || yi->op == OP_XI || !(is_pure(yi->op) || yi->op == OP_SELECT || yi->op == OP_LOAD))
+                break; /* (a load past this may see another value) */
+            if (yi->op != xi->op || yi->ty != xi->ty || yi->mem != xi->mem || yi->flags != xi->flags)
+                continue;
+            for (k = 0; k < nx && ir_resolve(f, *ir_opref(f, x, k)) == ir_resolve(f, *ir_opref(f, y, k)); k++)
+                ;
+            if (k == nx)
+                break;
+        }
+        if (!y || f->ins[y].op != xi->op)
+            break;
+        ir_remove(f, x);
+        ir_append(f, b, x);
+        ir_replace(f, y, x);
+        n++;
+    }
+    return n != 0;
+}
+
 /* Is what block b computes before its branch little, and safe to compute when the branch is not reached? */
 static int chain_block(u32 b)
 {
@@ -998,6 +1033,10 @@ static int simplify_cfg(void)
             }
             /* if-conversion: a branch around nothing, or to two empty arms,
                that only chooses values for phis becomes selects */
+            if (bb->term == TERM_BR && bb->succ[0] != bb->succ[1] && opt_level >= 3 && !opt_size && !opt_dev_fn && hoist_arms(b)) {
+                bb = &f->blk[b];
+                changed = 1;
+            }
             if (bb->term == TERM_BR && bb->succ[0] != bb->succ[1]) {
                 u32 t = bb->succ[0], e = bb->succ[1], j = 0, pt, pe, nphi = 0;
                 Block *tb = &f->blk[t], *eb = &f->blk[e];

@@ -343,6 +343,17 @@ void dwarf_where(u32 loc, u32 *file, u32 *line, u32 *col)
     *file = dwarf_file(name);
 }
 
+/* the source line of loc (an inlined body's own line), 0 if none: for reports */
+u32 dwarf_line_of(u32 loc)
+{
+    const char *name = 0;
+    u32 inst, line = 0, col;
+    if (!loc)
+        return 0;
+    loc_line(real_loc(loc, &inst), &name, &line, &col);
+    return line;
+}
+
 void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const DwCfi *cf, u32 ncf, u32 prologue_end)
 {
     DwFn *fn;

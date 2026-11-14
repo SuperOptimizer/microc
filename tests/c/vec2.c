@@ -152,6 +152,12 @@ static void tb2(int *o, const int *p, int s, int a, int b) { int i; for (i = s; 
 static void tb3(unsigned *o, const unsigned *p, unsigned s, unsigned a, unsigned b) { unsigned i; for (i = s; i < a && i < b; i++) o[i] = p[i] ^ 0x5au; }
 static void tb4(float *o, const float *p, long s, long a, long b) { long i; for (i = s; i < a && i < b; i++) o[i] = p[i] * 2.f - 1.f; }
 
+/* a choice fixed for the loop; the same read in both arms; reads of fixed places; a short inner loop unrolled */
+static void isel(float *w, const float *q, int cn, int n) { int i; const int bz = cn >> 2, bx = cn & 1; for (i = 0; i < n; i++) w[i] = (bz ? q[i] : 1 - q[i]) * (bx ? q[i + 1] : 2 - q[i + 1]); }
+static void isel64(double *w, const double *q, long c, int n) { int i; for (i = 0; i < n; i++) w[i] = c ? q[i] * 2 : q[i] - 1; }
+static void linv8(float *o, const float *m, const float *a, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] * m[0] + m[1] - a[i] * m[2] + m[3] * m[4] - m[5] + m[6] * a[i] + m[7]; }
+static void u3(float *U, const float *A, const float *w, int n, float c) { int i, d; for (i = 0; i < n; i++) for (d = 0; d < 3; d++) U[d * 39 + i] = c + A[d * 3] * w[i] + A[d * 3 + 1]; }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -228,6 +234,10 @@ int main(void)
         tb4(fc, fa, 1, (long)n, (long)n * 2 / 3); tb4(fb, fc, -0L + 2, -5L, (long)n);
         printf("   %lx %lx %lx %lx\n", check(ua, sizeof ua) ^ check(ub, sizeof ub), check(ia, sizeof ia) ^ check(ib, sizeof ib),
                check(qa, sizeof qa) ^ check(qb, sizeof qb), check(fb, sizeof fb) ^ check(fc, sizeof fc));
+        isel(fc, fa, 5, n); isel(fb, fa, 2, n); isel64(db, da, n & 1, n); isel64(da, db, (long)n << 33, n);
+        linv8(fc, fb, fa, n); linv8(fb + 3, fb, fa, n / 2); linv8(fa, fa + n / 2, fb, n);
+        u3(fb, fa, fc, n / 2, 0.5f); u3(fa, fa + 1, fb, n / 3, -1.f);
+        printf("   %lx %lx %lx %lx\n", check(fa, sizeof fa), check(fb, sizeof fb), check(fc, sizeof fc), check(da, sizeof da) ^ check(db, sizeof db));
     }
     return 0;
 }

@@ -430,6 +430,8 @@ u32 dwarf_file(const char *name);      /* its index in the unit's table of files
 const char *dwarf_file_name(u32 k);
 u32 dwarf_nfiles(void);
 void dwarf_where(u32 loc, u32 *file, u32 *line, u32 *col);
+u32 dwarf_inline(u32 callee, u32 call_loc);  /* an inlined call of callee (1 + its number) */
+u32 dwarf_inline_loc(u32 inst, u32 loc);     /* the location of code at loc copied into inlined call inst */
 /* a function's code is final: size bytes; the source location from off[k] on is loc[k]; its frame changes */
 void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const DwCfi *cf, u32 ncf, u32 prologue_end);
 void dwarf_finish(Obj *o); /* the unit's sections */

@@ -23,7 +23,29 @@ typedef struct DwFile {
 
 typedef struct DwRow {
     u32 off, file, line, col;
+    u32 inst; /* the inlined call it is part of (1 + DwInl), 0 if none */
 } DwRow;
+
+/* An inlined call: the function called, and where the call was (itself perhaps in another inlined call). Code
+   copied from an inlined body gets locations of its own above VLOC0, each one a location in the body and the
+   call it was copied into, so that the line table and the inlined calls can both be found from it. */
+#define VLOC0 0xe0000000U
+typedef struct DwInl {
+    u32 callee, call_loc;
+} DwInl;
+typedef struct DwVloc {
+    u32 loc, inst; /* a real location; 1 + DwInl */
+} DwVloc;
+
+typedef struct DwUse {
+    u32 fn;     /* index of the function */
+    u32 inst;   /* 1 + DwInl */
+    u32 parent; /* the inlined call it is inside, 0 for the function itself */
+    u32 rng;    /* offset of its list in .debug_rnglists */
+} DwUse;
+
+static DwUse *uses;
+static u32 nuses, capuses;
 
 typedef struct DwFn {
     u32 sym, size;
@@ -68,6 +90,11 @@ static u32 nvars, capvars;
 static DwPlace *places;
 static u32 nplaces, capplaces;
 static const char *unit_path;
+static DwInl *inls;
+static u32 ninls, capinls;
+static DwVloc *vlocs;
+static u32 nvlocs, capvlocs;
+static u32 *ihash, capihash, *vhash, capvhash; /* memo: (callee, call) -> inlined call; (loc, call) -> location */
 static char *cwd;
 
 static void *grow(void *p, u32 *cap, u32 need, size_t size)
@@ -83,7 +110,11 @@ static void *grow(void *p, u32 *cap, u32 need, size_t size)
    rows use (some readers do not take file 0 in rows). */
 void dwarf_reset(const char *path)
 {
-    nfiles = nrows = ncfis = nfns = nvars = nplaces = 0;
+    nfiles = nrows = ncfis = nfns = nvars = nplaces = ninls = nvlocs = 0;
+    if (capihash)
+        memset(ihash, 0, capihash * sizeof(u32));
+    if (capvhash)
+        memset(vhash, 0, capvhash * sizeof(u32));
     last_file = 0;
     unit_path = path;
     if (nfloc) {
@@ -225,10 +256,90 @@ u32 dwarf_nfiles(void)
 }
 
 /* where: file index, line, column */
+static u32 mix(u32 a, u32 b)
+{
+    u32 h = a * 0x9e3779b1U ^ b * 0x85ebca6bU;
+    return h ^ h >> 16;
+}
+
+/* the inlined call of callee at call_loc (1 + its index), made when new */
+u32 dwarf_inline(u32 callee, u32 call_loc)
+{
+    u32 h, n;
+    if (2 * (ninls + 1) > capihash) {
+        u32 j;
+        capihash = capihash ? capihash * 2 : 256;
+        ihash = (u32 *)xrealloc(ihash, capihash * sizeof(u32));
+        memset(ihash, 0, capihash * sizeof(u32));
+        for (j = 0; j < ninls; j++) {
+            for (h = mix(inls[j].callee, inls[j].call_loc) & (capihash - 1); ihash[h]; h = (h + 1) & (capihash - 1))
+                ;
+            ihash[h] = j + 1;
+        }
+    }
+    for (h = mix(callee, call_loc) & (capihash - 1); (n = ihash[h]) != 0; h = (h + 1) & (capihash - 1))
+        if (inls[n - 1].callee == callee && inls[n - 1].call_loc == call_loc)
+            return n;
+    inls = (DwInl *)grow(inls, &capinls, ninls + 1, sizeof(DwInl));
+    inls[ninls].callee = callee;
+    inls[ninls].call_loc = call_loc;
+    ihash[h] = ninls + 1;
+    return ++ninls;
+}
+
+static u32 vloc_of(u32 loc, u32 inst)
+{
+    u32 h, n;
+    if (2 * (nvlocs + 1) > capvhash) {
+        u32 j;
+        capvhash = capvhash ? capvhash * 2 : 1024;
+        vhash = (u32 *)xrealloc(vhash, capvhash * sizeof(u32));
+        memset(vhash, 0, capvhash * sizeof(u32));
+        for (j = 0; j < nvlocs; j++) {
+            for (h = mix(vlocs[j].loc, vlocs[j].inst) & (capvhash - 1); vhash[h]; h = (h + 1) & (capvhash - 1))
+                ;
+            vhash[h] = j + 1;
+        }
+    }
+    for (h = mix(loc, inst) & (capvhash - 1); (n = vhash[h]) != 0; h = (h + 1) & (capvhash - 1))
+        if (vlocs[n - 1].loc == loc && vlocs[n - 1].inst == inst)
+            return VLOC0 + n - 1;
+    if (VLOC0 + nvlocs == 0xffffffffU)
+        return loc; /* (out of numbers: the location without the call) */
+    vlocs = (DwVloc *)grow(vlocs, &capvlocs, nvlocs + 1, sizeof(DwVloc));
+    vlocs[nvlocs].loc = loc;
+    vlocs[nvlocs].inst = inst;
+    vhash[h] = nvlocs + 1;
+    return VLOC0 + nvlocs++;
+}
+
+/* The location of code at loc in a body that is copied into inlined call inst. Code of the body that came from
+   calls inlined into it goes with copies of those calls, made inside inst. */
+u32 dwarf_inline_loc(u32 inst, u32 loc)
+{
+    DwVloc v;
+    if (!loc || !inst)
+        return loc;
+    if (loc < VLOC0)
+        return vloc_of(loc, inst);
+    v = vlocs[loc - VLOC0];
+    return vloc_of(v.loc, dwarf_inline(inls[v.inst - 1].callee, dwarf_inline_loc(inst, inls[v.inst - 1].call_loc)));
+}
+
+static u32 real_loc(u32 loc, u32 *inst)
+{
+    *inst = 0;
+    if (loc < VLOC0 || loc - VLOC0 >= nvlocs)
+        return loc;
+    *inst = vlocs[loc - VLOC0].inst;
+    return vlocs[loc - VLOC0].loc;
+}
+
 void dwarf_where(u32 loc, u32 *file, u32 *line, u32 *col)
 {
     const char *name;
-    loc_line(loc, &name, line, col);
+    u32 inst;
+    loc_line(real_loc(loc, &inst), &name, line, col);
     *file = dwarf_file(name);
 }
 
@@ -253,13 +364,14 @@ void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const 
             continue;
         r.off = off[k];
         dwarf_where(loc[k], &r.file, &r.line, &r.col);
+        real_loc(loc[k], &r.inst);
         if (nrows > fn->row0) {
             DwRow *p = &rows[nrows - 1];
             if (p->off == r.off) { /* the code between went away (a jump to the next instruction) */
                 *p = r;
                 continue;
             }
-            if (p->file == r.file && p->line == r.line && p->col == r.col)
+            if (p->file == r.file && p->line == r.line && p->col == r.col && p->inst == r.inst)
                 continue;
         }
         rows = (DwRow *)grow(rows, &caprows, nrows + 1, sizeof(DwRow));
@@ -436,14 +548,17 @@ static void line_program(void)
 enum {
     AB_CU = 1, AB_FN, AB_FN_EXT, AB_PARAM, AB_PARAM_LIST, AB_VAR, AB_VAR_LIST, AB_PARAM_NONE, AB_VAR_NONE,
     AB_BASE, AB_PTR, AB_REF, AB_STRUCT, AB_STRUCT_ANON, AB_UNION, AB_UNION_ANON, AB_STRUCT_DECL, AB_UNION_DECL,
-    AB_MEMBER, AB_MEMBER_BITS, AB_MEMBER_ANON, AB_ARRAY, AB_SUBRANGE, AB_SUBRANGE_OPEN, AB_FNTYPE, AB_VOID
+    AB_MEMBER, AB_MEMBER_BITS, AB_MEMBER_ANON, AB_ARRAY, AB_SUBRANGE, AB_SUBRANGE_OPEN, AB_FNTYPE, AB_VOID,
+    AB_INLINED, AB_ABSTRACT
 };
 
 enum {
     DW_TAG_array_type = 0x01, DW_TAG_formal_parameter = 0x05, DW_TAG_member = 0x0d, DW_TAG_pointer_type = 0x0f,
     DW_TAG_reference_type = 0x10, DW_TAG_structure_type = 0x13, DW_TAG_subroutine_type = 0x15,
     DW_TAG_union_type = 0x17, DW_TAG_subrange_type = 0x21, DW_TAG_base_type = 0x24, DW_TAG_variable = 0x34,
-    DW_TAG_unspecified_type = 0x3b,
+    DW_TAG_unspecified_type = 0x3b, DW_TAG_inlined_subroutine = 0x1d,
+    DW_AT_inline = 0x20, DW_AT_abstract_origin = 0x31, DW_AT_call_column = 0x57, DW_AT_call_file = 0x58,
+    DW_AT_call_line = 0x59,
     DW_AT_location = 0x02, DW_AT_byte_size = 0x0b, DW_AT_bit_size = 0x0d, DW_AT_prototyped = 0x27,
     DW_AT_count = 0x37, DW_AT_data_member_location = 0x38, DW_AT_declaration = 0x3c, DW_AT_encoding = 0x3e,
     DW_AT_type = 0x49, DW_AT_data_bit_offset = 0x6b,
@@ -495,6 +610,10 @@ static void abbrevs(void)
     static const u32 none[] = {0};
     static const u32 fnty[] = {DW_AT_type, DW_FORM_ref4, DW_AT_prototyped, DW_FORM_flag_present, 0};
     static const u32 named[] = {DW_AT_name, DW_FORM_string, 0};
+    static const u32 inlined[] = {DW_AT_abstract_origin, DW_FORM_ref4, DW_AT_call_file, DW_FORM_udata, DW_AT_call_line,
+                                  DW_FORM_udata, DW_AT_call_column, DW_FORM_udata, DW_AT_ranges, DW_FORM_sec_offset, 0};
+    static const u32 abstract[] = {DW_AT_name, DW_FORM_string, DW_AT_decl_file, DW_FORM_udata, DW_AT_decl_line,
+                                   DW_FORM_udata, DW_AT_inline, DW_FORM_data1, 0};
     Buf *b = sec(s_abbrev);
     abbrev(b, AB_CU, DW_TAG_compile_unit, 1, cu);
     abbrev(b, AB_FN, DW_TAG_subprogram, 1, fn);
@@ -522,6 +641,8 @@ static void abbrevs(void)
     abbrev(b, AB_SUBRANGE_OPEN, DW_TAG_subrange_type, 0, none);
     abbrev(b, AB_FNTYPE, DW_TAG_subroutine_type, 0, fnty);
     abbrev(b, AB_VOID, DW_TAG_unspecified_type, 0, named);
+    abbrev(b, AB_INLINED, DW_TAG_inlined_subroutine, 1, inlined);
+    abbrev(b, AB_ABSTRACT, DW_TAG_subprogram, 0, abstract);
     buf_u8(b, 0);
 }
 
@@ -643,6 +764,19 @@ static void type_die(u32 id)
     Buf *b = sec(s_info);
     Field *fl;
     k->die = (u32)b->len;
+    if (k->kind == 0xfe) {
+        /* a function as inlined calls refer to it */
+        ObjSym *s = &O->syms[k->a];
+        u32 l = k->a < nfloc ? floc[k->a] : 0, file = 0, line = 0, col;
+        if (l)
+            dwarf_where(l, &file, &line, &col);
+        buf_uleb(b, AB_ABSTRACT);
+        str(b, s->name ? intern_str(s->name) : "?");
+        buf_uleb(b, file);
+        buf_uleb(b, line);
+        buf_u8(b, 1); /* DW_INL_inlined */
+        return;
+    }
     if (k->kind == TY_VOID) {
         buf_uleb(b, AB_VOID);
         str(b, "void");
@@ -740,6 +874,36 @@ static void type_die(u32 id)
 
 static u32 loclists_at(DwVar *v); /* where the variable's list of places is */
 
+/* the inlined calls in function fn that are directly inside parent (0: the function itself) */
+static void inlined_dies(u32 fn, u32 parent)
+{
+    u32 i;
+    for (i = 0; i < nuses; i++) {
+        DwUse *u = &uses[i];
+        DwType key;
+        u32 id, file, line, col, real, dummy;
+        Buf *b;
+        if (u->fn != fn || u->parent != parent)
+            continue;
+        memset(&key, 0, sizeof key);
+        key.kind = 0xfe;
+        key.a = inls[u->inst - 1].callee;
+        id = type_find(&key);
+        real = real_loc(inls[u->inst - 1].call_loc, &dummy);
+        dwarf_where(real, &file, &line, &col);
+        b = sec(s_info);
+        buf_uleb(b, AB_INLINED);
+        tref(id);
+        b = sec(s_info);
+        buf_uleb(b, file);
+        buf_uleb(b, line);
+        buf_uleb(b, col);
+        reloc_here(s_info, R_ABS32, y_rng, u->rng, 4);
+        inlined_dies(fn, u->inst);
+        buf_u8(sec(s_info), 0);
+    }
+}
+
 static void var_die(DwVar *v)
 {
     Buf *b = sec(s_info);
@@ -765,6 +929,81 @@ static void var_die(DwVar *v)
     }
 }
 
+/* ---- inlined calls ---- */
+
+
+static u32 inl_parent(u32 inst)
+{
+    u32 p;
+    real_loc(inls[inst - 1].call_loc, &p);
+    return p;
+}
+
+/* For each function, the inlined calls whose code is in it, and where (from the rows of its line table); their
+   lists of ranges go into .debug_rnglists. */
+static void inline_ranges(void)
+{
+    u32 k, r, *last_use, *rs, *re, *ru, nr, capr = 0;
+    nuses = 0;
+    if (!ninls)
+        return;
+    last_use = (u32 *)xmalloc((ninls + 1) * sizeof(u32)); /* by inlined call: 1 + its DwUse in this function */
+    memset(last_use, 0, (ninls + 1) * sizeof(u32));
+    rs = re = ru = 0;
+    for (k = 0; k < nfns; k++) {
+        DwFn *fn = &fns[k];
+        u32 first = nuses, i, j;
+        nr = 0;
+        for (r = fn->row0; r < fn->row0 + fn->nrows; r++) {
+            u32 c, end = r + 1 < fn->row0 + fn->nrows ? rows[r + 1].off : fn->size;
+            for (c = rows[r].inst; c; c = inl_parent(c)) {
+                if (!last_use[c]) {
+                    uses = (DwUse *)grow(uses, &capuses, nuses + 1, sizeof(DwUse));
+                    uses[nuses].fn = k;
+                    uses[nuses].inst = c;
+                    uses[nuses].parent = inl_parent(c);
+                    last_use[c] = ++nuses;
+                }
+                /* a range of it: joined to the one before when they meet */
+                for (i = nr; i > 0 && ru[i - 1] != last_use[c] - 1; i--)
+                    ;
+                if (i > 0 && re[i - 1] == rows[r].off) {
+                    re[i - 1] = end;
+                } else {
+                    if (nr == capr) {
+                        capr = capr ? capr * 2 : 64;
+                        rs = (u32 *)xrealloc(rs, capr * sizeof(u32));
+                        re = (u32 *)xrealloc(re, capr * sizeof(u32));
+                        ru = (u32 *)xrealloc(ru, capr * sizeof(u32));
+                    }
+                    rs[nr] = rows[r].off;
+                    re[nr] = end;
+                    ru[nr++] = last_use[c] - 1;
+                }
+            }
+        }
+        for (i = first; i < nuses; i++) {
+            Buf *b = sec(s_rng);
+            uses[i].rng = (u32)b->len;
+            buf_u8(b, 5); /* DW_RLE_base_address: the function */
+            reloc_here(s_rng, R_ABS64, fn->sym, 0, 8);
+            b = sec(s_rng);
+            for (j = 0; j < nr; j++)
+                if (ru[j] == i && re[j] > rs[j]) {
+                    buf_u8(b, 4); /* DW_RLE_offset_pair */
+                    buf_uleb(b, rs[j]);
+                    buf_uleb(b, re[j]);
+                }
+            buf_u8(b, 0);
+            last_use[uses[i].inst] = 0;
+        }
+    }
+    free(last_use);
+    free(rs);
+    free(re);
+    free(ru);
+}
+
 static void ranges(void)
 {
     Buf *b = sec(s_rng);
@@ -782,6 +1021,8 @@ static void ranges(void)
     }
     b = sec(s_rng);
     buf_u8(b, 0); /* DW_RLE_end_of_list */
+    inline_ranges();
+    b = sec(s_rng);
     put32(b, len_at, (u32)(b->len - len_at - 4));
 }
 
@@ -824,6 +1065,7 @@ static void info(const char *path)
         buf_u8(b, 0x9c); /* DW_OP_call_frame_cfa */
         for (v = fn->sym < nfloc ? vhead[fn->sym] : 0; v; v = vars[v - 1].next)
             var_die(&vars[v - 1]);
+        inlined_dies(k, 0);
         buf_u8(sec(s_info), 0);
     }
     /* the types, and the references to them */

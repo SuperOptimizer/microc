@@ -342,8 +342,11 @@ static u32 map_value(u32 yv)
 static u32 inline_one(u32 b, u32 v)
 {
     u32 yb, yv, k, n, cont, nrets = 0, *rets, *retvals, result = 0;
-    u32 first_new = f->nins, argbase = f->ins[v].a, after;
+    u32 first_new = f->nins, argbase = f->ins[v].a, after, inst = 0;
     int ty = f->ins[v].ty;
+
+    if (opt_debug && f->ins[v].loc && f->ins[f->ins[v].c].op == OP_ADDR)
+        inst = dwarf_inline(f->ins[f->ins[v].c].a, f->ins[v].loc); /* -g: the copy's code is this call's */
 
     /* (an always_inline function may have any number of returns) */
     rets = (u32 *)xmalloc((2 * y->nblk + 2) * sizeof(u32));
@@ -413,12 +416,12 @@ static u32 inline_one(u32 b, u32 v)
             if (yi->op == OP_CALL) {
                 nv = ir_call(f, yi->ty, yi->c, y->xargs + yi->a, yi->b, y->xargs[yi->a - 1], yi->flags);
                 f->ins[nv].mem = yi->mem;
-                f->ins[nv].loc = yi->loc;
+                f->ins[nv].loc = dwarf_inline_loc(inst, yi->loc);
                 ir_remove(f, nv); /* ir_call may have placed it in f->cur */
             } else {
                 nv = ir_raw(f, yi->op, yi->ty, yi->a, yi->b);
                 f->ins[nv].mem = yi->mem;
-                f->ins[nv].loc = yi->loc;
+                f->ins[nv].loc = dwarf_inline_loc(inst, yi->loc);
                 f->ins[nv].flags = yi->flags;
                 f->ins[nv].c = yi->c;
             }

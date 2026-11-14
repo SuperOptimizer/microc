@@ -281,6 +281,7 @@ static u32 x86_native(void)
 {
 #if defined(__x86_64__)
     unsigned a, b, c, d, r = 0;
+    int os_ymm = 0;
     __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(1), "2"(0));
     if (c & 1)
         r |= XF_SSE3;
@@ -298,6 +299,12 @@ static u32 x86_native(void)
         r |= XF_FMA;
     if (c >> 29 & 1)
         r |= XF_F16C;
+    if (c >> 27 & 1) { /* OSXSAVE: XCR0 says which register states the system saves */
+        unsigned lo, hi;
+        __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0)); /* xgetbv */
+        os_ymm = (lo & 6) == 6; /* xmm and ymm state */
+        (void)hi;
+    }
     __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(7), "2"(0));
     if (b >> 3 & 1)
         r |= XF_BMI;
@@ -305,6 +312,8 @@ static u32 x86_native(void)
         r |= XF_AVX2;
     if (b >> 8 & 1)
         r |= XF_BMI2;
+    if (!os_ymm) /* the processor has AVX but the system does not save ymm registers (some VMs): none of it */
+        r &= ~(u32)(XF_AVX | XF_AVX2 | XF_FMA | XF_F16C);
     (void)a;
     (void)d;
     return r;
@@ -615,11 +624,17 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-fvec-report=2") == 0)
             opt_vec_report = 2; /* with the instruction that stopped it */
         else if (strcmp(a, "-ffast-math") == 0)
-            opt_fast_math = 1, opt_math_errno = 0;
+            opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1;
         else if (strcmp(a, "-fassociative-math") == 0 || strcmp(a, "-funsafe-math-optimizations") == 0)
-            opt_fast_math = 1; /* floating-point sums (and, x86-64, maxima and minima) may be reordered */
-        else if (strcmp(a, "-fno-fast-math") == 0 || strcmp(a, "-fno-associative-math") == 0)
+            opt_fast_math = 1; /* floating-point sums may be reordered (maxima / minima also need -ffinite-math-only) */
+        else if (strcmp(a, "-fno-fast-math") == 0)
+            opt_fast_math = 0, opt_finite_math = 0;
+        else if (strcmp(a, "-fno-associative-math") == 0)
             opt_fast_math = 0;
+        else if (strcmp(a, "-ffinite-math-only") == 0)
+            opt_finite_math = 1;
+        else if (strcmp(a, "-fno-finite-math-only") == 0)
+            opt_finite_math = 0;
         else if (strcmp(a, "-fno-math-errno") == 0)
             opt_math_errno = 0;
         else if (strcmp(a, "-fmath-errno") == 0)
@@ -629,6 +644,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strncmp(a, "--target=", 9) == 0)
         {
             opt_target = strstr(a, "linux") ? TARGET_LINUX : TARGET_MACOS;
+            opt_arch = ARCH_ARM64; /* (an mcc running on x86-64 starts out at ARCH_X64) */
             if (strncmp(a + 9, "x86_64", 6) == 0 || strncmp(a + 9, "amd64", 5) == 0) {
                 /* x86-64 Linux: its own C library, beside the one for aarch64 */
                 opt_arch = ARCH_X64;
@@ -700,8 +716,12 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_fastmath = 1; /* nvcc's -use_fast_math */
         else if (strncmp(a, "-fmacro-prefix-map=", 19) == 0)
             pp_prefix_map(a + 19);
-        else if (strcmp(a, "-isystem") == 0 && i + 1 < argc)
-            pp_system_dir(argv[++i]);
+        else if (strcmp(a, "-isystem") == 0 && i + 1 < argc) {
+            /* as -I: a standard directory named again (pkg-config's -isystem /usr/include) would move it ahead of
+               mcc's own glibc/include, whose headers must come first (bits/floatn.h's _Float128) */
+            if (!is_system_dir(argv[++i]))
+                pp_system_dir(argv[i]);
+        }
         else if (strcmp(a, "-include") == 0 && i + 1 < argc)
             pp_force_include(argv[++i]);
         else if (strncmp(a, "-g", 2) == 0 && strcmp(a, "-g0") != 0 && strncmp(a, "-gsplit", 7) != 0 &&
@@ -711,7 +731,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_debug = 0;
         else if (strncmp(a, "-W", 2) == 0 || strncmp(a, "-f", 2) == 0 || strncmp(a, "-m", 2) == 0 ||
                  strncmp(a, "-g", 2) == 0 || strncmp(a, "-O", 2) == 0 || strncmp(a, "-Q", 2) == 0 ||
-                 strcmp(a, "-pipe") == 0)
+                 strcmp(a, "-pipe") == 0 || strcmp(a, "-w") == 0)
             ; /* accepted for compatibility with other compilers */
         else if (a[0] == '-' && a[1])
             die("unknown option %s", a);

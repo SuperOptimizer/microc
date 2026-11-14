@@ -242,6 +242,7 @@ extern int opt_inline_once;
 extern int opt_inline_limit;
 extern int opt_level;
 extern int opt_fast_math;
+extern int opt_finite_math; /* -ffinite-math-only (in -ffast-math): no NaN or infinity reaches a comparison, so a < b ? a : b may be a min */
 extern int opt_vec_report;
 extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
 extern int opt_x64_avx2;  /* opt_vec.c: 32-byte vectors in AVX functions */

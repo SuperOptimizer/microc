@@ -1628,7 +1628,10 @@ static void emit_ins(u32 v)
         Ins *ci = &PF->ins[RV(i->a)];
         u32 x = RV(ci->a), y = RV(ci->b), sb = RV(i->b), sc = RV(i->c);
         if (ci->blk && ((sb == x && sc == y) || (sb == y && sc == x)) && x != y && !opt_nominmax) {
-            int isf = ci->op >= OP_FLT && ci->op <= OP_FGE && opt_fastmath;
+            /* min.f32 / max.f32 give the other operand for a NaN where the select gives b: only when no NaN can come
+               (-ffinite-math-only). nvcc's -use_fast_math does not promise that, and code that guards against NaN
+               (x < lo ? lo : x) must keep its select */
+            int isf = ci->op >= OP_FLT && ci->op <= OP_FGE && opt_finite_math;
             int lt = ci->op == OP_SLT || ci->op == OP_SLE || ci->op == OP_ULT || ci->op == OP_ULE || (isf && (ci->op == OP_FLT || ci->op == OP_FLE));
             int gt = ci->op == OP_SGT || ci->op == OP_SGE || ci->op == OP_UGT || ci->op == OP_UGE || (isf && (ci->op == OP_FGT || ci->op == OP_FGE));
             if (lt || gt) {

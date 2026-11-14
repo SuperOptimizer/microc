@@ -14,6 +14,7 @@
 #include <string.h>
 
 int opt_fast_math; /* floating-point sums may be reordered */
+int opt_finite_math;
 
 static Func *f;
 
@@ -672,9 +673,9 @@ static int try_loop(u32 l, u32 n0)
             Ins *q = &f->ins[ri->a];
             u32 x = ri->b == ph ? ri->c : ri->b;
             int gt, uns_cmp, takes_x_when_true = ri->b != ph;
-            /* floating point: x86-64's maxps / minps differ from the select only with NaNs and signed zeros, which
-               -ffast-math lets go */
-            int fl = (ri->ty == IT_F32 || ri->ty == IT_F64) && opt_fast_math && opt_arch == ARCH_X64;
+            /* floating point: x86-64's maxps / minps differ from the select only with NaNs and signed zeros, so they need
+               -ffinite-math-only too (in -ffast-math; -ffast-math -fno-finite-math-only keeps NaN results exact) */
+            int fl = (ri->ty == IT_F32 || ri->ty == IT_F64) && opt_fast_math && opt_finite_math && opt_arch == ARCH_X64;
             if ((ri->ty != IT_I32 && !fl) || INV(ri->a) || cnt[ri->a] != 1 || cnt[ph] != 2 || (ri->b != ph && ri->c != ph) || x == ph ||
                 !((q->a == x && q->b == ph) || (q->a == ph && q->b == x)))
                 MISS("a value carried from one iteration to the next that is not a sum, maximum or minimum");

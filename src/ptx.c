@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
 u32 ptx_maxntid;
@@ -407,6 +407,27 @@ static const char *maddr(u32 a)
         return base;
     s = obuf();
     sprintf(s, "%s+%ld", base, (long)off);
+    return s;
+}
+
+/* The address a of a load or a store when it is in the function's own frame: [%SPL+n], of the local state space
+   (ld.local, LDL), rather than the generic [%SP+n] (LD, which looks up the space of each address); 0 otherwise. */
+static const char *local_maddr(u32 a)
+{
+    Ins *i;
+    char *s;
+    i64 off = 0;
+    a = RV(a);
+    if (opt_nolocal || !remat)
+        return 0;
+    if (addr_sum(a, &off))
+        a = RV(PF->ins[a].a);
+    i = &PF->ins[a];
+    if (i->op != OP_SLOT && !(i->op == OP_ADDR && special_of(i->a) >= 0))
+        return 0;
+    off += (i64)(i->op == OP_SLOT ? slotoff[i->a] : special_off[special_of(i->a)]) + (i64)(i32)i->b;
+    s = obuf();
+    sprintf(s, "%%SPL+%ld", (long)off);
     return s;
 }
 
@@ -1016,7 +1037,34 @@ static void emit_asm(u32 v)
         if (nh > 11)
             die("ptx: %s: too many 16-bit assembly operands", fname);
     }
-    expand(gl_tmpl(st->tmpl, vals, st->nops), '%', "", ops, st->nops);
+    {
+        /* an atomic operation whose old value nothing reads is a reduction (red), as nvcc writes atomicAdd(p, v)
+           standing alone: the GPU need not send the value back (mcuda_device.h's "atom.OP %0, [%1], %2;") */
+        const char *t = st->tmpl, *e;
+        char red[96], shd[96];
+        int unread = st->nops == 3 && st->ops[0].out == 1 && !st->ops[1].out && !st->ops[2].out && !opt_nored;
+        for (w = 1; unread && w < PF->nins; w++)
+            if (PF->ins[w].op == OP_ASMOUT && PF->ins[w].blk && PF->ins[w].a == v && PF->ins[w].b == 0)
+                unread = 0;
+        if (unread && !strncmp(t, "atom.", 5) && (e = strstr(t, " %0, [%1], %2;")) != 0 && !e[14] && e - t < 64 &&
+            !memchr(t, ' ', (size_t)(e - t))) {
+            sprintf(red, "red.%.*s [%%1], %%2;", (int)(e - t - 5), t + 5);
+            t = red;
+        }
+        if (st->nops == 3 && !st->ops[1].out && vals[1] && sh_s && !opt_nored && strlen(t) < 80 &&
+            (!strncmp(t, "atom.", 5) || !strncmp(t, "red.", 4)) && strstr(t, "[%1]") && !strstr(t, "global.") &&
+            !strstr(t, "shared") && !strstr(t, "local.")) {
+            /* ... and one on shared memory is told so, with the 32-bit address (as nvcc's atom.shared / red.shared) */
+            const char *sa = sh_maddr(vals[1]);
+            if (sa) {
+                u32 n = t[0] == 'a' ? 5 : 4;
+                sprintf(shd, "%.*sshared.%s", (int)n, t, t + n);
+                ops[1] = sa;
+                t = shd;
+            }
+        }
+        expand(gl_tmpl(t, vals, st->nops), '%', "", ops, st->nops);
+    }
     for (k = 0; k < st->nops; k++)
         if (post[k])
             P("\tcvt.u32.u16 %s, %s;\n", post[k], ops[k]);
@@ -1401,6 +1449,10 @@ static void emit_ins(u32 v)
             P("\tld.shared.%s %s, [%s];\n", lt[i->mem], reg(v), a);
             return;
         }
+        if ((a = local_maddr(i->a)) != 0) {
+            P("\tld.local.%s %s, [%s];\n", lt[i->mem], reg(v), a);
+            return;
+        }
         a = maddr(i->a);
         P("\tld.%s%s %s, [%s];\n", (i->flags & IF_NC) && !opt_nonc ? "global.nc." : gl_s && gl_s[RV(i->a)] ? gl_s[RV(i->a)] == 2 ? "global.nc." : "global." : "",
           lt[i->mem], reg(v), a);
@@ -1411,6 +1463,11 @@ static void emit_ins(u32 v)
         if ((a = sh_maddr(i->a)) != 0) {
             b = ropnd(i->b);
             P("\tst.shared.%s [%s], %s;\n", stt[i->mem], a, b);
+            return;
+        }
+        if ((a = local_maddr(i->a)) != 0) {
+            b = ropnd(i->b);
+            P("\tst.local.%s [%s], %s;\n", stt[i->mem], a, b);
             return;
         }
         a = maddr(i->a);

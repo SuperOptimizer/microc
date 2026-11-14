@@ -624,11 +624,19 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-fvec-report=2") == 0)
             opt_vec_report = 2; /* with the instruction that stopped it */
         else if (strcmp(a, "-ffast-math") == 0)
-            opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1;
+            opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1, opt_no_signed_zeros = 1, opt_reciprocal_math = 1;
         else if (strcmp(a, "-fassociative-math") == 0 || strcmp(a, "-funsafe-math-optimizations") == 0)
             opt_fast_math = 1; /* floating-point sums may be reordered (maxima / minima also need -ffinite-math-only) */
         else if (strcmp(a, "-fno-fast-math") == 0)
-            opt_fast_math = 0, opt_finite_math = 0;
+            opt_fast_math = 0, opt_finite_math = 0, opt_no_signed_zeros = 0, opt_reciprocal_math = 0;
+        else if (strcmp(a, "-fno-signed-zeros") == 0)
+            opt_no_signed_zeros = 1;
+        else if (strcmp(a, "-fsigned-zeros") == 0)
+            opt_no_signed_zeros = 0;
+        else if (strcmp(a, "-freciprocal-math") == 0)
+            opt_reciprocal_math = 1;
+        else if (strcmp(a, "-fno-reciprocal-math") == 0)
+            opt_reciprocal_math = 0;
         else if (strcmp(a, "-fno-associative-math") == 0)
             opt_fast_math = 0;
         else if (strcmp(a, "-ffinite-math-only") == 0)

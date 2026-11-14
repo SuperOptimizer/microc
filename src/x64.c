@@ -1927,7 +1927,7 @@ static void sel_vec(u32 v)
     case OP_FDIV: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5e, ra, rb, 0); return;
     case OP_VSMAX: case OP_VSMIN: case OP_VUMAX: case OP_VUMIN:
         if (fl) { /* maxps maxpd minps minpd (-ffast-math reductions) */
-            vbin(d, (n == 8 ? VP66 : O_0F) | (i->op == OP_VSMAX ? 0x5f : 0x5d), ra, rb, 1);
+            vbin(d, (n == 8 ? VP66 : O_0F) | (i->op == OP_VSMAX ? 0x5f : 0x5d), ra, rb, 0); /* (the second where unordered: in order) */
             return;
         }
         vbin(d, minmax_code(i->op, n), ra, rb, 1);

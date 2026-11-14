@@ -11,7 +11,7 @@ static short ha[N + 40], hb[N + 40];
 static int ia[N + 40], ib[N + 40];
 static unsigned qa[N + 40], qb[N + 40];
 static float fa[N + 40], fb[N + 40], fc[N + 40];
-static double da[N + 40], db[N + 40];
+static double da[N + 40], db[N + 40], dc[N + 40];
 static long la[N + 40];
 
 /* papyrus.h: running maxima and minima of byte rows */
@@ -158,6 +158,22 @@ static void isel64(double *w, const double *q, long c, int n) { int i; for (i = 
 static void linv8(float *o, const float *m, const float *a, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] * m[0] + m[1] - a[i] * m[2] + m[3] * m[4] - m[5] + m[6] * a[i] + m[7]; }
 static void u3(float *U, const float *A, const float *w, int n, float c) { int i, d; for (i = 0; i < n; i++) for (d = 0; d < 3; d++) U[d * 39 + i] = c + A[d * 3] * w[i] + A[d * 3 + 1]; }
 
+/* running maxima and minima of floats with NaNs among them (exact even with -ffast-math -fno-finite-math-only) */
+static float fmxi(const float *a, float m, int n) { int i; for (i = 0; i < n; i++) m = a[i] > m ? a[i] : m; return m; }
+static float fmni(const float *a, float m, int n) { int i; for (i = 0; i < n; i++) if (a[i] <= m) m = a[i]; return m; }
+static double dmxl(const double *a, double m, int n) { int i; for (i = 0; i < n; i++) m = m > a[i] ? m : a[i]; return m; }
+/* lane by lane maxima / minima of floats as selects, NaNs and zeros of both signs among them: maxps / minps exactly */
+static void lmaxf(float *o, const float *a, const float *b, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] > b[i] ? a[i] : b[i]; }
+static void fclamp4(float *o, const float *a, int n) { int i; for (i = 0; i < n; i++) { float v = a[i] < 0.f ? 0.f : a[i]; o[i] = 4.f < v ? 4.f : v; } }
+static void lmind(double *o, const double *a, const double *b, int n) { int i; for (i = 0; i < n; i++) o[i] = b[i] < a[i] ? b[i] : a[i]; }
+/* division by a value fixed for the loop: by a power of two it is a multiplication, exactly (others only with -freciprocal-math) */
+static void divc(float *o, const float *a, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] / 0.25f + a[i] / 4.f; }
+static void divv(float *o, const float *a, float c, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] / c; }
+static void ddivc(double *o, const double *a, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] / 1024.0 - a[i] / 0x1p-1000; }
+static float qnanf(void) { union { unsigned u; float f; } x; x.u = 0x7fc00001u; return x.f; } /* (one NaN, whatever makes it) */
+static double qnan(void) { union { unsigned long u; double d; } x; x.u = 0x7ff8000000000001ul; return x.d; }
+static double nn(double x) { return x != x ? 12345.0 : x; } /* (printf writes a NaN's sign) */
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -238,6 +254,23 @@ int main(void)
         linv8(fc, fb, fa, n); linv8(fb + 3, fb, fa, n / 2); linv8(fa, fa + n / 2, fb, n);
         u3(fb, fa, fc, n / 2, 0.5f); u3(fa, fa + 1, fb, n / 3, -1.f);
         printf("   %lx %lx %lx %lx\n", check(fa, sizeof fa), check(fb, sizeof fb), check(fc, sizeof fc), check(da, sizeof da) ^ check(db, sizeof db));
+        for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 53) - 20.5f; da[i] = db[i] = (double)((i * 11) % 29) - 9.25; }
+        for (i = 3; i < N + 40; i += 7) { fa[i] = __builtin_nanf(""); da[i] = __builtin_nan(""); }
+        printf("   %g %g %g %g %g %g\n", nn(fmxi(fa, -1e30f, n)), nn(fmxi(fa, __builtin_nanf(""), n)), nn(fmni(fa, 1e30f, n)),
+               nn(fmni(fa + 1, 3.5f, n - 1)), nn(dmxl(db, -1e300, n)), nn(dmxl(db, 2.0, n / 2))); /* (no NaN: -ffinite-math-only may vectorise it) */
+        for (i = 0; i < N + 40; i++) {
+            fb[i] = i % 5 == 0 ? -0.f : i % 5 == 1 ? 0.f : (float)((i * 7) % 11) - 5.f; db[i] = i % 4 == 0 ? -0.0 : i % 4 == 1 ? 0.0 : (double)((i * 5) % 9) - 4;
+            fa[i] = i % 6 == 0 ? 0.f : i % 6 == 1 ? -0.f : (float)((i * 3) % 13) - 6.f; da[i] = i % 3 == 0 ? 0.0 : (double)((i * 7) % 5) - 2;
+        }
+        for (i = 4; i < N + 40; i += 9) { fa[i] = qnanf(); db[i] = qnan(); }
+        for (i = 2; i < N + 40; i += 13) fb[i] = qnanf();
+        lmaxf(fc, fa, fb, n); lmind(dc, da, db, n);
+        printf("   %lx %lx", check(fc, sizeof fc), check(dc, sizeof dc));
+        fclamp4(fc, fa, n); fclamp4(fb, fb, n);
+        printf(" %lx %lx\n", check(fc, sizeof fc), check(fb, sizeof fb));
+        for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 53) * 1.37e-38f + (float)(i % 7) * 3.1f; da[i] = (double)((i * 7) % 31) * 1.1e-300 - i; }
+        divc(fb, fa, n); divv(fc, fa, 8.f, n); ddivc(db, da, n);
+        printf("   %lx %lx %lx\n", check(fb, sizeof fb), check(fc, sizeof fc), check(db, sizeof db));
     }
     return 0;
 }

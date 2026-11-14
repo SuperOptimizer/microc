@@ -15,6 +15,8 @@
 
 int opt_fast_math; /* floating-point sums may be reordered */
 int opt_finite_math;
+int opt_no_signed_zeros;
+int opt_reciprocal_math; /* -freciprocal-math (in -ffast-math): x / c may be x * (1 / c) */ /* -fno-signed-zeros (in -ffast-math): +0 and -0 may be taken for each other */
 
 static Func *f;
 
@@ -27,7 +29,7 @@ enum { K_NONE, K_IDX, K_ADDR, K_VEC, K_MASK, K_RED, K_SKIP, K_IVPHI, K_IVNEXT, K
 #define MAX_IV 6
 #define MAX_BASES 8
 #define MAX_PAIRS 6
-#define MAX_SPLATS 8
+#define MAX_SPLATS 24 /* (x86-64: vec_pressure is the real bound) */
 #define MAX_VECS 12 /* few enough that none is ever spilled */
 
 static u8 *kind, *shift;
@@ -37,6 +39,7 @@ static int mixed;  /* x86-64: elements of different sizes, all in lanes of four 
 #define MM_ON 1
 #define MM_MAX 2 /* else the minimum */
 #define MM_UNS 4 /* compared without sign */
+#define MM_FL 8  /* floating point: maxps / minps */
 int opt_x64_avx2;  /* x86-64: AVX2 (256-bit integer lanes): opt_vec uses 32-byte vectors in AVX functions */
 int opt_x64_sse41; /* x86-64: SSE4.1 may be used (pmulld, pmaxsd, ...); -msse4.1, -mavx2, -march=native ... */
 Obj *opt_obj;
@@ -234,6 +237,24 @@ static int lane_kind(int ty)
 
 /* values from outside the loop, spread over the lanes in the preheader */
 static u32 splat_of[MAX_SPLATS + MAX_IV * 2], splat[MAX_SPLATS + MAX_IV * 2], nsplat;
+/* divisors fixed for the loop and their reciprocals (made in the preheader) */
+static u32 rcp_of[MAX_SPLATS], rcp[MAX_SPLATS], nrcp;
+
+/* Is 1 / x exact (x a constant power of two whose reciprocal is a normal number of its type)? */
+static int exact_recip(u32 x)
+{
+    double d;
+    u64 bits;
+    int e;
+    if (!ir_is_fconst(f, x, &d))
+        return 0;
+    memcpy(&bits, &d, 8);
+    e = (int)(bits >> 52 & 0x7ff) - 1023; /* d = +-2^e when the fraction is zero (and it is no zero, subnormal, inf or NaN) */
+    if ((bits & (((u64)1 << 52) - 1)) || (bits >> 52 & 0x7ff) == 0 || (bits >> 52 & 0x7ff) == 0x7ff)
+        return 0;
+    return f->ins[x].ty == IT_F32 ? -e >= -126 && -e <= 127 && e >= -126 && e <= 127 : -e >= -1022 && -e <= 1023;
+}
+
 /* conditions fixed for the loop that selects use, and their masks (made in the preheader) */
 static u32 invc[MAX_SPLATS], invm[MAX_SPLATS], ninvc;
 
@@ -243,7 +264,7 @@ static int note_splat(u32 x)
     for (k = 0; k < nsplat && splat_of[k] != x; k++)
         ;
     if (k == nsplat) {
-        if (nsplat == MAX_SPLATS)
+        if (nsplat == (opt_arch == ARCH_X64 ? MAX_SPLATS : 8))
             return 0;
         splat_of[nsplat++] = x;
     }
@@ -299,7 +320,21 @@ static int minmax_of(Ins *i)
 {
     Ins *q = &f->ins[i->a];
     int gt, uns;
-    if (i->b == i->c || f->ins[q->a].ty != IT_I32 || !((q->a == i->b && q->b == i->c) || (q->a == i->c && q->b == i->b)))
+    if (i->b == i->c || !((q->a == i->b && q->b == i->c) || (q->a == i->c && q->b == i->b)))
+        return 0;
+    if (i->ty == IT_F32 || i->ty == IT_F64) {
+        /* x86-64's maxps (t, e) is the select c ? t : e of c = t > e lane by lane: a NaN on either side, or equal
+           values, give e, as the select's false arm does (minps likewise with <). With >= or <= equal values
+           give t, which differs only in a zero's sign: -fno-signed-zeros. */
+        int strict = q->op == OP_FGT || q->op == OP_FLT;
+        if (opt_arch != ARCH_X64 || !(q->op >= OP_FLT && q->op <= OP_FGE) || (!strict && !opt_no_signed_zeros))
+            return 0;
+        gt = q->op == OP_FGT || q->op == OP_FGE;
+        if (q->a != i->b)
+            gt = !gt;
+        return MM_ON | (gt ? MM_MAX : 0) | MM_FL;
+    }
+    if (f->ins[q->a].ty != IT_I32)
         return 0;
     switch (q->op) {
     case OP_SGT: case OP_SGE: gt = 1; uns = 0; break;
@@ -343,6 +378,8 @@ static int minmax_op(u32 v)
     Ins *i = &f->ins[v];
     int m = mmk[v], uns = (m & MM_UNS) != 0;
     shift[v] = 0;
+    if (m & MM_FL)
+        return m & MM_MAX ? OP_VSMAX : OP_VSMIN; /* maxps / minps: SSE */
     if (lanesz < 4) {
         /* The widened values must compare as their lanes do. Zero-extended ones do so without sign whichever
            way they are compared; sign-extended ones with a sign compared with it, without one compared without. */
@@ -378,6 +415,8 @@ static int x64_has(u32 v)
     int op = i->op, sse41 = opt_x64_sse41;
     if (kind[v] == K_VEC && mmk[v]) {
         int o = minmax_op(v);
+        if (mmk[v] & MM_FL)
+            return 1;
         /* pmaxub pminub pmaxsw pminsw are SSE2; the rest SSE4.1 */
         return (lanesz == 1 && (o == OP_VUMAX || o == OP_VUMIN)) || (lanesz == 2 && (o == OP_VSMAX || o == OP_VSMIN)) || sse41;
     }
@@ -691,9 +730,14 @@ static int try_loop(u32 l, u32 n0)
             Ins *q = &f->ins[ri->a];
             u32 x = ri->b == ph ? ri->c : ri->b;
             int gt, uns_cmp, takes_x_when_true = ri->b != ph;
-            /* floating point: x86-64's maxps / minps differ from the select only with NaNs and signed zeros, so they need
-               -ffinite-math-only too (in -ffast-math; -ffast-math -fno-finite-math-only keeps NaN results exact) */
-            int fl = (ri->ty == IT_F32 || ri->ty == IT_F64) && opt_fast_math && opt_finite_math && opt_arch == ARCH_X64;
+            /* floating point (x86-64's maxps / minps), with -ffast-math. maxps (x, m) is the select m = x > m ? x : m lane by
+               lane, NaNs included: either operand unordered gives the second, m, as the select's false arm does; equal
+               ones give m too, and with >= x instead, which differs only in the sign of a zero. A NaN start stays NaN in
+               every lane. What differs is the order in which the lanes' results are combined, and that changes only
+               which zero comes out: so -fno-signed-zeros suffices when the false arm keeps m. m = m > x ? m : x keeps
+               the last NaN seen, an order no lanes can follow: that one needs -ffinite-math-only. */
+            int fl = (ri->ty == IT_F32 || ri->ty == IT_F64) && opt_fast_math && opt_arch == ARCH_X64 &&
+                     (opt_finite_math || (opt_no_signed_zeros && takes_x_when_true));
             if ((ri->ty != IT_I32 && !fl) || INV(ri->a) || cnt[ri->a] != 1 || cnt[ph] != 2 || (ri->b != ph && ri->c != ph) || x == ph ||
                 !((q->a == x && q->b == ph) || (q->a == ph && q->b == x)))
                 MISS("a value carried from one iteration to the next that is not a sum, maximum or minimum");
@@ -933,7 +977,8 @@ static int try_loop(u32 l, u32 n0)
             break;
         }
         case OP_SELECT:
-            if (!INV(i->a) && kind[i->a] == K_MASK && cnt[i->a] == 1 && i->ty == IT_I32 && (mmk[v] = minmax_of(i))) {
+            if (!INV(i->a) && kind[i->a] == K_MASK && cnt[i->a] == 1 && (i->ty == IT_I32 || i->ty == IT_F32 || i->ty == IT_F64) &&
+                (mmk[v] = minmax_of(i))) {
                 /* c = a > b ? a : b and its like: one instruction, at any element width */
                 if (!(INV(i->b) || is_vec(i->b)) || !(INV(i->c) || is_vec(i->c)))
                     MISS("a value that is neither per-element nor constant in the loop");
@@ -1087,16 +1132,21 @@ static int try_loop(u32 l, u32 n0)
 
     /* on x86-64: four sums side by side each, the counters' steps, two for the instructions made of several */
     if (opt_arch == ARCH_X64) {
-        u32 extra = 3 + ninvc;
+        u32 extra = 3 + ninvc, nconst;
         for (k = 0; k < nred; k++)
             extra += red_op[k] == OP_VSUM ? 0 : 4;
         for (k = 0; k < niv; k++)
             extra += iv_val[k] ? 2 : 0;
         for (v = f->blk[l].first; v; v = f->ins[v].next)
             extra += kind[v] == K_MASK && mmk[v];
-        /* AVX functions: xmm0-12 (xmm13 is a scratch there); their values can be spilled, and a spread value from
-           outside the loop is then read from memory where it is used, which costs little: those count half */
-        if (vec_pressure(extra) - (f->avx ? nsplat / 2 : 0) > (vw == 32 ? 13u : 14u))
+        /* AVX functions have xmm0-12 (xmm13 is a scratch there), but their vectors can be spilled: a spread value from
+           outside the loop is then read from memory where it is used, which costs little (those count half, spread
+           constants, a broadcast from .rodata, not at all), and a few spills of the body's own values cost less than
+           the eight scalar rounds they replace: the bound is loose (phase_blend_row's atan2 polynomial: 20) */
+        nconst = 0;
+        for (k = 0; k < nsplat; k++)
+            nconst += f->ins[splat_of[k]].op == OP_CONST || f->ins[splat_of[k]].op == OP_FCONST;
+        if (vec_pressure(extra) - (f->avx ? nconst + (nsplat - nconst) / 2 : 0) > (f->avx ? 24u : 14u))
             MISS("too many vector values at once for the x86-64 vector registers");
     }
     /* How many times does the loop run? Three ways of counting are known.
@@ -1302,6 +1352,7 @@ static int try_loop(u32 l, u32 n0)
     ivv = ir_phi(f, V, IT_I64);
     f->xargs[f->ins[ivv].a] = C64(0);
     nsplat = 0;
+    nrcp = 0;
     memset(invm, 0, sizeof invm);
     for (k = 0; k < nred; k++) {
         /* sums start from nothing; a maximum or minimum starts from the value so far in every lane */
@@ -1373,7 +1424,10 @@ static int try_loop(u32 l, u32 n0)
                     acc[k][0] = nv;
                     continue;
                 }
-                nv = mk(V, red_op[k], vty, acc[k][u], vec_operand(red_x[k], P));
+                if (red_op[k] >= OP_VSMAX && red_op[k] <= OP_VUMIN && (f->ins[red_phi[k]].ty == IT_F32 || f->ins[red_phi[k]].ty == IT_F64))
+                    nv = mk(V, red_op[k], vty, vec_operand(red_x[k], P), acc[k][u]); /* maxps (x, m): m where unordered */
+                else
+                    nv = mk(V, red_op[k], vty, acc[k][u], vec_operand(red_x[k], P));
                 f->xargs[f->ins[acc[k][u]].a + 1] = nv;
                 acc[k][u] = nv;
             } else if (in.op == OP_LOAD && kind[in.a] == K_GADDR) {
@@ -1448,6 +1502,17 @@ static int try_loop(u32 l, u32 n0)
             } else if (ir_opcount_tab[in.op] == 1) {
                 /* x86-64 takes only unsigned values below 2^31 (x64_has): the signed conversion */
                 nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : opt_arch == ARCH_X64 && in.op == OP_FTOUI ? OP_FTOSI : in.op, vty, vec_operand(in.a, P), 0);
+            } else if (in.op == OP_FDIV && INV(in.b) && (opt_reciprocal_math || exact_recip(in.b)) && nsplat < MAX_SPLATS) {
+                /* x / c as x * (1 / c), 1 / c worked out once in the preheader: exact when 1 / c is (c a power of
+                   two), else -freciprocal-math (in -ffast-math). A vector division takes ten times a multiplication. */
+                for (k = 0; k < nrcp && rcp_of[k] != in.b; k++)
+                    ;
+                if (k == nrcp) {
+                    rcp_of[k] = in.b;
+                    rcp[k] = mk(P, OP_FDIV, in.ty, ir_fconst(f, in.ty, 1.0), outside(in.b));
+                    nrcp++;
+                }
+                nv = mk(V, OP_FMUL, vty, vec_operand(in.a, P), vec_operand(rcp[k], P));
             } else {
                 if (kind[v] == K_MASK)
                     lk = lane_kind(f->ins[in.a].ty);
@@ -1529,3 +1594,4 @@ int opt_vectorise(Func *fn)
     free(base);
     return done;
 }
+

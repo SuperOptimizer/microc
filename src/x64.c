@@ -84,6 +84,7 @@ enum {
     X_VLD,    /* d = [s0 + s1]; w: four elements of the narrow kind cc there, widened to 32 bits */
     X_VST,    /* [s1 + s2] = s0; w: its four 32-bit lanes narrowed to the kind cc */
     X_VONES,  /* d = all ones (imm 1: all zeros) */
+    X_VGATH,  /* d = four elements of kind cc at s0 + (lane k of s1) << sym, each widened to 32 bits (SSE4.1) */
     X_FUN     /* scalar d = a function of the scalar s0, done in line (sel_math): cc says how, imm the opcode */
 };
 
@@ -1003,6 +1004,11 @@ static void sel_vec(u32 v)
         m->sym = f->ins[i->b].a;
         return;
     }
+    case OP_VGATHER:
+        m = emit(X_VGATH, 0, d, reg_of(i->a), reg_of(i->b));
+        m->cc = i->flags;
+        m->sym = i->c;
+        return;
     case OP_VMATH: {
         /* sqrtps sqrtpd; roundps roundpd: down 9, up 10, toward zero 11, the current way 4 (12: without inexact) */
         static const u8 rnd[6] = { 0, 9, 10, 11, 4, 12 };
@@ -1056,6 +1062,10 @@ static void sel_vec(u32 v)
     case OP_FMUL: vbin(d, (n == 8 ? VP66 : O_0F) | 0x59, ra, rb, 1); return;
     case OP_FDIV: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5e, ra, rb, 0); return;
     case OP_VSMAX: case OP_VSMIN: case OP_VUMAX: case OP_VUMIN:
+        if (fl) { /* maxps maxpd minps minpd (-ffast-math reductions) */
+            vbin(d, (n == 8 ? VP66 : O_0F) | (i->op == OP_VSMAX ? 0x5f : 0x5d), ra, rb, 1);
+            return;
+        }
         vbin(d, minmax_code(i->op, n), ra, rb, 1);
         return;
     case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE: {
@@ -2770,7 +2780,9 @@ static void encode_vec(MIns *i)
         u32 v = vloc(i->s0), T = FSCR0, U = FSCR1;
         int k = i->cc, fl = (int)i->imm;
         u32 add = k == M_F32 ? O_0F | 0x58 : k == M_F64 ? O_66 | O_0F | 0x58 : k == M_64 ? O_66 | O_0F | 0xd4 : O_66 | O_0F | 0xfe;
-        if (fl >= 1 && fl <= 4) {
+        if (fl >= 1 && fl <= 4 && (k == M_F32 || k == M_F64)) {
+            add = (k == M_F64 ? O_66 : 0) | O_0F | (fl == 1 ? 0x5f : 0x5d); /* maxps minps (pd) */
+        } else if (fl >= 1 && fl <= 4) {
             static const u32 across[5] = { 0, O_38 | 0x3d, O_38 | 0x39, O_38 | 0x3f, O_38 | 0x3b }; /* pmaxsd pminsd pmaxud pminud */
             add = O_66 | O_0F | across[fl];
         }
@@ -2822,6 +2834,23 @@ static void encode_vec(MIns *i)
         vop_ri(O_66 | O_0F | 0x70, U, T, 0xb1);
         op_rr(add, 0, U, T);
         vsum_put(i, U, k != M_F32, 0);
+        return;
+    }
+    case X_VGATH: {
+        /* lane by lane, in order: pextrd the index, sign-extend it, load the element extended, pinsrd it */
+        static const u32 ld[] = { O_0F | 0xbe, O_0F | 0xb6, O_0F | 0xbf, O_0F | 0xb7, 0x8b, 0x8b, 0x8b, 0x8b };
+        u32 idx = vloc(i->s1), k;
+        b = use(i->s0, SCR1);
+        for (k = 0; k < 4; k++) {
+            vop_ri(O_66 | O_0F | O_3A | 0x16, idx, SCR0, k); /* pextrd r32, xmm, k */
+            op_rr(0x63, 1, SCR0, SCR0);                        /* movsxd */
+            ea_base(&ea, b, 0);
+            ea.idx = SCR0;
+            ea.scale = i->sym;
+            op_mem(ld[i->cc], 0, SCR0, &ea, 0);
+            vop_ri(O_66 | O_0F | O_3A | 0x22, FSCR0, SCR0, k); /* pinsrd xmm, r32, k */
+        }
+        mov_rr(vloc(i->d), FSCR0);
         return;
     }
     case X_FUN: {

@@ -18,7 +18,10 @@ int opt_finite_math;
 
 static Func *f;
 
-enum { K_NONE, K_IDX, K_ADDR, K_VEC, K_MASK, K_RED, K_SKIP, K_IVPHI, K_IVNEXT, K_LINV };
+enum { K_NONE, K_IDX, K_ADDR, K_VEC, K_MASK, K_RED, K_SKIP, K_IVPHI, K_IVNEXT, K_LINV,
+       K_GIDX,   /* x86-64: a vector of i32 indexes widened (and shifted: shift), base = the vector; for a gather */
+       K_GADDR }; /* base (from outside the loop) + a K_GIDX: base = it, ioff = the index vector, shift */
+#define MAX_GATH 4
 #define MAX_LINV 4
 #define MAX_RED 4
 #define MAX_IV 6
@@ -36,10 +39,15 @@ static int mixed;  /* x86-64: elements of different sizes, all in lanes of four 
 #define MM_UNS 4 /* compared without sign */
 int opt_x64_sse41; /* x86-64: SSE4.1 may be used (pmulld, pmaxsd, ...); -msse4.1, -mavx2, -march=native ... */
 Obj *opt_obj;
+/* -fvec-gather: loops that read through an index computed lane by lane. Off by default: with SSE4.1 the gather is four
+   extract / load / insert steps, measured slower than the scalar loop (clamped row 1.02 vs 1.37 ns, halving 1.20 vs 0.87 ns
+   an element); it waits for AVX2's vpgatherdd. */
+int opt_vec_gather;
 static u32 *base, *cnt, *map, *lpos;
 static u32 *ioff; /* an index or address (K_IDX, K_ADDR): the value from outside the loop added to the counter before it
                      was widened (bit 31: taken away), as in a[i + k]; 0 if none */
-static u32 idx_off, walk_off; /* that of the index is_idx and the access walks found */
+static u32 idx_off, walk_off;
+static u32 gth[MAX_GATH], ngth; /* the gathering loads */ /* that of the index is_idx and the access walks found */
 static u32 L;
 static u32 iv;  /* the induction variable that indexes arrays, if any */
 static int ext; /* how the body widens it when it is 32 bits wide */
@@ -337,7 +345,8 @@ static u32 vec_pressure(u32 extra)
     for (v = f->blk[L].first; v; v = f->ins[v].next) {
         Ins *i = &f->ins[v];
         p++;
-        if (kind[v] == K_SKIP || kind[v] == K_IVNEXT || kind[v] == K_IDX || kind[v] == K_ADDR || kind[v] == K_LINV)
+        if (kind[v] == K_SKIP || kind[v] == K_IVNEXT || kind[v] == K_IDX || kind[v] == K_ADDR || kind[v] == K_LINV ||
+            kind[v] == K_GIDX || kind[v] == K_GADDR)
             continue;
         IR_OPS(f, i, ops, nops);
         for (k = 0; k < nops; k++)
@@ -398,6 +407,94 @@ static int vmath_of(u32 v)
 
 int opt_vec_report; /* say what was and was not vectorised */
 
+/* Can the range of the i32 x, an index of a gather, be bounded from the loop's counters and values from outside it
+   (sums, differences, shifts and multiplications by constants, selects)? Then the elements it picks lie in that range,
+   whose addresses are checked against what the loop writes. (Like the rest of this file, index arithmetic is taken not
+   to wrap around.) */
+static int gmono(u32 x, int depth)
+{
+    Ins *i = &f->ins[x];
+    u64 c;
+    if (depth > 12)
+        return 0;
+    if (INV(x))
+        return i->ty == IT_I32;
+    if (kind[x] == K_IVPHI)
+        return i->ty == IT_I32;
+    switch (i->op) {
+    case OP_ADD: case OP_SUB:
+        return gmono(i->a, depth + 1) && gmono(i->b, depth + 1);
+    case OP_SHR: case OP_SAR: case OP_SHL:
+        return ir_is_const(f, i->b, &c) && gmono(i->a, depth + 1);
+    case OP_MUL:
+        return INV(i->b) && ir_is_const(f, i->b, &c) && (i32)(u32)c > 0 && gmono(i->a, depth + 1);
+    case OP_SELECT:
+        return kind[x] == K_VEC && gmono(i->b, depth + 1) && gmono(i->c, depth + 1);
+    default:
+        return 0;
+    }
+}
+
+static u32 gmin(u32 P, u32 a, u32 b, int max)
+{
+    u32 r = mk(P, OP_SELECT, IT_I32, mk(P, max ? OP_SGT : OP_SLT, IT_I32, a, b), a);
+    f->ins[r].c = b;
+    return r;
+}
+
+/* the least and the most x (gmono said yes) can be over the loop's count (i64) iterations, in the preheader P */
+static void grange(u32 x, u32 P, u32 count, u32 *lo, u32 *hi)
+{
+    Ins *i = &f->ins[x];
+    u32 alo, ahi, blo, bhi;
+    if (INV(x)) {
+        *lo = *hi = outside(x);
+        return;
+    }
+    if (kind[x] == K_IVPHI) {
+        int k = iv_index(x);
+        u32 t = mk(P, OP_TRUNC, IT_I32, mk(P, OP_SUB, IT_I64, count, ir_const(f, IT_I64, 1)), 0), e;
+        if (iv_step[k] != 1)
+            t = mk(P, OP_MUL, IT_I32, t, ir_const(f, IT_I32, (u64)iv_step[k]));
+        e = mk(P, OP_ADD, IT_I32, iv_init[k], t);
+        *lo = iv_step[k] > 0 ? iv_init[k] : e;
+        *hi = iv_step[k] > 0 ? e : iv_init[k];
+        return;
+    }
+    grange(i->op == OP_SELECT ? i->b : i->a, P, count, &alo, &ahi);
+    switch (i->op) {
+    case OP_ADD:
+        grange(i->b, P, count, &blo, &bhi);
+        *lo = mk(P, OP_ADD, IT_I32, alo, blo);
+        *hi = mk(P, OP_ADD, IT_I32, ahi, bhi);
+        return;
+    case OP_SUB:
+        grange(i->b, P, count, &blo, &bhi);
+        *lo = mk(P, OP_SUB, IT_I32, alo, bhi);
+        *hi = mk(P, OP_SUB, IT_I32, ahi, blo);
+        return;
+    case OP_SELECT:
+        grange(i->c, P, count, &blo, &bhi);
+        *lo = gmin(P, alo, blo, 0);
+        *hi = gmin(P, ahi, bhi, 1);
+        return;
+    default: /* shifts, multiplications by a positive constant: order kept (a logical shift only of what is not negative) */
+        *lo = mk(P, i->op, IT_I32, alo, i->b);
+        *hi = mk(P, i->op, IT_I32, ahi, i->b);
+        if (i->op == OP_SHR) {
+            /* where it may be negative, anything from 0 to all ones shifted */
+            u32 neg = mk(P, OP_SLT, IT_I32, alo, ir_const(f, IT_I32, 0)), r;
+            r = mk(P, OP_SELECT, IT_I32, neg, ir_const(f, IT_I32, 0));
+            f->ins[r].c = *lo;
+            *lo = r;
+            r = mk(P, OP_SELECT, IT_I32, neg, mk(P, OP_SHR, IT_I32, ir_const(f, IT_I32, 0xffffffffU), i->b));
+            f->ins[r].c = *hi;
+            *hi = r;
+        }
+        return;
+    }
+}
+
 static u32 missv; /* the instruction being looked at, for the report */
 #define MISS(why) \
     do { \
@@ -423,7 +520,7 @@ static int try_loop(u32 l, u32 n0)
     u32 pa[MAX_PAIRS], pb[MAX_PAIRS], np = 0;
     u8 pka[MAX_PAIRS], pkb[MAX_PAIRS];
     u32 nvec = 0, maxsh = 0, full_only = 0, vf, init64, n64, count, ok, vcnt, ivv, ivv2, sh, offend;
-    int uns, c, cty, tnext, lsh, wide = 0;
+    int uns, le, c, cty, tnext, lsh, wide = 0;
     i64 st;
     Ins *ci;
 
@@ -457,8 +554,11 @@ static int try_loop(u32 l, u32 n0)
     }
     cond = f->blk[l].arg;
     ci = &f->ins[cond];
-    if (cond >= n0 || (ci->op != OP_SLT && ci->op != OP_ULT && ci->op != OP_NE && ci->op != OP_SGT) || ci->blk != l)
+    missv = cond;
+    if (cond >= n0 || (ci->op != OP_SLT && ci->op != OP_ULT && ci->op != OP_NE && ci->op != OP_SGT && ci->op != OP_SLE &&
+                       ci->op != OP_ULE) || ci->blk != l)
         MISS("a loop test that is not handled");
+    missv = 0;
     t = ci->a;
     n = ci->b;
     if (!INV(n) || INV(t))
@@ -515,7 +615,10 @@ static int try_loop(u32 l, u32 n0)
             Ins *q = &f->ins[ri->a];
             u32 x = ri->b == ph ? ri->c : ri->b;
             int gt, uns_cmp, takes_x_when_true = ri->b != ph;
-            if (ri->ty != IT_I32 || INV(ri->a) || cnt[ri->a] != 1 || cnt[ph] != 2 || (ri->b != ph && ri->c != ph) || x == ph ||
+            /* floating point: x86-64's maxps / minps differ from the select only with NaNs and signed zeros, so they need
+               -ffinite-math-only too (in -ffast-math; -ffast-math -fno-finite-math-only keeps NaN results exact) */
+            int fl = (ri->ty == IT_F32 || ri->ty == IT_F64) && opt_fast_math && opt_finite_math && opt_arch == ARCH_X64;
+            if ((ri->ty != IT_I32 && !fl) || INV(ri->a) || cnt[ri->a] != 1 || cnt[ph] != 2 || (ri->b != ph && ri->c != ph) || x == ph ||
                 !((q->a == x && q->b == ph) || (q->a == ph && q->b == x)))
                 MISS("a value carried from one iteration to the next that is not a sum, maximum or minimum");
             switch (q->op) {
@@ -523,8 +626,12 @@ static int try_loop(u32 l, u32 n0)
             case OP_SLT: case OP_SLE: gt = 0; uns_cmp = 0; break;
             case OP_UGT: case OP_UGE: gt = 1; uns_cmp = 1; break;
             case OP_ULT: case OP_ULE: gt = 0; uns_cmp = 1; break;
+            case OP_FGT: case OP_FGE: gt = 1; uns_cmp = 0; break;
+            case OP_FLT: case OP_FLE: gt = 0; uns_cmp = 0; break;
             default: MISS("an operation that has no vector form");
             }
+            if (fl != (q->op >= OP_FEQ && q->op <= OP_FGE))
+                MISS("an operation that has no vector form");
             /* is the larger of the two kept? */
             if ((q->a == x) != takes_x_when_true)
                 gt = !gt;
@@ -569,6 +676,7 @@ static int try_loop(u32 l, u32 n0)
 
     lanesz = 0;
     mixed = 0;
+    ngth = 0;
     nsplat = 0;
     memset(iv_val, 0, sizeof iv_val);
     iv = 0;
@@ -597,6 +705,13 @@ static int try_loop(u32 l, u32 n0)
                 shift[v] = 0;
                 break;
             }
+            if (i->op == OP_SEXT32 && opt_arch == ARCH_X64 && opt_x64_sse41 && opt_vec_gather && !INV(i->a) && kind[i->a] != K_IVPHI &&
+                f->ins[i->a].ty == IT_I32 && is_vec(i->a)) {
+                kind[v] = K_GIDX; /* an index computed lane by lane: the load it addresses gathers */
+                shift[v] = 0;
+                base[v] = i->a;
+                break;
+            }
             if (!index_iv(i->a, IT_I32) || (ext && ext != i->op))
                 MISS("an index of an unsupported kind");
             ext = i->op;
@@ -604,6 +719,12 @@ static int try_loop(u32 l, u32 n0)
             shift[v] = 0;
             break;
         case OP_SHL:
+            if (!INV(i->a) && kind[i->a] == K_GIDX && !shift[i->a] && f->ins[i->b].op == OP_CONST && f->ins[i->b].a <= 3) {
+                kind[v] = K_GIDX;
+                shift[v] = (u8)f->ins[i->b].a;
+                base[v] = base[i->a];
+                break;
+            }
             if (!INV(i->a) && kind[i->a] == K_ADDR && !shift[i->a] && !ioff[i->a] && f->ins[i->b].op == OP_CONST &&
                 f->ins[i->b].a <= 3 && f->ins[i->b].a) {
                 /* (i + k) << s with i + k 64 bits wide (size_t indexes): k folded into where the array starts */
@@ -622,6 +743,20 @@ static int try_loop(u32 l, u32 n0)
             break;
         case OP_LOAD:
         case OP_STORE:
+            if (i->op == OP_LOAD && !INV(i->a) && kind[i->a] == K_GADDR) {
+                /* a gather: elements of four bytes or less, each lane its own (lanes of four bytes) */
+                if ((u32)mem_size(i->mem) != (u32)1 << shift[i->a] || mem_size(i->mem) > 4 || (i->flags & 0x80) || ngth == MAX_GATH ||
+                    !gmono(ioff[i->a], 0))
+                    MISS("a gather that is not handled");
+                if (!set_lane(M_32))
+                    mixed = 1;
+                if (maxmem < 4)
+                    maxmem = 4;
+                gth[ngth++] = v;
+                kind[v] = K_VEC;
+                nvec++;
+                break;
+            }
             if (!walks(i->a, (u32)mem_size(i->mem), &key))
                 MISS("a memory access that does not move by one element each time round");
             if (!set_lane(i->mem)) {
@@ -659,6 +794,13 @@ static int try_loop(u32 l, u32 n0)
         case OP_ADD:
             if (i->ty == IT_I64 && (INV(i->a) || INV(i->b))) {
                 u32 x = INV(i->a) ? i->b : i->a, y = INV(i->a) ? i->a : i->b;
+                if (!INV(x) && kind[x] == K_GIDX) {
+                    kind[v] = K_GADDR;
+                    shift[v] = shift[x];
+                    base[v] = y;
+                    ioff[v] = base[x];
+                    break;
+                }
                 if (!INV(x) && kind[x] == K_ADDR && !shift[x] && !ioff[x]) {
                     /* p + (i + k), bytes: k folded into where the array starts */
                     kind[v] = K_ADDR;
@@ -806,7 +948,8 @@ static int try_loop(u32 l, u32 n0)
     }
     if (opt_arch == ARCH_X64 && !opt_x64_sse41)
         for (k = 0; k < nred; k++)
-            if (red_op[k] == OP_VSMAX || red_op[k] == OP_VSMIN || red_op[k] == OP_VUMAX || red_op[k] == OP_VUMIN)
+            if ((red_op[k] == OP_VSMAX || red_op[k] == OP_VSMIN || red_op[k] == OP_VUMAX || red_op[k] == OP_VUMIN) &&
+                f->ins[red_phi[k]].ty == IT_I32)
                 MISS("a maximum or minimum that x86-64 has an instruction for only with -msse4.1");
     for (k = 0, j = 0; k < nkeys; k++)
         j += stored[k];
@@ -858,8 +1001,9 @@ static int try_loop(u32 l, u32 n0)
     st = iv_step[c];
     cty = f->ins[t].ty;
     tnext = t == iv_next[c];
-    uns = ci->op == OP_ULT;
-    if (f->ins[n].ty != cty)
+    uns = ci->op == OP_ULT || ci->op == OP_ULE;
+    le = ci->op == OP_SLE || ci->op == OP_ULE; /* i <= n: counted as i < n + 1, which 64 bits hold */
+    if (f->ins[n].ty != cty || (le && (cty != IT_I32 || st != 1 || !tnext)))
         MISS("a loop test that is not handled");
     if (st == 1 && tnext && ci->op != OP_SGT) {
         /* for (i = a; i < n; i++), or i != n */
@@ -897,6 +1041,8 @@ static int try_loop(u32 l, u32 n0)
     if (st == 1) {
         init64 = cty == IT_I32 ? mk(P, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, iv_init[c], 0) : iv_init[c];
         n64 = cty == IT_I32 ? mk(P, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, n, 0) : n;
+        if (le)
+            n64 = mk(P, OP_ADD, IT_I64, n64, C64(1));
         count = mk(P, OP_SUB, IT_I64, n64, init64);
         ok = mk(P, uns ? OP_ULT : OP_SLT, IT_I32, init64, n64);
     } else if (st == -1) {
@@ -970,6 +1116,28 @@ static int try_loop(u32 l, u32 n0)
             send = mk(P, OP_ADD, IT_I64, start[j], klsh[j] ? mk(P, OP_SHL, IT_I64, count, C64(klsh[j])) : count);
             ok = mk(P, OP_AND, IT_I32, ok,
                     mk(P, OP_OR, IT_I32, mk(P, OP_ULE, IT_I32, aend, start[j]), mk(P, OP_UGE, IT_I32, a, send)));
+        }
+    }
+    /* what a gather may read, from its index's first value to its last, must not be among the elements written */
+    for (k = 0; k < ngth; k++) {
+        u32 ga = f->ins[gth[k]].a, sh2 = shift[ga], lo, hi, glo, ghi, b0 = outside(base[ga]);
+        grange(ioff[ga], P, count, &lo, &hi);
+        ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_SLE, IT_I32, lo, hi));
+        glo = mk(P, OP_SEXT32, IT_I64, lo, 0);
+        ghi = mk(P, OP_SEXT32, IT_I64, hi, 0);
+        if (sh2) {
+            glo = mk(P, OP_SHL, IT_I64, glo, C64(sh2));
+            ghi = mk(P, OP_SHL, IT_I64, ghi, C64(sh2));
+        }
+        glo = mk(P, OP_ADD, IT_I64, b0, glo);
+        ghi = mk(P, OP_ADD, IT_I64, mk(P, OP_ADD, IT_I64, b0, ghi), C64((u64)1 << sh2));
+        for (j = 0; j < nkeys; j++) {
+            u32 send;
+            if (!stored[j])
+                continue;
+            send = mk(P, OP_ADD, IT_I64, start[j], klsh[j] ? mk(P, OP_SHL, IT_I64, count, C64(klsh[j])) : count);
+            ok = mk(P, OP_AND, IT_I32, ok,
+                    mk(P, OP_OR, IT_I32, mk(P, OP_ULE, IT_I32, ghi, start[j]), mk(P, OP_UGE, IT_I32, glo, send)));
         }
     }
     vcnt = mk(P, OP_SUB, IT_I64, count, C64(1));
@@ -1051,7 +1219,8 @@ static int try_loop(u32 l, u32 n0)
             Ins in = f->ins[v];
             u32 nv, x, y;
             int lk = lane_kind(in.ty);
-            if (v == cond || kind[v] == K_IVNEXT || kind[v] == K_IDX || kind[v] == K_ADDR || kind[v] == K_SKIP || kind[v] == K_LINV)
+            if (v == cond || kind[v] == K_IVNEXT || kind[v] == K_IDX || kind[v] == K_ADDR || kind[v] == K_SKIP || kind[v] == K_LINV ||
+                kind[v] == K_GIDX || kind[v] == K_GADDR)
                 continue;
             if (kind[v] == K_RED) {
                 for (k = 0; red_next[k] != v; k++)
@@ -1069,6 +1238,11 @@ static int try_loop(u32 l, u32 n0)
                 nv = mk(V, red_op[k], IT_V128, acc[k][u], vec_operand(red_x[k], P));
                 f->xargs[f->ins[acc[k][u]].a + 1] = nv;
                 acc[k][u] = nv;
+            } else if (in.op == OP_LOAD && kind[in.a] == K_GADDR) {
+                u32 ga = in.a;
+                nv = mk(V, OP_VGATHER, IT_V128, outside(base[ga]), vec_operand(ioff[ga], P));
+                f->ins[nv].c = shift[ga];
+                f->ins[nv].flags = in.mem; /* the elements' kind; the lanes are four bytes */
             } else if (in.op == OP_LOAD || in.op == OP_STORE) {
                 u32 off = offv;
                 walks(in.a, (u32)mem_size(in.mem), &key);

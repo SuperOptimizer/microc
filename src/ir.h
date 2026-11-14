@@ -61,6 +61,8 @@ enum {
     OP_VSUM,   /* the lanes of a combined into a scalar; flags: 0 sum, 1-4 as the next four, 5/6 sum of unsigned/signed lanes into a wider total */
     OP_VSMAX, OP_VSMIN, OP_VUMAX, OP_VUMIN, /* lane by lane */
     OP_VIOTA, /* 0, a, 2a, ... in the lanes; a is a number, not a value */
+    OP_VGATHER, /* lanes of four bytes: lane k = the element (kind in flags) at a + (b's lane k, sign-extended) << c (a number);
+                   x86-64 only (opt_vec.c, with SSE4.1) */
     OP_VMATH, /* lane by lane, b (a number, VM_*) of a: x86-64 only (opt_vec.c makes it from calls of sqrtf and the like) */
     OP_COUNT
 };
@@ -233,6 +235,7 @@ extern int opt_level;
 extern int opt_fast_math;
 extern int opt_finite_math; /* -ffinite-math-only (in -ffast-math): no NaN or infinity reaches a comparison, so a < b ? a : b may be a min */
 extern int opt_vec_report;
+extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
 extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */
 extern Obj *opt_obj;    /* opt_vec.c: the object the functions being optimised go to (for the names of what they call) */
 extern int opt_math_errno; /* x64.c: sqrt is a call, for errno (-fno-math-errno, -ffast-math: in line) */

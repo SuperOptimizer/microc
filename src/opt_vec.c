@@ -14,6 +14,7 @@
 #include <string.h>
 
 int opt_fast_math; /* floating-point sums may be reordered */
+int opt_finite_math;
 
 static Func *f;
 

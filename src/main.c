@@ -539,7 +539,15 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-fvec-report=2") == 0)
             opt_vec_report = 2; /* with the instruction that stopped it */
         else if (strcmp(a, "-ffast-math") == 0)
-            opt_fast_math = 1, opt_math_errno = 0;
+            opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1;
+        else if (strcmp(a, "-fassociative-math") == 0)
+            opt_fast_math = 1;
+        else if (strcmp(a, "-fno-associative-math") == 0)
+            opt_fast_math = 0;
+        else if (strcmp(a, "-ffinite-math-only") == 0)
+            opt_finite_math = 1;
+        else if (strcmp(a, "-fno-finite-math-only") == 0)
+            opt_finite_math = 0;
         else if (strcmp(a, "-fno-math-errno") == 0)
             opt_math_errno = 0;
         else if (strcmp(a, "-fmath-errno") == 0)

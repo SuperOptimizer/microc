@@ -1,0 +1,9 @@
+malloc 0 0 0 0
+saxpy no error
+4 104 202 1 2.5
+2016 6112 10208 14304
+dev 0: 7   2.50 text 5000000000 c ff
+dev 0: 784105 7168 -784105
+dev 1: 8   2.50 text 5000000000 c ff
+dev 1: 37211 8192 -37211
+free 0 0, last no error

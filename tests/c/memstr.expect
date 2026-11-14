@@ -1,0 +1,4 @@
+copy/set/move mismatches: 0
+strlen/strcmp/memcmp mismatches: 0
+qsort errors: 0 sum 716690808
+exit 0

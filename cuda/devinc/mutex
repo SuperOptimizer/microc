@@ -1,0 +1,15 @@
+/* mcc C++: std::mutex and std::lock_guard over pthreads. */
+#ifndef MCC_MUTEX
+#define MCC_MUTEX
+#include <pthread.h>
+namespace std {
+struct mutex { pthread_mutex_t m; };
+}
+extern "C" {
+static inline void __mcc_guard_lock(void *m) { pthread_mutex_lock((pthread_mutex_t *)m); }
+static inline void __mcc_guard_unlock(void *m) { pthread_mutex_unlock((pthread_mutex_t *)m); }
+}
+namespace std {
+template <class M> struct lock_guard { M *m; } __attribute__((mcc_guard));
+}
+#endif

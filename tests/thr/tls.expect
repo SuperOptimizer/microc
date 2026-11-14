@@ -1,0 +1,7 @@
+thread 1: 7
+thread 2: 7
+thread 3: 7
+thread 4: 7
+main: 42 initial 2.5 3 0 100 1000
+distinct 1 aligned 0 0
+bump 11 13

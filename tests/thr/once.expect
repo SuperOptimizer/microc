@@ -1,0 +1,7 @@
+once: 101, seen unfinished 0
+returned 360
+destructors 8, sum 36, chained 2
+main's value unset
+detached: destructors 13, sum 5036
+key reused 1, value unset
+self 1 0

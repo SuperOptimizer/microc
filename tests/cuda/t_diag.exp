@@ -1,0 +1,37 @@
+nullstore: 719
+mcuda: kernel nullstore, block (1,1,0), thread (2,1,0): memory access at the bad address 0x10 at PTX line 43 of t_diag.ptx
+00000000 00000000
+trapk: 719
+mcuda: kernel trapk, block (0,0,0), thread (1,0,0): trap at PTX line 53 of t_diag.ptx
+00000000 00000000
+deadlock: 719
+mcuda: kernel deadlock, block (0,0,0), thread (0,0,0): deadlock: thread (0,0,0) waits at a barrier on PTX line 60; thread (1,0,0) waits at a barrier on PTX line 60; thread (2,0,0) waits at a barrier on PTX line 60; 4 threads wait in all, the first at PTX line 60 of t_diag.ptx
+00000000 00000000
+gone: 0
+00000003 00000000
+stuck: 719
+mcuda: kernel stuck, block (0,0,0), thread (0,0,0): deadlock: thread (0,0,0) waits at a barrier on PTX line 89; thread (1,0,0) waits at vote.sync on PTX line 91; thread (2,0,0) waits at vote.sync on PTX line 91; 32 threads wait in all, the first at PTX line 89 of t_diag.ptx
+00000000 00000000
+mmapart: 719
+mcuda: kernel mmapart, block (0,0,0), thread (0,0,0): mma.sync needs all 32 threads of the warp at PTX line 100 of t_diag.ptx
+00000000 00000000
+badcall: 719
+mcuda: kernel badcall, block (0,0,0), thread (0,0,0): indirect call of something that is not a function (1234) at PTX line 111 of t_diag.ptx
+00000000 00000000
+deep: 719
+mcuda: kernel deep, block (0,0,0), thread (0,0,0): stack overflow (4128 more bytes wanted) at PTX line 120 of t_diag.ptx, in down
+00000000 00000000
+brx: 719
+mcuda: kernel brx, block (0,0,0), thread (1,0,0): brx.idx: the index 2 is outside the list of targets at PTX line 137 of t_diag.ptx
+00000000 00000000
+assert: 719
+mcuda: kernel assert, block (0,0,0), thread (0,0,0): assertion failed: x > 0, file k.cu, line 42, function k at PTX line 161 of t_diag.ptx
+00000000 00000000
+nofunc: 719
+mcuda: kernel nofunc, block (0,0,0), thread (0,0,0): call of the undefined function elsewhere at PTX line 176 of t_diag.ptx
+00000005 00000000
+unknown: 218
+t_diag.ptx:185: unknown: unknown instruction frobnicate.u32
+00000000 00000000
+fine: 0
+0000600d 00000000

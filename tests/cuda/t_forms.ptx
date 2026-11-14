@@ -1,0 +1,101 @@
+// The inline PTX of ufsm and of the device headers, in the very forms they are written in (operands filled in),
+// where the other tests use a different spelling.
+//! run forms 1 1 1 32 1 1 0 320
+.version 8.5
+.target sm_90
+.address_size 64
+
+.shared .align 16 .b8 smem[64];
+.global .align 16 .b8 gsrc[32] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+
+.visible .entry forms(.param .u64 out)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .reg .b16 %h1;
+    .reg .pred %p<3>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd2, %r1, 40;
+    add.u64 %rd1, %rd1, %rd2;
+    // 0: __ffs: one more than the place of the lowest set bit
+    or.b32 %r2, %r1, 0x100;
+    { .reg .b32 t; brev.b32 t, %r2; bfind.shiftamt.u32 t, t; add.s32 %r3, t, 1; }
+    st.global.u32 [%rd1], %r3;
+    // 1: any, all, ballot of lane & 4
+    and.b32 %r4, %r1, 4;
+    mov.u32 %r5, 0xffffffff;
+    { .reg .pred q; setp.ne.b32 q, %r4, 0; vote.sync.any.pred q, q, %r5; selp.b32 %r6, 1, 0, q; }
+    { .reg .pred q; setp.ne.b32 q, %r4, 0; vote.sync.all.pred q, q, %r5; selp.b32 %r7, 1, 0, q; }
+    { .reg .pred q; setp.ne.b32 q, %r4, 0; vote.sync.ballot.b32 %r8, q, %r5; }
+    shl.b32 %r7, %r7, 1;
+    or.b32 %r6, %r6, %r7;
+    xor.b32 %r6, %r6, %r8;
+    st.global.u32 [%rd1+4], %r6;                       // f0f0f0f1
+    // 2: __syncthreads_or, __syncthreads_and
+    { .reg .pred q; setp.ne.b32 q, %r4, 0; bar.red.or.pred q, 0, q; selp.b32 %r6, 1, 0, q; }
+    { .reg .pred q; setp.ne.b32 q, %r4, 0; bar.red.and.pred q, 0, q; selp.b32 %r7, 1, 0, q; }
+    shl.b32 %r7, %r7, 1;
+    or.b32 %r6, %r6, %r7;
+    st.global.u32 [%rd1+8], %r6;                       // 1
+    // 3: barriers with their operands in registers, and the warp's own
+    mov.u32 %r9, 1;
+    mov.u32 %r10, 32;
+    setp.lt.u32 %p1, %r1, 16;
+    bar.warp.sync %r5;
+    bar.sync %r9, %r10;
+    bar.arrive %r9, %r10;
+    bar.sync %r9, %r10;
+    bar.sync 0;
+    // cp.async with the source's size in a register (the other must be a constant): 16 bytes of room, 4 + lane & 3 of them from the source
+    mov.u64 %rd3, smem;
+    and.b32 %r11, %r1, 3;
+    cvt.u64.u32 %rd4, %r11;
+    shl.b64 %rd4, %rd4, 4;
+    add.u64 %rd3, %rd3, %rd4;
+    mov.u64 %rd5, gsrc;
+    mov.u32 %r12, 16;
+    add.u32 %r13, %r11, 4;
+    setp.ge.u32 %p2, %r1, 4;
+    @%p2 bra $Lskip;
+    cp.async.ca.shared.global [%rd3], [%rd5], 16, %r13;
+$Lskip:
+    cp.async.commit_group;
+    cp.async.wait_group 1;
+    cp.async.commit_group;
+cp.async.wait_group 0;
+    bar.sync 0;
+    ld.shared.u32 %r14, [%rd3+4];
+    st.global.u32 [%rd1+12], %r14;                     // 3: bytes 5.. of the source, as far as lane & 3 brought them
+    // 4: the largest lane number seen in shared memory, by 32-bit address
+    cvta.to.shared.u64 %rd6, %rd3;
+    cvt.u32.u64 %r15, %rd6;
+    red.shared.max.u32 [%r15+12], %r1;
+    bar.sync 0;
+    ld.shared.u32 %r16, [%r15+12];
+    st.global.u32 [%rd1+16], %r16;                     // 28 + (lane & 3)
+    // 5: an integer mma that adds into one register four times over (all of A is zero)
+    mov.u32 %r17, 0;
+    mov.u32 %r18, 100;
+    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%r19,%r20,%r21,%r22}, {%r17,%r17,%r17,%r17}, {%r17,%r17}, {%r18,%r18,%r18,%r18};
+    add.u32 %r19, %r19, %r20;
+    add.u32 %r19, %r19, %r21;
+    add.u32 %r19, %r19, %r22;
+    st.global.u32 [%rd1+20], %r19;                     // 400
+    // 6: ldmatrix with a register and a displacement
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r20}, [%r15+0];
+    // 7: fp8 pair from two floats, into a 16-bit register
+    mov.f32 %f1, 0f3FC00000;
+    cvt.rn.f32.u32 %f2, %r1;
+    cvt.rn.satfinite.e4m3x2.f32 %h1, %f1, %f2;
+    cvt.u32.u16 %r21, %h1;
+    st.global.u32 [%rd1+28], %r21;
+    cvt.rn.f16x2.e4m3x2 %r22, %h1;
+    st.global.u32 [%rd1+32], %r22;
+    // 9: tf32
+    mov.f32 %f3, 0f3F801000;
+    cvt.rna.tf32.f32 %r23, %f3;
+    st.global.u32 [%rd1+36], %r23;                     // 3f800000 + 2000 (rounded away at the half)
+    ret;
+}

@@ -1,0 +1,5 @@
+int 320000 op 960000 relaxed 960000
+byte 0 short 42496 sub 0 sync 320000
+max 319999 bits ff fp 40000
+mutex 320000 spin 80000 recursive 80000 flag 80000
+jobs 1 bad 0

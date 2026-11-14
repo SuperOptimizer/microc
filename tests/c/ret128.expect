@@ -1,0 +1,13 @@
+make 0123456789abcdeffedcba9876543210
+same 0123456789abcdeffedcba9876543210
+pointer 0123456789abcdeffedcba9876543211
+neg fedcba98765432100123456789abcdf0
+mul fffffffffffffff0000000000000000f
+odd 0123456789abcdf1fedcba9876543212
+far 0123456789abcdeffedcba987654322b
+small fedcba9876543210fedcba9876543210
+pick1 fffffffffffffffffffffffffffffffb
+pick0 fffffffffffffffffffffffffffffff7
+fact 00000d13f6370f96865df5dd54000000
+nested 0000000000000007000000000000000f
+exit 0

@@ -1,0 +1,76 @@
+// A loop of simple instructions, to time the interpreter: ptxt -t bench.ptx
+//! run spin 1 1 1 1 1 1 0 2
+//! run saxpy 64 1 1 256 1 1 0 4
+.version 8.5
+.target sm_86
+.address_size 64
+
+.visible .entry spin(.param .u64 out)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<3>;
+    .reg .pred %p1;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, 1;
+    mov.u32 %r2, 2;
+    mov.u32 %r3, 0;
+$L1:
+    add.u32 %r1, %r1, %r2;
+    xor.b32 %r2, %r2, %r1;
+    shl.b32 %r4, %r1, 3;
+    sub.u32 %r2, %r2, %r4;
+    add.u32 %r3, %r3, 1;
+    setp.lt.u32 %p1, %r3, 40000000;
+    @%p1 bra $L1;
+    st.global.u32 [%rd1], %r1;
+    st.global.u32 [%rd1+4], %r2;
+    ret;
+}
+
+// every thread walks 1024 floats of a table on its stack frame: loads, a fused multiply-add, stores
+.visible .entry saxpy(.param .u64 out)
+{
+    .local .align 4 .f32 buf[1024];
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<6>;
+    .reg .f32 %f<5>;
+    .reg .pred %p1;
+    ld.param.u64 %rd1, [out];
+    mov.u64 %rd2, buf;
+    mov.u32 %r1, 0;
+    mov.f32 %f1, 0f3F000000;
+$L0:
+    cvt.rn.f32.u32 %f2, %r1;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    st.f32 [%rd4], %f2;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p1, %r1, 1024;
+    @%p1 bra $L0;
+    mov.u32 %r2, 0;
+$L2:
+    mov.u32 %r1, 0;
+$L1:
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.f32 %f2, [%rd4];
+    fma.rn.f32 %f3, %f2, %f1, %f2;
+    st.f32 [%rd4], %f3;
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p1, %r1, 1024;
+    @%p1 bra $L1;
+    add.u32 %r2, %r2, 1;
+    setp.lt.u32 %p1, %r2, 4;
+    @%p1 bra $L2;
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %ctaid.x;
+    or.b32 %r3, %r3, %r4;
+    setp.ne.u32 %p1, %r3, 0;
+    @%p1 bra $L9;
+    ld.f32 %f4, [%rd2+8];
+    st.global.f32 [%rd1], %f4;
+    ld.f32 %f4, [%rd2+4092];
+    st.global.f32 [%rd1+4], %f4;
+$L9:
+    ret;
+}

@@ -1,0 +1,66 @@
+gpuptx: the PTX tests on a real GPU (tests/cuda/gpuptx.sh, gpuptx.c), and what is known to differ.
+Last run: RTX PRO 4000 Blackwell (sm_120), driver 595, CUDA 13.2, x86_64 Linux. 18 of the 23 tests print
+exactly their .exp: all nine g_* (every instruction of gen.py: integers, f32/f64 in the four rounding modes,
+cvt with .sat/.ftz and what is not a number, the 8- and 4-bit formats, mma in every shape with the
+block-scaled ones, ldmatrix) and t_atom t_basic t_call t_ext t_forms t_half t_mem t_par t_sync.
+
+The five that differ, and must:
+  t_bad1 t_bad2 t_bad3   wrong PTX. Both refuse it, with words of their own; the hardware's assembler at the
+                         load, the engine at the load (t_bad1) or the launch (218, the others).
+  t_diag                 what the engine says of kernels that go wrong (a bad address, trap, a barrier nobody
+                         else reaches, ...). The device does not load the module at all: the assembler knows no
+                         "frobnicate" and wants the thread count of bar.sync to be a multiple of 32.
+  t_lib                  calls the engine's own library (__mcuda_*, printf): there is none on the device. And the
+                         assembler wants a function declared with a result to be called with one; the engine
+                         takes the call both ways.
+
+Where the hardware was found to differ from what the tests first said, and what was done:
+ the engine was wrong (changed, the tests with it)
+  testp.normal           true for +0 and -0.
+  fns.b32                a base above 31 gives 0xffffffff (the engine took base & 31).
+  cvt to an integer of what is not a number: 0 only from .f32 to 32 bits or fewer; from .f64, or to 64 bits,
+                         the top bit of the type (0x80000000, 0x8000000000000000; .s8 -128, .u8 128, .s16
+                         -32768 from .f64). The PTX manual says 0.
+  activemask, ldmatrix with a 32-bit .shared address: see the lead's tests tc.cu and intr.cu.
+ the test was wrong (changed)
+  cvt.sat between integers where the destination holds every source value (u64.u32, s32.s32, ...): refused.
+  mma ... .tf32: the registers of A and B are .b32, not .f32.     ldmatrix .x1: the destination is {%r}.
+  cp.async: the size of the copy is a constant (4, 8, 16); only the source's size may be a register.
+  ldu: not on .local.      sub.bf16 and its like want sm_90, the fp8 conversions sm_89, e2m1 and the
+  block-scaled mma sm_120a with .version 9.1 (4X with .ue8m0), so those modules now say so.
+  A pointer from alloca, or the address of a .local, is a local address: ld.local/st.local, or cvta.local
+  first. A plain ld/st of it is CUDA_ERROR_ILLEGAL_ADDRESS. (The engine takes both.)
+  Every access must be at a multiple of its size, a vector's being that of the whole vector
+  (CUDA_ERROR_MISALIGNED_ADDRESS). (The engine does not look.)
+ different, and left so (the tests no longer show it)
+  Constants. The assembler works out at build time what it can, and not always as the device would:
+  sub.rn.f32 of 1.5 and 16777215 as two literals gave another last bit than the instruction run on the
+  device, which agrees with the engine. gen.py now passes every constant through an xor with a zero read
+  from memory.
+  Very long kernels. cvt.rni.s32.f64 and cvt.rzi.u32.f64 of +inf gave 0 in a kernel of 10270 lines and the
+  largest number, as they must, in any shorter cut of it. gen.py now ends a kernel after about 1500 lines.
+  %nwarpid is 48 whatever the block (the engine: the block's warps). %total_smem_size is rounded up (128 for
+  32 static + 64 dynamic bytes; the engine: 96), and shared addresses start at 0x400 (the engine: 0).
+  The texts of errors, and when wrong PTX is refused (above).
+  The sums of a floating-point mma. g_mma agrees with the device because its sums are exact. Where they are
+  not, the device cuts where the engine rounds (the engine adds in double precision and rounds to the nearest
+  once): of random f16 data about half the words differ, mostly by one in the last place, more where terms
+  cancel. This is left so by default, because the cut is a property of one generation of the hardware and
+  the rounded sum is the better one; MCUDA_MMA_HW=1 in the environment (mc_mma_hw(1) in a program, a line
+  "//! hw" in a test for ptxt) makes the engine cut as the device does, interpreter and JIT alike.
+  tests/cuda/mmahw.py says exactly what the device does, and tests/cuda/hw/mma.txt has 18688 of its words
+  (146 sets of random data with full significands, wide and narrow ranges of exponents, zeros, subnormal
+  numbers, sums that cancel), all of which that model gives; h_mma.ptx is those sets as a test that runs with
+  the switch, and the device prints the same for it. Modelled, and every word the device's: m16n8k16 and
+  m16n8k8 of f16 with f32 and f16 sums, bf16, tf32 (m16n8k8, m16n8k4), e4m3 and e5m2 (m16n8k32), and the
+  block-scaled kinds: mxf8f6f4 1X with e4m3, e5m2, e2m3, e3m2 and e2m1 elements, mxf4 2X, mxf4nvf4 2X and 4X
+  (those of e2m1 in four bits add sixteen products exactly before they cut, 35 bits below the largest scale).
+  Not modelled (the default's sum in both modes): a sum with an infinity or a NaN among its terms or scales;
+  its result was only looked at without scales. The cost of the switch: 2.2 times the time of a loop of
+  m16n8k16 f16 mma (an assembly routine for that shape; the others go through C: 8 to 10 times when that shape was made to).
+  Without the switch only this much is the device's: a NaN from an mma that is not block-scaled is
+  0x7fffffff (0x7fff in .f16), and a sum that is zero is +0 whatever the signs.
+  e2m1 in the bytes of mxf8f6f4 is bits 2 to 5 of the byte; the device reads bits 0 to 5 as e2m3, which is the
+  same number when bits 0 and 1 are zero and another when not. The engine now reads it as the device does.
+Not looked at here: NaN payloads beyond the canonical one, the approximate instructions (rcp.approx, sin,
+...), which the generated tests do not use.

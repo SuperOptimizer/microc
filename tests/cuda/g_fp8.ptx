@@ -1,0 +1,1558 @@
+//! run k0 1 1 1 1 1 1 0 508
+//! run k1 1 1 1 1 1 1 0 5
+// made by gen.py
+.version 9.1
+.target sm_120a
+.address_size 64
+
+.visible .entry k0(.param .u64 out)
+{
+    .reg .b64 %ro;
+    .reg .b32 %a, %b, %c, %e, %x;
+    .reg .b64 %la, %lb, %lc, %le, %lx;
+    .reg .b16 %ha, %hb, %hc, %hx;
+    .reg .f32 %fa, %fb, %fc, %fx;
+    .reg .f64 %da, %db, %dc, %dx;
+    .reg .pred %p, %q;
+    .reg .b32 %z, %zt;
+    .reg .b64 %zl, %zu;
+    .reg .b16 %zh;
+    ld.param.u64 %ro, [out];
+    ld.global.u32 %z, [%ro];
+    cvt.u64.u32 %zl, %z;
+    cvt.u16.u32 %zh, %z;
+    mov.f32 %fa, 0f00000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+0], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+4], %x;
+    mov.f32 %fa, 0f3F800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fBF800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+8], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+12], %x;
+    mov.f32 %fa, 0fBF800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F000000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+16], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+20], %x;
+    mov.f32 %fa, 0f3F000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f43E00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+24], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+28], %x;
+    mov.f32 %fa, 0f43E00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f43E80000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+32], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+36], %x;
+    mov.f32 %fa, 0f43E80000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f43E88000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+40], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+44], %x;
+    mov.f32 %fa, 0f43E88000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f43F00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+48], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+52], %x;
+    mov.f32 %fa, 0f43F00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f4E6E6B28; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+56], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+60], %x;
+    mov.f32 %fa, 0f4E6E6B28; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fCE6E6B28; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+64], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+68], %x;
+    mov.f32 %fa, 0fCE6E6B28; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3B000000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+72], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+76], %x;
+    mov.f32 %fa, 0f3B000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3A800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+80], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+84], %x;
+    mov.f32 %fa, 0f3A800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3B400000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+88], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+92], %x;
+    mov.f32 %fa, 0f3B400000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F880000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+96], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+100], %x;
+    mov.f32 %fa, 0f3F880000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F980000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+104], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+108], %x;
+    mov.f32 %fa, 0f3F980000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40533333; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+112], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+116], %x;
+    mov.f32 %fa, 0f40533333; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fC0F8A3D7; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+120], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+124], %x;
+    mov.f32 %fa, 0fC0F8A3D7; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f47600000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+128], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+132], %x;
+    mov.f32 %fa, 0f47600000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f47700000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+136], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+140], %x;
+    mov.f32 %fa, 0f47700000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f47700100; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+144], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+148], %x;
+    mov.f32 %fa, 0f47700100; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f37800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+152], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+156], %x;
+    mov.f32 %fa, 0f37800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f37000000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+160], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+164], %x;
+    mov.f32 %fa, 0f37000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f37BFFF9B; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+168], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+172], %x;
+    mov.f32 %fa, 0f37BFFF9B; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f42C80000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+176], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+180], %x;
+    mov.f32 %fa, 0f42C80000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3E99999A; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+184], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+188], %x;
+    mov.f32 %fa, 0f3E99999A; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f41D00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+192], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+196], %x;
+    mov.f32 %fa, 0f41D00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f41D80000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+200], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+204], %x;
+    mov.f32 %fa, 0f41D80000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3C800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+208], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+212], %x;
+    mov.f32 %fa, 0f3C800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fBC700000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+216], %x;
+    cvt.rn.satfinite.e5m2x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+220], %x;
+    mov.f32 %fa, 0f00000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3E800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+224], %x;
+    mov.f32 %fa, 0f3E800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3E800003; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+228], %x;
+    mov.f32 %fa, 0f3E800003; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F000000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+232], %x;
+    mov.f32 %fa, 0f3F000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F400000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+236], %x;
+    mov.f32 %fa, 0f3F400000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3F800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+240], %x;
+    mov.f32 %fa, 0f3F800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3FA00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+244], %x;
+    mov.f32 %fa, 0f3FA00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3FC00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+248], %x;
+    mov.f32 %fa, 0f3FC00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3FE00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+252], %x;
+    mov.f32 %fa, 0f3FE00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40000000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+256], %x;
+    mov.f32 %fa, 0f40000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40200000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+260], %x;
+    mov.f32 %fa, 0f40200000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f401FFE5D; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+264], %x;
+    mov.f32 %fa, 0f401FFE5D; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40400000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+268], %x;
+    mov.f32 %fa, 0f40400000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40600000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+272], %x;
+    mov.f32 %fa, 0f40600000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+276], %x;
+    mov.f32 %fa, 0f40800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40A00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+280], %x;
+    mov.f32 %fa, 0f40A00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40A000D2; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+284], %x;
+    mov.f32 %fa, 0f40A000D2; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40C00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+288], %x;
+    mov.f32 %fa, 0f40C00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f40E00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+292], %x;
+    mov.f32 %fa, 0f40E00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f4E6E6B28; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+296], %x;
+    mov.f32 %fa, 0f4E6E6B28; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f80000000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+300], %x;
+    mov.f32 %fa, 0f80000000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fBE800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+304], %x;
+    mov.f32 %fa, 0fBE800000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fBF400000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+308], %x;
+    mov.f32 %fa, 0fBF400000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fBFA00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+312], %x;
+    mov.f32 %fa, 0fBFA00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fC0200000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+316], %x;
+    mov.f32 %fa, 0fC0200000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fC0600000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+320], %x;
+    mov.f32 %fa, 0fC0600000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fC0A00000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+324], %x;
+    mov.f32 %fa, 0fC0A00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fC1100000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+328], %x;
+    mov.f32 %fa, 0fC1100000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f3DCCCCCD; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+332], %x;
+    mov.f32 %fa, 0f3DCCCCCD; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0fBE99999A; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+336], %x;
+    mov.b32 %a, 0x5500; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+340], %x;
+    mov.b32 %a, 0x5501; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+344], %x;
+    mov.b32 %a, 0x5502; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+348], %x;
+    mov.b32 %a, 0x5503; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+352], %x;
+    mov.b32 %a, 0x5504; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+356], %x;
+    mov.b32 %a, 0x5505; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+360], %x;
+    mov.b32 %a, 0x5506; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+364], %x;
+    mov.b32 %a, 0x5507; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+368], %x;
+    mov.b32 %a, 0x5508; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+372], %x;
+    mov.b32 %a, 0x5509; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+376], %x;
+    mov.b32 %a, 0x550a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+380], %x;
+    mov.b32 %a, 0x550b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+384], %x;
+    mov.b32 %a, 0x550c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+388], %x;
+    mov.b32 %a, 0x550d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+392], %x;
+    mov.b32 %a, 0x550e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+396], %x;
+    mov.b32 %a, 0x550f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+400], %x;
+    mov.b32 %a, 0x5510; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+404], %x;
+    mov.b32 %a, 0x5511; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+408], %x;
+    mov.b32 %a, 0x5512; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+412], %x;
+    mov.b32 %a, 0x5513; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+416], %x;
+    mov.b32 %a, 0x5514; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+420], %x;
+    mov.b32 %a, 0x5515; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+424], %x;
+    mov.b32 %a, 0x5516; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+428], %x;
+    mov.b32 %a, 0x5517; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+432], %x;
+    mov.b32 %a, 0x5518; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+436], %x;
+    mov.b32 %a, 0x5519; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+440], %x;
+    mov.b32 %a, 0x551a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+444], %x;
+    mov.b32 %a, 0x551b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+448], %x;
+    mov.b32 %a, 0x551c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+452], %x;
+    mov.b32 %a, 0x551d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+456], %x;
+    mov.b32 %a, 0x551e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+460], %x;
+    mov.b32 %a, 0x551f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+464], %x;
+    mov.b32 %a, 0x5520; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+468], %x;
+    mov.b32 %a, 0x5521; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+472], %x;
+    mov.b32 %a, 0x5522; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+476], %x;
+    mov.b32 %a, 0x5523; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+480], %x;
+    mov.b32 %a, 0x5524; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+484], %x;
+    mov.b32 %a, 0x5525; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+488], %x;
+    mov.b32 %a, 0x5526; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+492], %x;
+    mov.b32 %a, 0x5527; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+496], %x;
+    mov.b32 %a, 0x5528; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+500], %x;
+    mov.b32 %a, 0x5529; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+504], %x;
+    mov.b32 %a, 0x552a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+508], %x;
+    mov.b32 %a, 0x552b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+512], %x;
+    mov.b32 %a, 0x552c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+516], %x;
+    mov.b32 %a, 0x552d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+520], %x;
+    mov.b32 %a, 0x552e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+524], %x;
+    mov.b32 %a, 0x552f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+528], %x;
+    mov.b32 %a, 0x5530; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+532], %x;
+    mov.b32 %a, 0x5531; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+536], %x;
+    mov.b32 %a, 0x5532; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+540], %x;
+    mov.b32 %a, 0x5533; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+544], %x;
+    mov.b32 %a, 0x5534; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+548], %x;
+    mov.b32 %a, 0x5535; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+552], %x;
+    mov.b32 %a, 0x5536; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+556], %x;
+    mov.b32 %a, 0x5537; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+560], %x;
+    mov.b32 %a, 0x5538; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+564], %x;
+    mov.b32 %a, 0x5539; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+568], %x;
+    mov.b32 %a, 0x553a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+572], %x;
+    mov.b32 %a, 0x553b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+576], %x;
+    mov.b32 %a, 0x553c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+580], %x;
+    mov.b32 %a, 0x553d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+584], %x;
+    mov.b32 %a, 0x553e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+588], %x;
+    mov.b32 %a, 0x553f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+592], %x;
+    mov.b32 %a, 0x5540; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+596], %x;
+    mov.b32 %a, 0x5541; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+600], %x;
+    mov.b32 %a, 0x5542; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+604], %x;
+    mov.b32 %a, 0x5543; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+608], %x;
+    mov.b32 %a, 0x5544; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+612], %x;
+    mov.b32 %a, 0x5545; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+616], %x;
+    mov.b32 %a, 0x5546; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+620], %x;
+    mov.b32 %a, 0x5547; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+624], %x;
+    mov.b32 %a, 0x5548; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+628], %x;
+    mov.b32 %a, 0x5549; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+632], %x;
+    mov.b32 %a, 0x554a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+636], %x;
+    mov.b32 %a, 0x554b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+640], %x;
+    mov.b32 %a, 0x554c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+644], %x;
+    mov.b32 %a, 0x554d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+648], %x;
+    mov.b32 %a, 0x554e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+652], %x;
+    mov.b32 %a, 0x554f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+656], %x;
+    mov.b32 %a, 0x5550; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+660], %x;
+    mov.b32 %a, 0x5551; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+664], %x;
+    mov.b32 %a, 0x5552; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+668], %x;
+    mov.b32 %a, 0x5553; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+672], %x;
+    mov.b32 %a, 0x5554; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+676], %x;
+    mov.b32 %a, 0x5555; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+680], %x;
+    mov.b32 %a, 0x5556; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+684], %x;
+    mov.b32 %a, 0x5557; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+688], %x;
+    mov.b32 %a, 0x5558; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+692], %x;
+    mov.b32 %a, 0x5559; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+696], %x;
+    mov.b32 %a, 0x555a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+700], %x;
+    mov.b32 %a, 0x555b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+704], %x;
+    mov.b32 %a, 0x555c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+708], %x;
+    mov.b32 %a, 0x555d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+712], %x;
+    mov.b32 %a, 0x555e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+716], %x;
+    mov.b32 %a, 0x555f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+720], %x;
+    mov.b32 %a, 0x5560; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+724], %x;
+    mov.b32 %a, 0x5561; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+728], %x;
+    mov.b32 %a, 0x5562; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+732], %x;
+    mov.b32 %a, 0x5563; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+736], %x;
+    mov.b32 %a, 0x5564; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+740], %x;
+    mov.b32 %a, 0x5565; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+744], %x;
+    mov.b32 %a, 0x5566; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+748], %x;
+    mov.b32 %a, 0x5567; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+752], %x;
+    mov.b32 %a, 0x5568; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+756], %x;
+    mov.b32 %a, 0x5569; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+760], %x;
+    mov.b32 %a, 0x556a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+764], %x;
+    mov.b32 %a, 0x556b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+768], %x;
+    mov.b32 %a, 0x556c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+772], %x;
+    mov.b32 %a, 0x556d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+776], %x;
+    mov.b32 %a, 0x556e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+780], %x;
+    mov.b32 %a, 0x556f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+784], %x;
+    mov.b32 %a, 0x5570; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+788], %x;
+    mov.b32 %a, 0x5571; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+792], %x;
+    mov.b32 %a, 0x5572; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+796], %x;
+    mov.b32 %a, 0x5573; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+800], %x;
+    mov.b32 %a, 0x5574; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+804], %x;
+    mov.b32 %a, 0x5575; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+808], %x;
+    mov.b32 %a, 0x5576; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+812], %x;
+    mov.b32 %a, 0x5577; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+816], %x;
+    mov.b32 %a, 0x5578; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+820], %x;
+    mov.b32 %a, 0x5579; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+824], %x;
+    mov.b32 %a, 0x557a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+828], %x;
+    mov.b32 %a, 0x557b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+832], %x;
+    mov.b32 %a, 0x557c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+836], %x;
+    mov.b32 %a, 0x557d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+840], %x;
+    mov.b32 %a, 0x557e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+844], %x;
+    mov.b32 %a, 0x557f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+848], %x;
+    mov.b32 %a, 0x5580; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+852], %x;
+    mov.b32 %a, 0x5581; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+856], %x;
+    mov.b32 %a, 0x5582; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+860], %x;
+    mov.b32 %a, 0x5583; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+864], %x;
+    mov.b32 %a, 0x5584; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+868], %x;
+    mov.b32 %a, 0x5585; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+872], %x;
+    mov.b32 %a, 0x5586; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+876], %x;
+    mov.b32 %a, 0x5587; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+880], %x;
+    mov.b32 %a, 0x5588; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+884], %x;
+    mov.b32 %a, 0x5589; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+888], %x;
+    mov.b32 %a, 0x558a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+892], %x;
+    mov.b32 %a, 0x558b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+896], %x;
+    mov.b32 %a, 0x558c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+900], %x;
+    mov.b32 %a, 0x558d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+904], %x;
+    mov.b32 %a, 0x558e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+908], %x;
+    mov.b32 %a, 0x558f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+912], %x;
+    mov.b32 %a, 0x5590; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+916], %x;
+    mov.b32 %a, 0x5591; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+920], %x;
+    mov.b32 %a, 0x5592; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+924], %x;
+    mov.b32 %a, 0x5593; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+928], %x;
+    mov.b32 %a, 0x5594; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+932], %x;
+    mov.b32 %a, 0x5595; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+936], %x;
+    mov.b32 %a, 0x5596; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+940], %x;
+    mov.b32 %a, 0x5597; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+944], %x;
+    mov.b32 %a, 0x5598; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+948], %x;
+    mov.b32 %a, 0x5599; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+952], %x;
+    mov.b32 %a, 0x559a; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+956], %x;
+    mov.b32 %a, 0x559b; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+960], %x;
+    mov.b32 %a, 0x559c; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+964], %x;
+    mov.b32 %a, 0x559d; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+968], %x;
+    mov.b32 %a, 0x559e; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+972], %x;
+    mov.b32 %a, 0x559f; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+976], %x;
+    mov.b32 %a, 0x55a0; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+980], %x;
+    mov.b32 %a, 0x55a1; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+984], %x;
+    mov.b32 %a, 0x55a2; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+988], %x;
+    mov.b32 %a, 0x55a3; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+992], %x;
+    mov.b32 %a, 0x55a4; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+996], %x;
+    mov.b32 %a, 0x55a5; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1000], %x;
+    mov.b32 %a, 0x55a6; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1004], %x;
+    mov.b32 %a, 0x55a7; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1008], %x;
+    mov.b32 %a, 0x55a8; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1012], %x;
+    mov.b32 %a, 0x55a9; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1016], %x;
+    mov.b32 %a, 0x55aa; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1020], %x;
+    mov.b32 %a, 0x55ab; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1024], %x;
+    mov.b32 %a, 0x55ac; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1028], %x;
+    mov.b32 %a, 0x55ad; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1032], %x;
+    mov.b32 %a, 0x55ae; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1036], %x;
+    mov.b32 %a, 0x55af; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1040], %x;
+    mov.b32 %a, 0x55b0; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1044], %x;
+    mov.b32 %a, 0x55b1; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1048], %x;
+    mov.b32 %a, 0x55b2; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1052], %x;
+    mov.b32 %a, 0x55b3; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1056], %x;
+    mov.b32 %a, 0x55b4; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1060], %x;
+    mov.b32 %a, 0x55b5; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1064], %x;
+    mov.b32 %a, 0x55b6; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1068], %x;
+    mov.b32 %a, 0x55b7; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1072], %x;
+    mov.b32 %a, 0x55b8; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1076], %x;
+    mov.b32 %a, 0x55b9; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1080], %x;
+    mov.b32 %a, 0x55ba; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1084], %x;
+    mov.b32 %a, 0x55bb; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1088], %x;
+    mov.b32 %a, 0x55bc; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1092], %x;
+    mov.b32 %a, 0x55bd; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1096], %x;
+    mov.b32 %a, 0x55be; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1100], %x;
+    mov.b32 %a, 0x55bf; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1104], %x;
+    mov.b32 %a, 0x55c0; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1108], %x;
+    mov.b32 %a, 0x55c1; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1112], %x;
+    mov.b32 %a, 0x55c2; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1116], %x;
+    mov.b32 %a, 0x55c3; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1120], %x;
+    mov.b32 %a, 0x55c4; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1124], %x;
+    mov.b32 %a, 0x55c5; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1128], %x;
+    mov.b32 %a, 0x55c6; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1132], %x;
+    mov.b32 %a, 0x55c7; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1136], %x;
+    mov.b32 %a, 0x55c8; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1140], %x;
+    mov.b32 %a, 0x55c9; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1144], %x;
+    mov.b32 %a, 0x55ca; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1148], %x;
+    mov.b32 %a, 0x55cb; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1152], %x;
+    mov.b32 %a, 0x55cc; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1156], %x;
+    mov.b32 %a, 0x55cd; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1160], %x;
+    mov.b32 %a, 0x55ce; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1164], %x;
+    mov.b32 %a, 0x55cf; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1168], %x;
+    mov.b32 %a, 0x55d0; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1172], %x;
+    mov.b32 %a, 0x55d1; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1176], %x;
+    mov.b32 %a, 0x55d2; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1180], %x;
+    mov.b32 %a, 0x55d3; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1184], %x;
+    mov.b32 %a, 0x55d4; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1188], %x;
+    mov.b32 %a, 0x55d5; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1192], %x;
+    mov.b32 %a, 0x55d6; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1196], %x;
+    mov.b32 %a, 0x55d7; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1200], %x;
+    mov.b32 %a, 0x55d8; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1204], %x;
+    mov.b32 %a, 0x55d9; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1208], %x;
+    mov.b32 %a, 0x55da; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1212], %x;
+    mov.b32 %a, 0x55db; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1216], %x;
+    mov.b32 %a, 0x55dc; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1220], %x;
+    mov.b32 %a, 0x55dd; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1224], %x;
+    mov.b32 %a, 0x55de; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1228], %x;
+    mov.b32 %a, 0x55df; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1232], %x;
+    mov.b32 %a, 0x55e0; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1236], %x;
+    mov.b32 %a, 0x55e1; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1240], %x;
+    mov.b32 %a, 0x55e2; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1244], %x;
+    mov.b32 %a, 0x55e3; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1248], %x;
+    mov.b32 %a, 0x55e4; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1252], %x;
+    mov.b32 %a, 0x55e5; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1256], %x;
+    mov.b32 %a, 0x55e6; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1260], %x;
+    mov.b32 %a, 0x55e7; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1264], %x;
+    mov.b32 %a, 0x55e8; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1268], %x;
+    mov.b32 %a, 0x55e9; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1272], %x;
+    mov.b32 %a, 0x55ea; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1276], %x;
+    mov.b32 %a, 0x55eb; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1280], %x;
+    mov.b32 %a, 0x55ec; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1284], %x;
+    mov.b32 %a, 0x55ed; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1288], %x;
+    mov.b32 %a, 0x55ee; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1292], %x;
+    mov.b32 %a, 0x55ef; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1296], %x;
+    mov.b32 %a, 0x55f0; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1300], %x;
+    mov.b32 %a, 0x55f1; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1304], %x;
+    mov.b32 %a, 0x55f2; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1308], %x;
+    mov.b32 %a, 0x55f3; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1312], %x;
+    mov.b32 %a, 0x55f4; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1316], %x;
+    mov.b32 %a, 0x55f5; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1320], %x;
+    mov.b32 %a, 0x55f6; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1324], %x;
+    mov.b32 %a, 0x55f7; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1328], %x;
+    mov.b32 %a, 0x55f8; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1332], %x;
+    mov.b32 %a, 0x55f9; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1336], %x;
+    mov.b32 %a, 0x55fa; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1340], %x;
+    mov.b32 %a, 0x55fb; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1344], %x;
+    mov.b32 %a, 0x55fc; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1348], %x;
+    mov.b32 %a, 0x55fd; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1352], %x;
+    mov.b32 %a, 0x55fe; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1356], %x;
+    mov.b32 %a, 0x55ff; xor.b32 %a, %a, %z;
+    { .reg .b8 t; cvt.u8.u32 t, %a; cvt.rn.f16x2.e2m1x2 %x, t; }
+    st.global.b32 [%ro+1360], %x;
+    mov.f32 %fa, 0f7FC00000; mov.b32 %zt, %fa; xor.b32 %zt, %zt, %z; mov.b32 %fa, %zt; mov.f32 %fb, 0f7F800000; mov.b32 %zt, %fb; xor.b32 %zt, %zt, %z; mov.b32 %fb, %zt; mov.f32 %fc, 0fFF800000; mov.b32 %zt, %fc; xor.b32 %zt, %zt, %z; mov.b32 %fc, %zt;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fa, %fb;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+1364], %x;
+    cvt.rn.satfinite.e4m3x2.f32 %hx, %fc, %fa;
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+1368], %x;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fa, %fb; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+1372], %x;
+    { .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %fc, %fa; cvt.u16.u8 %hx, t; }
+    cvt.u32.u16 %x, %hx;
+    st.global.b32 [%ro+1376], %x;
+    mov.b16 %ha, 0x0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1380], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1384], %x;
+    mov.b16 %ha, 0x304; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1388], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1392], %x;
+    mov.b16 %ha, 0x608; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1396], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1400], %x;
+    mov.b16 %ha, 0x90c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1404], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1408], %x;
+    mov.b16 %ha, 0xc10; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1412], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1416], %x;
+    mov.b16 %ha, 0xf14; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1420], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1424], %x;
+    mov.b16 %ha, 0x1218; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1428], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1432], %x;
+    mov.b16 %ha, 0x151c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1436], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1440], %x;
+    mov.b16 %ha, 0x1820; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1444], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1448], %x;
+    mov.b16 %ha, 0x1b24; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1452], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1456], %x;
+    mov.b16 %ha, 0x1e28; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1460], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1464], %x;
+    mov.b16 %ha, 0x212c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1468], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1472], %x;
+    mov.b16 %ha, 0x2430; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1476], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1480], %x;
+    mov.b16 %ha, 0x2734; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1484], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1488], %x;
+    mov.b16 %ha, 0x2a38; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1492], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1496], %x;
+    mov.b16 %ha, 0x2d3c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1500], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1504], %x;
+    mov.b16 %ha, 0x3040; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1508], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1512], %x;
+    mov.b16 %ha, 0x3344; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1516], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1520], %x;
+    mov.b16 %ha, 0x3648; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1524], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1528], %x;
+    mov.b16 %ha, 0x394c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1532], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1536], %x;
+    mov.b16 %ha, 0x3c50; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1540], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1544], %x;
+    mov.b16 %ha, 0x3f54; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1548], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1552], %x;
+    mov.b16 %ha, 0x4258; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1556], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1560], %x;
+    mov.b16 %ha, 0x455c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1564], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1568], %x;
+    mov.b16 %ha, 0x4860; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1572], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1576], %x;
+    mov.b16 %ha, 0x4b64; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1580], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1584], %x;
+    mov.b16 %ha, 0x4e68; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1588], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1592], %x;
+    mov.b16 %ha, 0x516c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1596], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1600], %x;
+    mov.b16 %ha, 0x5470; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1604], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1608], %x;
+    mov.b16 %ha, 0x5774; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1612], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1616], %x;
+    mov.b16 %ha, 0x5a78; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1620], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1624], %x;
+    mov.b16 %ha, 0x5d7c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1628], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1632], %x;
+    mov.b16 %ha, 0x6080; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1636], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1640], %x;
+    mov.b16 %ha, 0x6384; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1644], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1648], %x;
+    mov.b16 %ha, 0x6688; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1652], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1656], %x;
+    mov.b16 %ha, 0x698c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1660], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1664], %x;
+    mov.b16 %ha, 0x6c90; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1668], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1672], %x;
+    mov.b16 %ha, 0x6f94; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1676], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1680], %x;
+    mov.b16 %ha, 0x7298; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1684], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1688], %x;
+    mov.b16 %ha, 0x759c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1692], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1696], %x;
+    mov.b16 %ha, 0x78a0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1700], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1704], %x;
+    mov.b16 %ha, 0x7ba4; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1708], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1712], %x;
+    mov.b16 %ha, 0x7ea8; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1716], %x;
+    mov.b16 %ha, 0x81ac; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1720], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1724], %x;
+    mov.b16 %ha, 0x84b0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1728], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1732], %x;
+    mov.b16 %ha, 0x87b4; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1736], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1740], %x;
+    mov.b16 %ha, 0x8ab8; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1744], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1748], %x;
+    mov.b16 %ha, 0x8dbc; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1752], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1756], %x;
+    mov.b16 %ha, 0x90c0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1760], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1764], %x;
+    mov.b16 %ha, 0x93c4; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1768], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1772], %x;
+    mov.b16 %ha, 0x96c8; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1776], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1780], %x;
+    mov.b16 %ha, 0x99cc; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1784], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1788], %x;
+    mov.b16 %ha, 0x9cd0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1792], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1796], %x;
+    mov.b16 %ha, 0x9fd4; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1800], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1804], %x;
+    mov.b16 %ha, 0xa2d8; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1808], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1812], %x;
+    mov.b16 %ha, 0xa5dc; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1816], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1820], %x;
+    mov.b16 %ha, 0xa8e0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1824], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1828], %x;
+    mov.b16 %ha, 0xabe4; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1832], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1836], %x;
+    mov.b16 %ha, 0xaee8; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1840], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1844], %x;
+    mov.b16 %ha, 0xb1ec; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1848], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1852], %x;
+    mov.b16 %ha, 0xb4f0; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1856], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1860], %x;
+    mov.b16 %ha, 0xb7f4; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1864], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1868], %x;
+    mov.b16 %ha, 0xbaf8; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1872], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1876], %x;
+    mov.b16 %ha, 0xbdfc; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1880], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1884], %x;
+    mov.b16 %ha, 0xc100; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1888], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1892], %x;
+    mov.b16 %ha, 0xc404; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1896], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1900], %x;
+    mov.b16 %ha, 0xc708; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1904], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1908], %x;
+    mov.b16 %ha, 0xca0c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1912], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1916], %x;
+    mov.b16 %ha, 0xcd10; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1920], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1924], %x;
+    mov.b16 %ha, 0xd014; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1928], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1932], %x;
+    mov.b16 %ha, 0xd318; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1936], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1940], %x;
+    mov.b16 %ha, 0xd61c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1944], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1948], %x;
+    mov.b16 %ha, 0xd920; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1952], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1956], %x;
+    mov.b16 %ha, 0xdc24; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1960], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1964], %x;
+    mov.b16 %ha, 0xdf28; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1968], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1972], %x;
+    mov.b16 %ha, 0xe22c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1976], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1980], %x;
+    mov.b16 %ha, 0xe530; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1984], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1988], %x;
+    mov.b16 %ha, 0xe834; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+1992], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+1996], %x;
+    mov.b16 %ha, 0xeb38; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+2000], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+2004], %x;
+    mov.b16 %ha, 0xee3c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+2008], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+2012], %x;
+    mov.b16 %ha, 0xf140; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+2016], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+2020], %x;
+    mov.b16 %ha, 0xf444; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+2024], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+2028], %x;
+    ret;
+}
+
+.visible .entry k1(.param .u64 out)
+{
+    .reg .b64 %ro;
+    .reg .b32 %a, %b, %c, %e, %x;
+    .reg .b64 %la, %lb, %lc, %le, %lx;
+    .reg .b16 %ha, %hb, %hc, %hx;
+    .reg .f32 %fa, %fb, %fc, %fx;
+    .reg .f64 %da, %db, %dc, %dx;
+    .reg .pred %p, %q;
+    .reg .b32 %z, %zt;
+    .reg .b64 %zl, %zu;
+    .reg .b16 %zh;
+    ld.param.u64 %ro, [out];
+    ld.global.u32 %z, [%ro];
+    cvt.u64.u32 %zl, %z;
+    cvt.u16.u32 %zh, %z;
+    mov.b16 %ha, 0xf748; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+0], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+4], %x;
+    mov.b16 %ha, 0xfa4c; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+8], %x;
+    cvt.rn.f16x2.e5m2x2 %x, %ha;
+    st.global.b32 [%ro+12], %x;
+    mov.b16 %ha, 0xfd50; xor.b16 %ha, %ha, %zh;
+    cvt.rn.f16x2.e4m3x2 %x, %ha;
+    st.global.b32 [%ro+16], %x;
+    ret;
+}

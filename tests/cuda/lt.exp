@@ -1,0 +1,14 @@
+fp32                         wrong 0 sum 44392
+fp32 through tf32            wrong 0 sum 44392
+transposed                   wrong 0 sum -53534
+alpha, beta                  wrong 0 sum -4661
+alpha, beta, not transposed  wrong 0 sum 32986
+fp16 to fp32                 wrong 0 sum -13951
+fp16 to fp32, bias           wrong 0 sum -38941
+fp16 to fp32, bias, beta     wrong 0 sum -22906
+fp16                         wrong 0 sum -13951
+fp16, bias, beta             wrong 0 sum -22906
+bf16 to fp32                 wrong 0 sum -13951
+bf16 to fp32, bias, beta     wrong 0 sum -71736
+one row                      wrong 0 sum 13
+large                        wrong 0 sum 139418

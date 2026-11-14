@@ -1,0 +1,9 @@
+# Third-party sources for mkulibs.sh: file | URL | sha256 | how the download was checked (2026-11-13).
+# libc/ext/fetch.sh downloads them, compares the sha256 and unpacks each into build/ext/<name>.
+zlib-1.4.tar.gz | https://zlib.net/zlib-1.4.tar.gz | 02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584 | equals the SHA-256 printed on https://zlib.net/
+zstd-1.5.7.tar.gz | https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz | eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3 | equals zstd-1.5.7.tar.gz.sha256 of the same release
+c-blosc-1.21.6.tar.gz | https://github.com/Blosc/c-blosc/archive/refs/tags/v1.21.6.tar.gz | 9fcd60301aae28f97f1301b735f966cc19e7c49b6b4321b839b4579a0c156f38 | GitHub tag archive; the project publishes no checksum (it also carries the lz4 1.9.4 that mkulibs.sh builds)
+libjpeg-turbo-2.1.5.1.tar.gz | https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/2.1.5.1/libjpeg-turbo-2.1.5.1.tar.gz | 2fdc3feb6e9deb17adec9bafa3321419aa19f8f4e5dea7bf8486844ca22207bf | gpg: good signature (.sig of the release) by key 0338C8D8D9FDA62CF9C421BD7EC2DBB6F4DBF434 (The libjpeg-turbo Project, key from the project's LJT-GPG-KEY)
+curl-8.11.0.tar.gz | https://curl.se/download/curl-8.11.0.tar.gz | 264537d90e58d2b09dddc50944baf3c38e7089151c8986715e2aaeaaf2b8118f | gpg: good signature (curl-8.11.0.tar.gz.asc) by key 27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2 (Daniel Stenberg, key from https://daniel.haxx.se/mykey.asc)
+xxHash-0.8.3.tar.gz | https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.3.tar.gz | aae608dfe8213dfd05d909a57718ef82f30722c392344583d3f39050c7f29a80 | GitHub tag archive; the project publishes no checksum
+bearssl-0.6.tar.gz | https://bearssl.org/bearssl-0.6.tar.gz | 6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14 | the site publishes no checksum file; the value equals the one distributions carry for 0.6

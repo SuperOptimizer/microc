@@ -1,0 +1,221 @@
+-- errors
+cudaSuccess / no error
+cudaErrorInvalidValue / invalid argument
+cudaErrorMemoryAllocation / out of memory
+cudaErrorNotReady / device not ready
+cudaErrorLaunchFailure / unspecified launch failure
+cudaErrorUnknown / unknown error
+unrecognized error code
+values 9 98 218 400 600 719 999
+clean 0
+bad memcpy 21
+peek 21
+good call 0
+peek 21
+bad free 1
+get 1
+get 0
+-- device
+count 0 1
+get 0 0
+set 0: 0, set 1: 101
+last cudaErrorInvalidDevice
+props 0
+name NVIDIA GeForce RTX 3090, sm_86, 82 SMs, warp 32
+threads 1024 (1024 1024 64), grid 2147483647 65535 65535
+shared 49152 101376 102400, uva 1
+total memory: ok
+props of device 1: 101
+attr SMs 0 82
+attr smem/SM 0 102400
+attr major 0 8
+attr bad 1
+priorities 0 0 -5
+peer 0 0
+enable peer 101
+flags 0 0 4
+versions 0 12090 0 12090
+occupancy 0 6 0 16 0 2
+func attr 0
+-- memory
+malloc 0 0
+device pointers: ok
+malloc 0: 0 1
+h2d 0, d2d 0, d2h 0
+round trip: ok
+memset 0
+memset bytes: ok
+async 0 0 0
+async bytes: ok
+with attributes 0 1
+attribute copy: ok
+peer 0 0 101
+peer copy: ok
+zero count with null 0
+2d 0
+2d bytes: ok
+2d bad pitch 12
+memset2d 0
+memset2d bytes: ok
+3d 0
+3d bytes: ok
+3d array 801
+host alloc 0 0
+host pointers: ok
+device pointer 0 1
+device pointer of pageable memory 1
+host flags 0 3
+register 0 712 0
+unregister 0 713
+managed 0
+attributes: 0 2 0 1, 0 0, 0 1 1, 0 3, 0 0 1
+free inside 1, free host as device 1, free device as host 1
+free 0 0 0, again 1, null 0
+free host 0 0, again 1, null 0
+after free 0 0
+meminfo 0
+meminfo totals: ok
+malloc 64 MB 0
+free went down: ok
+free came back: ok
+malloc 1 TB 2 1
+last cudaErrorMemoryAllocation
+-- streams and events
+create 0 0 0
+stream handles: ok
+flags 0 0 0 1, priority 0 0 0 -5
+bad flags 1
+sync 0 0 0, query 0 0
+events 0 0 0 0
+elapsed before record 400
+query unrecorded 0
+record 0 0 0
+wait 0 0, sync 0, query 0
+elapsed 0 >=0: 1, <10s: 1
+elapsed self 0 1
+elapsed without timing 400
+copy on stream 0, on a non-stream 400
+destroy 0 0 0, again 400, default 400
+use destroyed 400 400
+destroy events 0 0 0 0, again 400
+last cudaErrorInvalidResourceHandle
+-- virtual memory through driver entry points
+driver call before the run time hands one out: 3
+no such entry 500 1 1
+entry points: ok
+granularity 0 2097152
+reserve 0 1
+reserve off the granularity 1
+create 0 0
+physical memory is charged: ok
+access before map 1
+map with an offset 1, with the wrong size 1
+map 0 0 0 0 0, twice 1
+access 0
+the ring aliases: ok
+device memory to the run time: 0 2
+memset through cuda 0 0
+cudaFree of a ring 1
+unmap half a mapping 1
+unmap 0
+release 0 0, again 1
+address free 0
+physical memory is given back: ok
+after: 0 0
+release while mapped 0 77 1, free the range 0 1
+-- driver API
+init 0, count 0 1, get 0 0, get 1: 101
+name 0 NVIDIA GeForce RTX 3090
+short name 0 NVIDIA
+total mem 0 1
+attributes 0 82 0 6 0 1024
+error string 0 invalid argument, name 0 CUDA_ERROR_LAUNCH_FAILED
+context 0 0 1 sync 0
+alloc 0 0, zero bytes 1
+copies 0 0 0
+driver copies: ok
+memset 0 0
+driver memsets: ok
+meminfo 0 1
+free 0 0, again 1
+destroy 0, then alloc 201, set primary 0, then alloc 0
+run-time error untouched 0
+-- cublasLt
+create 0
+matmul f32 NN: f32 x f32 -> f32, 5x7x6: PASS (exact)
+matmul f32 NN random: f32 x f32 -> f32, 9x4x33: PASS (within rounding)
+matmul f32 TN beta: f32^T x f32 -> f32, 6x5x7: PASS (within rounding)
+matmul f32 NT alpha beta C: f32 x f32^T -> f32, 4x8x5: PASS (exact)
+matmul f32 TT tf32: f32^T x f32^T -> f32, 7x3x9: PASS (within rounding)
+matmul f32 bias: f32 x f32 -> f32, 6x6x6: PASS (exact)
+matmul f32 relu bias: f32 x f32^T -> f32, 8x5x4: PASS (exact)
+matmul f32 batched: f32^T x f32^T -> f32, 3x4x5, batch 4: PASS (exact)
+matmul bf16 NT into f32: bf16 x bf16^T -> f32, 12x5x9: PASS (exact)
+matmul bf16 NT into f32 random: bf16 x bf16^T -> f32, 12x5x9: PASS (within rounding)
+matmul f16 TN bias f16: f16^T x f16 -> f16, 6x10x8: PASS (exact)
+matmul f16 TN bias f16 random: f16^T x f16 -> f16, 6x10x8: PASS (within rounding)
+matmul f16 TN bias f32 beta: f16^T x f16 -> f32, 6x10x8: PASS (within rounding)
+matmul bf16 TT bias bf16 C: bf16^T x bf16^T -> bf16, 5x6x4: PASS (exact)
+matmul bf16 NN bf16 random: bf16 x bf16 -> bf16, 5x6x16: PASS (within rounding)
+matmul bf16 TN bias f32: bf16^T x bf16 -> f32, 7x3x5: PASS (exact)
+matmul f16 batched NT f32: f16 x f16^T -> f32, 4x5x6, batch 3: PASS (exact)
+matmul f16 batched TN f16: f16^T x f16 -> f16, 5x4x7, batch 5: PASS (within rounding)
+matmul mixed f16 x bf16: f16 x bf16 -> f32, 3x3x3: PASS (exact)
+layout 0 0 0 0
+layout attributes 0 2 8 0 1, wrong size 7
+desc 0, pref 0
+desc epilogue 0 1
+heuristic 0 1 0
+f64 layout: 15 0
+f64 matmul: 15
+gelu: 15 0
+f64 compute: 0 15
+unknown attribute: 15
+init 0, 2x2 times 3x2: 7, 2x2 times (3x2)^T: 0, 0: 7 10 3 4 -1 -2
+destroy 0, again 1
+-- scans and sorts
+exclusive sum u32: ok
+inclusive sum u32: ok
+exclusive sum u32 in place: ok
+exclusive scan with a start: ok
+exclusive sum u64: ok
+inclusive sum u64 in place: ok
+empty inputs: ok
+5-bit keys: u32/u32 ok u32/u64 ok keys u32 ok u64/u32 ok u64/u64 ok keys u64 ok descending 0 ok
+13-bit keys: u32/u32 ok u32/u64 ok keys u32 ok u64/u32 ok u64/u64 ok keys u64 ok descending 0 ok
+32-bit keys: u32/u32 ok u32/u64 ok keys u32 ok u64/u32 ok u64/u64 ok keys u64 ok descending 0 ok
+64-bit keys: u64/u32 ok u64/u64 ok keys u64 ok descending 0 ok
+bits [0, 37) out of place 0 ok, inputs intact
+bits [8, 16) one pass 0 ok
+bits [3, 30) descending in place 0 ok
+keys in place, values out of place 0 ok
+empty bit range 0 copied
+bad arguments -1 -1 -1
+-- launches
+saxpy 0
+saxpy result: ok
+saxpy again 0
+saxpy bounds: ok
+symbol 1, unknown 1
+to symbol 0 0
+from symbol 0: 10 20 2.5 40
+addg 0: 10 20 2.5 40 10 20 2.5 40
+kernel of another unit 0: 123
+clean 0
+no such kernel 98 (cudaErrorInvalidDeviceFunction)
+zero grid 1, block of 1025 1, block of 64x32 1, too much shared memory 1, bad stream 400 (cudaErrorInvalidResourceHandle)
+unparsable module 218 (cudaErrorInvalidPtx), symbol 1
+faulting kernel 719 (cudaErrorLaunchFailure)
+load 0, functions 0 0, missing 500
+global 0 16, missing 500
+a second copy of the global 1
+cuLaunchKernel 0
+driver saxpy result: ok
+cuLaunchKernel with a parameter buffer 0
+parameter buffer result: ok
+driver addg 0: 0 1 2 3 0 1
+bad launches 1 1
+load bad PTX 218, a log 1
+unload 0
+run-time error left 0
+all ok

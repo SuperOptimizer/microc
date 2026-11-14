@@ -1,0 +1,6 @@
+3000 in turn: sum 4501500, stack reused
+200 groups of 16: sum 5121600
+400 with their own stack sizes: 400
+a 32 MB stack: 1
+the default stack holds 7 MB: 1
+address space steady

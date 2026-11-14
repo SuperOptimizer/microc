@@ -1,0 +1,86 @@
+30 alice
+25 bob
+35 carol
+2 65 32.5
+ab 2 ell 3 ABC
+a-b-c-
+[foo] bar [foo]
+[foo] baz [foo]
+2: bob 25 y
+x 2
+y 1
+   42|ab   |03.14|ff|A|str
+yes
+3
+0
+3628800
+1 1 0 1
+0.25 1024 1 -2 1000000 0.3 10000000000 3 4
+to stderr
+alice X x
+3
+r bob
+r carol
+3
+hi
+8
+abc bc
+2 2 2
+0
+3-z
+1
+old
+young
+old
+3 carol 35 x
+alice 30 x
+bob 25 y
+got a
+got b
+no
+rc=3
+end
+rc=4
+3
+1 1 1 0
+alice
+b
+30
+25
+35
+paren form
+world
+#ifndef __ASM_CPUCAPS_H
+#define __ASM_CPUCAPS_H
+
+/* Generated file - do not edit */
+
+#define ARM64_BTI                           	0
+#define ARM64_HAS_32BIT_EL0_DO_NOT_USE      	1
+#define ARM64_HAS_32BIT_EL1                 	2
+#define ARM64_HAS_ADDRESS_AUTH              	3
+#define ARM64_HAS_ADDRESS_AUTH_ARCH         	4
+#define ARM64_HAS_ADDRESS_AUTH_IMP_DEF      	5
+#define ARM64_HAS_AMU_EXTN                  	6
+#define ARM64_HAS_ARMv8_4_TTL               	7
+#define ARM64_HAS_CACHE_DIC                 	8
+#define ARM64_HAS_CACHE_IDC                 	9
+#define ARM64_HAS_CNP                       	10
+#define ARM64_HAS_CRC32                     	11
+#define ARM64_HAS_DCPODP                    	12
+#define ARM64_HAS_DCPOP                     	13
+#define ARM64_HAS_E0PD                      	14
+#define ARM64_NCAPS				15
+
+#endif /* __ASM_CPUCAPS_H */
+3
+a b
+a b   e
+5
+2 a/b/c
+2 0
+17
+1 2
+3 3
+21 20 21
+exit 0

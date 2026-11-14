@@ -1,0 +1,29 @@
+// The other module of t_ext.ptx: it defines what that one declares .extern. (No test of its own.)
+.version 8.5
+.target sm_86
+.address_size 64
+
+.visible .global .align 4 .u32 libtab[4] = {11, 22, 33, 44};
+.visible .global .align 4 .u32 libcount;
+
+.visible .func (.reg .u32 r) libsum (.reg .u32 n)
+{
+    .reg .u32 %i, %v;
+    .reg .u64 %p, %o;
+    .reg .pred %c;
+    mov.u32 r, 0;
+    mov.u32 %i, 0;
+    mov.u64 %p, libtab;
+$L0:
+    setp.ge.u32 %c, %i, n;
+    @%c bra $L1;
+    mul.wide.u32 %o, %i, 4;
+    add.u64 %o, %o, %p;
+    ld.global.u32 %v, [%o];
+    add.u32 r, r, %v;
+    add.u32 %i, %i, 1;
+    bra $L0;
+$L1:
+    atom.global.add.u32 %v, [libcount], 1;
+    ret;
+}

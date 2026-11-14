@@ -1,0 +1,18 @@
+devices 1, current 0
+stream done: no error
+event done: no error
+time: no error, not negative
+chain -1972706428: 598 544 -16843008 -16843008 304 11986
+rows 2843298: 0 1 3365
+shared 9954688
+2048 threads: invalid argument
+then: no error
+no blocks: invalid argument
+too much shared memory: invalid argument (cudaErrorInvalidValue)
+bad direction: invalid copy direction for memcpy
+managed 326912
+memory: some of it is free
+processors: some
+limits: 1024 threads a block, 1024 x 1024 x 64, warp 32, 48 KB shared
+occupancy: some
+free of nothing: no error

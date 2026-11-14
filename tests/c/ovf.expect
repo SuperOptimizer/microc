@@ -1,0 +1,29 @@
+add int 0 3
+add int 1 -2147483648
+add long 0 2147483648
+add long 1 -9223372036854775808
+add unsigned long 0 -9223372036854775808
+add unsigned long 1 0
+add unsigned long 0 -2
+add unsigned int 1 4294967294
+add unsigned char 1 44
+add signed char 0 127
+add signed char 1 -128
+sub unsigned long 1 -1
+sub long 0 -1
+sub long 1 9223372036854775807
+sub unsigned int 1 4294967293
+sub int 0 2
+mul long 1 -2
+mul unsigned long 1 0
+mul unsigned long 0 -8589934591
+mul unsigned long 1 -3
+mul long 0 -3
+mul unsigned long 1 -3
+mul long 1 -9223372036854775808
+mul int 1 0
+mul unsigned int 0 4294901760
+mul long 1 1
+mul _Bool 1 0
+mul _Bool 0 1
+exit 0

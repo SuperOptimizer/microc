@@ -1,0 +1,347 @@
+// The functions the engine gives a module that declares them .extern: vprintf, malloc, free, the C mathematics
+// library; and the approximate PTX instructions (sin, cos, lg2, ex2, tanh, rsqrt), to five decimals.
+//! run lib 1 1 1 2 1 1 0 24
+//! run mccnames 1 1 1 1 1 1 0 8
+.version 8.5
+.target sm_86
+.address_size 64
+
+.extern .func (.param .s32 r) vprintf (.param .u64 fmt, .param .u64 args);
+.extern .func (.param .u64 r) malloc (.param .u64 n);
+.extern .func free (.param .u64 p);
+.extern .func (.param .f32 r) powf (.param .f32 a, .param .f32 b);
+.extern .func (.param .f64 r) erf (.param .f64 a);
+.extern .func (.param .f32 r) expf (.param .f32 a);
+.extern .func (.reg .f32 r) logf (.reg .f32 a);
+.extern .func (.param .f64 r) atan2 (.param .f64 a, .param .f64 b);
+.extern .func (.param .f32 r) fmodf (.param .f32 a, .param .f32 b);
+.extern .func (.param .f64 r) cbrt (.param .f64 a);
+.extern .func (.param .f32 r) roundf (.param .f32 a);
+.extern .func (.param .f32 r) log1pf (.param .f32 a);
+// as mcc declares what a kernel calls: with a prefix; memcpy is declared once, with its result, and called both
+// with and without one (the hardware's assembler wants every call to take the result)
+.extern .func (.param .b64 func_retval0) __mcuda_memcpy (.param .b64 __mcuda_memcpy_param_0, .param .b64 __mcuda_memcpy_param_1, .param .b64 __mcuda_memcpy_param_2);
+.extern .func __mcuda_bzero (.param .b64 __mcuda_bzero_param_0, .param .b64 __mcuda_bzero_param_1);
+.extern .func (.param .f32 func_retval0) __mcuda_exp2f (.param .f32 __mcuda_exp2f_param_0);
+.extern .func __mcuda_sincosf (.param .f32 __mcuda_sincosf_param_0, .param .b64 __mcuda_sincosf_param_1, .param .b64 __mcuda_sincosf_param_2);
+.extern .func (.param .f32 func_retval0) __mcuda_frexpf (.param .f32 __mcuda_frexpf_param_0, .param .b64 __mcuda_frexpf_param_1);
+.extern .func (.param .b64 func_retval0) __mcuda_lrintf (.param .f32 __mcuda_lrintf_param_0);
+
+// "thread %d of %u: %s %5.2f %lld %c %x%%\n"
+.global .align 1 .b8 fmt[40] = {116, 104, 114, 101, 97, 100, 32, 37, 100, 32, 111, 102, 32, 37, 117, 58, 32, 37, 115, 32, 37, 53, 46, 50, 102, 32, 37, 108, 108, 100, 32, 37, 99, 32, 37, 120, 37, 37, 10, 0};
+.global .align 1 .b8 word[3] = {104, 105, 0};
+
+// rounds 100000 x to an integer, into out[i]
+.func put (.reg .u64 out, .reg .u32 i, .reg .f64 x)
+{
+    .reg .f64 %d;
+    .reg .s32 %v;
+    .reg .u64 %a;
+    mul.f64 %d, x, 0d40F86A0000000000;
+    cvt.rni.s32.f64 %v, %d;
+    mul.wide.u32 %a, i, 4;
+    add.u64 %a, %a, out;
+    st.global.s32 [%a], %v;
+    ret;
+}
+
+.visible .entry lib(.param .u64 out)
+{
+    .local .align 8 .b8 args[48];
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<8>;
+    .reg .f64 %d<8>;
+    .reg .pred %p1;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    // the arguments of printf, each on its own alignment
+    st.local.u32 [args], %r1;
+    mov.u32 %r2, %ntid.x;
+    st.local.u32 [args+4], %r2;
+    mov.u64 %rd2, word;
+    st.local.u64 [args+8], %rd2;
+    mov.f64 %d1, 0d400921FB54442D18;
+    st.local.f64 [args+16], %d1;
+    mov.u64 %rd2, -123456789012;
+    st.local.u64 [args+24], %rd2;
+    mov.u32 %r2, 65;
+    st.local.u32 [args+32], %r2;
+    mov.u32 %r2, 0xbeef;
+    st.local.u32 [args+36], %r2;
+    {
+        .param .u64 a0;
+        .param .u64 a1;
+        .param .s32 r0;
+        mov.u64 %rd2, fmt;
+        st.param.u64 [a0], %rd2;
+        mov.u64 %rd2, args;
+        st.param.u64 [a1], %rd2;
+        call (r0), vprintf, (a0, a1);
+    }
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 ret;
+    // malloc: a block to write to and read back
+    {
+        .param .u64 a0;
+        .param .u64 r0;
+        mov.u64 %rd2, 64;
+        st.param.u64 [a0], %rd2;
+        call (r0), malloc, (a0);
+        ld.param.u64 %rd3, [r0];
+    }
+    mov.u32 %r2, 77;
+    st.u32 [%rd3+60], %r2;
+    ld.u32 %r3, [%rd3+60];
+    st.global.u32 [%rd1], %r3;                // 0: 77
+    {
+        .param .u64 a0;
+        st.param.u64 [a0], %rd3;
+        call free, (a0);
+    }
+    // 1: 2 ^ 0.5
+    {
+        .param .f32 a0;
+        .param .f32 a1;
+        .param .f32 r0;
+        mov.f32 %f1, 0f40000000;
+        st.param.f32 [a0], %f1;
+        mov.f32 %f1, 0f3F000000;
+        st.param.f32 [a1], %f1;
+        call (r0), powf, (a0, a1);
+        ld.param.f32 %f2, [r0];
+    }
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 1, %d2);
+    // 2: erf(0.5)   3: e   4: log 10 (register arguments)   5: atan2(1, -1)   6: fmod(7.5, 2)   7: cbrt(-27)
+    {
+        .param .f64 a0;
+        .param .f64 r0;
+        mov.f64 %d1, 0d3FE0000000000000;
+        st.param.f64 [a0], %d1;
+        call (r0), erf, (a0);
+        ld.param.f64 %d2, [r0];
+    }
+    call put, (%rd1, 2, %d2);
+    {
+        .param .f32 a0;
+        .param .f32 r0;
+        mov.f32 %f1, 0f3F800000;
+        st.param.f32 [a0], %f1;
+        call (r0), expf, (a0);
+        ld.param.f32 %f2, [r0];
+    }
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 3, %d2);
+    mov.f32 %f1, 0f41200000;
+    call (%f2), logf, (%f1);
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 4, %d2);
+    {
+        .param .f64 a0;
+        .param .f64 a1;
+        .param .f64 r0;
+        mov.f64 %d1, 0d3FF0000000000000;
+        st.param.f64 [a0], %d1;
+        neg.f64 %d1, %d1;
+        st.param.f64 [a1], %d1;
+        call (r0), atan2, (a0, a1);
+        ld.param.f64 %d2, [r0];
+    }
+    call put, (%rd1, 5, %d2);
+    {
+        .param .f32 a0;
+        .param .f32 a1;
+        .param .f32 r0;
+        mov.f32 %f1, 0f40F00000;
+        st.param.f32 [a0], %f1;
+        mov.f32 %f1, 0f40000000;
+        st.param.f32 [a1], %f1;
+        call (r0), fmodf, (a0, a1);
+        ld.param.f32 %f2, [r0];
+    }
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 6, %d2);
+    {
+        .param .f64 a0;
+        .param .f64 r0;
+        mov.f64 %d1, 0dC03B000000000000;
+        st.param.f64 [a0], %d1;
+        call (r0), cbrt, (a0);
+        ld.param.f64 %d2, [r0];
+    }
+    call put, (%rd1, 7, %d2);
+    // 8: round(-2.5) = -3   9: log1p(1e-3)
+    {
+        .param .f32 a0;
+        .param .f32 r0;
+        mov.f32 %f1, 0fC0200000;
+        st.param.f32 [a0], %f1;
+        call (r0), roundf, (a0);
+        ld.param.f32 %f2, [r0];
+        cvt.f64.f32 %d2, %f2;
+        call put, (%rd1, 8, %d2);
+        mov.f32 %f1, 0f3A83126F;
+        st.param.f32 [a0], %f1;
+        call (r0), log1pf, (a0);
+        ld.param.f32 %f2, [r0];
+        cvt.f64.f32 %d2, %f2;
+        call put, (%rd1, 9, %d2);
+    }
+    // the approximate instructions: 10 sin 1, 11 cos 1, 12 lg2 10, 13 ex2 1.5, 14 tanh 0.5, 15 rsqrt 2 (f32), 16 rsqrt 2 (f64), 17 rcp 3
+    mov.f32 %f1, 0f3F800000;
+    sin.approx.f32 %f2, %f1;
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 10, %d2);
+    cos.approx.f32 %f2, %f1;
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 11, %d2);
+    mov.f32 %f1, 0f41200000;
+    lg2.approx.f32 %f2, %f1;
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 12, %d2);
+    mov.f32 %f1, 0f3FC00000;
+    ex2.approx.ftz.f32 %f2, %f1;
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 13, %d2);
+    mov.f32 %f1, 0f3F000000;
+    tanh.approx.f32 %f2, %f1;
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 14, %d2);
+    mov.f32 %f1, 0f40000000;
+    rsqrt.approx.f32 %f2, %f1;
+    cvt.f64.f32 %d2, %f2;
+    call put, (%rd1, 15, %d2);
+    mov.f64 %d1, 0d4000000000000000;
+    rsqrt.approx.f64 %d2, %d1;
+    call put, (%rd1, 16, %d2);
+    mov.f64 %d1, 0d4008000000000000;
+    rcp.approx.ftz.f64 %d2, %d1;
+    call put, (%rd1, 17, %d2);
+    // 18: flush to zero: a subnormal sum becomes zero, and without .ftz it does not
+    mov.f32 %f1, 0f00400000;
+    add.ftz.f32 %f2, %f1, %f1;
+    add.f32 %f3, %f1, 0f00000001;
+    mov.b32 %r2, %f2;
+    mov.b32 %r3, %f3;
+    st.global.u32 [%rd1+72], %r2;             // 18: 0: with .ftz subnormal operands count as zero
+    st.global.u32 [%rd1+76], %r3;             // 19: 00400001
+    mul.ftz.f32 %f2, %f1, 0f3F000000;
+    mov.b32 %r2, %f2;
+    st.global.u32 [%rd1+80], %r2;             // 20: 0
+    // 21: max.NaN.xorsign.abs as ufsm uses it; 22: min.xorsign.abs
+    mov.f32 %f1, 0fC0400000;
+    mov.f32 %f2, 0f40000000;
+    max.xorsign.abs.f32 %f3, %f1, %f2;
+    mov.b32 %r2, %f3;
+    st.global.u32 [%rd1+84], %r2;             // 21: -3 (signs differ, the larger magnitude)
+    min.xorsign.abs.f32 %f3, %f1, %f2;
+    mov.b32 %r2, %f3;
+    st.global.u32 [%rd1+88], %r2;             // 22: -2
+    mov.f32 %f2, 0f7FC00000;
+    max.NaN.xorsign.abs.f32 %f3, %f1, %f2;
+    testp.notanumber.f32 %p1, %f3;
+    selp.u32 %r2, 1, 0, %p1;
+    st.global.u32 [%rd1+92], %r2;             // 23: 1
+    ret;
+}
+
+.visible .entry mccnames(.param .u64 out)
+{
+    .local .align 8 .b8 a[16];
+    .local .align 8 .b8 b[16];
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd1, [out];
+    mov.u64 %rd2, a;
+    mov.u64 %rd3, b;
+    mov.u64 %rd4, 0x1122334455667788;
+    st.u64 [%rd2], %rd4;
+    st.u64 [%rd2+8], %rd4;
+    st.u64 [%rd3], %rd4;
+    st.u64 [%rd3+8], %rd4;
+    // b[0..3] = 0, then b[8..15] = a[1..8] with the result used, then out[0..1] = b[6..13] with no result
+    {
+        .param .b64 param0;
+        st.param.b64 [param0+0], %rd3;
+        .param .b64 param1;
+        mov.u64 %rd5, 4;
+        st.param.b64 [param1+0], %rd5;
+        call.uni __mcuda_bzero, (param0, param1);
+    }
+    {
+        .param .b64 param0;
+        add.u64 %rd5, %rd3, 8;
+        st.param.b64 [param0+0], %rd5;
+        .param .b64 param1;
+        add.u64 %rd6, %rd2, 1;
+        st.param.b64 [param1+0], %rd6;
+        .param .b64 param2;
+        mov.u64 %rd6, 8;
+        st.param.b64 [param2+0], %rd6;
+        .param .b64 retval0;
+        call.uni (retval0), __mcuda_memcpy, (param0, param1, param2);
+        ld.param.b64 %rd7, [retval0+0];
+    }
+    {
+        .param .b64 param0;
+        st.param.b64 [param0+0], %rd1;
+        .param .b64 param1;
+        sub.u64 %rd7, %rd7, 2;
+        st.param.b64 [param1+0], %rd7;
+        .param .b64 param2;
+        mov.u64 %rd6, 8;
+        st.param.b64 [param2+0], %rd6;
+        call.uni __mcuda_memcpy, (param0, param1, param2);
+    }
+    ld.u32 %r1, [%rd3];
+    st.global.u32 [%rd1+8], %r1;                // 2: 0
+    // 3: 2 ^ 10; 4, 5: sin and cos of 0 through pointers; 6: the mantissa of 80 = 0.625, 7: its exponent 7 plus lrint(2.5) = 2
+    {
+        .param .f32 param0;
+        mov.f32 %f1, 0f41200000;
+        st.param.f32 [param0+0], %f1;
+        .param .f32 retval0;
+        call.uni (retval0), __mcuda_exp2f, (param0);
+        ld.param.f32 %f2, [retval0+0];
+    }
+    st.global.f32 [%rd1+12], %f2;
+    {
+        .param .f32 param0;
+        mov.f32 %f1, 0f00000000;
+        st.param.f32 [param0+0], %f1;
+        .param .b64 param1;
+        add.u64 %rd5, %rd1, 16;
+        st.param.b64 [param1+0], %rd5;
+        .param .b64 param2;
+        add.u64 %rd5, %rd1, 20;
+        st.param.b64 [param2+0], %rd5;
+        call.uni __mcuda_sincosf, (param0, param1, param2);
+    }
+    {
+        .param .f32 param0;
+        mov.f32 %f1, 0f42A00000;
+        st.param.f32 [param0+0], %f1;
+        .param .b64 param1;
+        add.u64 %rd5, %rd1, 28;
+        st.param.b64 [param1+0], %rd5;
+        .param .f32 retval0;
+        call.uni (retval0), __mcuda_frexpf, (param0, param1);
+        ld.param.f32 %f2, [retval0+0];
+    }
+    st.global.f32 [%rd1+24], %f2;
+    {
+        .param .f32 param0;
+        mov.f32 %f1, 0f40200000;
+        st.param.f32 [param0+0], %f1;
+        .param .b64 retval0;
+        call.uni (retval0), __mcuda_lrintf, (param0);
+        ld.param.b64 %rd5, [retval0+0];
+    }
+    ld.global.u32 %r2, [%rd1+28];
+    cvt.u32.u64 %r3, %rd5;
+    add.u32 %r2, %r2, %r3;
+    st.global.u32 [%rd1+28], %r2;
+    ret;
+}

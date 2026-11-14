@@ -1,0 +1,205 @@
+// Memory: globals with initialisers, constants, locals, loads and stores of every width, vectors,
+// shared memory (static, dynamic, by 32-bit and 64-bit address), cvta, isspacep.
+//! run mem 1 1 1 1 1 1 0 48
+//! run mem 1 1 1 1 1 1 0 48
+//! run shared 2 1 1 8 1 1 64 40
+.version 8.5
+.target sm_86
+.address_size 64
+
+.global .align 16 .u32 gtab[4] = {1, 2, 0x80000003, 4};
+.global .align 8 .u64 gptr = gtab;
+.global .align 8 .u64 gptr2 = gtab + 8;
+.global .align 1 .u8 gbytes[5] = {0x81, 2, 3};
+.global .align 2 .s16 gs16[2] = {-2, 7};
+.const .align 8 .f64 cd[2] = {0d4004000000000000, 0.5};
+.const .align 8 .f32 cf[3] = {0f3FC00000, -2.0, 1e3};
+.global .align 8 .u32 gzero[4];
+.global .align 4 .u32 gcount;
+
+.visible .entry mem(.param .u64 out)
+{
+    .local .align 16 .b8 buf[64];
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<6>;
+    .reg .f64 %d<6>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd1, [out];
+    // 0..3: the table through its name, a register, and the pointers stored beside it
+    ld.global.u32 %r1, [gtab];
+    st.global.u32 [%rd1], %r1;
+    mov.u64 %rd2, gtab;
+    ld.global.u32 %r1, [%rd2+4];
+    st.global.u32 [%rd1+4], %r1;
+    ld.global.u64 %rd3, [gptr];
+    ld.global.s32 %rd4, [%rd3+8];
+    st.global.u64 [%rd1+8], %rd4;
+    // 4: through gptr2
+    ld.global.u64 %rd3, [gptr2];
+    ld.u32 %r1, [%rd3+4];
+    st.u32 [%rd1+16], %r1;
+    // 5..8: bytes, signed and not; the bytes the initialiser left out are zero
+    ld.global.u8 %r1, [gbytes];
+    st.global.u32 [%rd1+20], %r1;
+    ld.global.s8 %r1, [gbytes];
+    st.global.u32 [%rd1+24], %r1;
+    ld.global.u8 %r1, [gbytes+2];
+    ld.global.u8 %r2, [gbytes+4];
+    shl.b32 %r2, %r2, 8;
+    or.b32 %r1, %r1, %r2;
+    st.global.u32 [%rd1+28], %r1;
+    ld.global.s16 %r1, [gs16];
+    st.global.u32 [%rd1+32], %r1;
+    // 9: unsigned 16 bits
+    ld.global.u16 %r1, [gs16];
+    st.global.u32 [%rd1+36], %r1;
+    // 10..13: constants
+    ld.const.f64 %d1, [cd];
+    ld.const.f64 %d2, [cd+8];
+    add.f64 %d3, %d1, %d2;
+    st.global.f64 [%rd1+40], %d3;
+    ld.const.f32 %f1, [cf+4];
+    ld.const.f32 %f2, [cf+8];
+    st.global.f32 [%rd1+48], %f1;
+    st.global.f32 [%rd1+52], %f2;
+    // 14..17: a vector load and a vector store. (The hardware wants the address of every access a multiple
+    // of its size, a vector's being that of all of it; the engine does not look.)
+    ld.global.v4.u32 {%r1, %r2, %r3, %r4}, [gtab];
+    add.u32 %r1, %r1, 16;
+    st.local.v4.u32 [buf+48], {%r4, %r3, %r2, %r1};
+    ld.local.v2.u32 {%r1, %r2}, [buf+48];
+    st.global.v2.u32 [%rd1+56], {%r1, %r2};
+    ld.local.v2.u32 {%r1, %r2}, [buf+56];
+    st.global.v2.u32 [%rd1+64], {%r1, %r2};
+    // 18, 19: a pair of floats
+    ld.const.v2.f32 {%f1, %f2}, [cf];
+    st.global.v2.f32 [%rd1+72], {%f2, %f1};
+    // 20..23: the stack frame: narrow stores into a zeroed 64-bit word
+    mov.u64 %rd5, buf;
+    mov.u64 %rd6, 0;
+    st.local.u64 [buf], %rd6;
+    st.local.u64 [buf+8], %rd6;
+    mov.u32 %r1, 0x11223344;
+    st.local.u8 [buf+1], %r1;
+    st.local.u16 [%rd5+4], %r1;
+    // (a store with no space named wants the generic address: on the hardware a local one is not that)
+    cvta.local.u64 %rd8, %rd5;
+    st.u8 [%rd8+7], %r1;
+    ld.local.u64 %rd7, [%rd5];
+    st.global.u64 [%rd1+80], %rd7;
+    shl.b32 %r2, %r1, 8;
+    st.local.u32 [%rd5+8], %r2;
+    shr.u32 %r2, %r1, 24;
+    st.local.u8 [%rd5+12], %r2;
+    ld.local.u64 %rd7, [buf+8];
+    st.global.u64 [%rd1+88], %rd7;
+    // 24: the zeroed table counts the launches; 25..27 stay zero
+    ld.global.u32 %r1, [gcount];
+    add.u32 %r1, %r1, 1;
+    st.global.u32 [gcount], %r1;
+    st.global.u32 [%rd1+96], %r1;
+    ld.global.v2.u32 {%r2, %r3}, [gzero+8];
+    st.global.v2.u32 [%rd1+104], {%r2, %r3};
+    // 28..31: isspacep
+    isspacep.global %p1, %rd1;
+    selp.u32 %r1, 1, 0, %p1;
+    st.global.u32 [%rd1+112], %r1;
+    isspacep.shared %p1, %rd1;
+    selp.u32 %r1, 1, 0, %p1;
+    st.global.u32 [%rd1+116], %r1;
+    isspacep.local %p1, %rd8;
+    selp.u32 %r1, 1, 0, %p1;
+    st.global.u32 [%rd1+120], %r1;
+    isspacep.local %p1, %rd1;
+    selp.u32 %r1, 1, 0, %p1;
+    st.global.u32 [%rd1+124], %r1;
+    // 32, 33: a 64-bit float through a 64-bit integer store, and an immediate address of a global with an offset
+    mov.f64 %d1, 0d3FF8000000000000;
+    mov.b64 %rd7, %d1;
+    st.global.u64 [%rd1+128], %rd7;
+    // 34: the table is changed for the next launch
+    ld.global.u32 %r1, [gtab+12];
+    shl.b32 %r1, %r1, 4;
+    st.global.u32 [gtab+12], %r1;
+    st.global.u32 [%rd1+136], %r1;
+    // 35: ldu, and a store of a float immediate
+    st.local.f32 [buf+32], 0f40490FDB;
+    ld.local.u32 %r1, [buf+32];
+    st.global.u32 [%rd1+140], %r1;
+    ldu.global.u32 %r1, [%rd1+140];
+    st.global.u32 [%rd1+140], %r1;
+    ret;
+}
+
+.shared .align 4 .u32 stat[8];
+.extern .shared .align 16 .b8 dyn[];
+
+// 8 threads; each block writes 20 words at out + 80 * block
+.visible .entry shared(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mul.wide.u32 %rd2, %r2, 80;
+    add.u64 %rd1, %rd1, %rd2;
+    // stat[tid] = 100 * (block + 1) + tid
+    add.u32 %r3, %r2, 1;
+    mad.lo.u32 %r3, %r3, 100, %r1;
+    mov.u64 %rd3, stat;
+    mul.wide.u32 %rd4, %r1, 4;
+    add.u64 %rd5, %rd3, %rd4;
+    st.shared.u32 [%rd5], %r3;
+    // dyn as a generic address: dyn[tid] = tid + 1 (bytes)
+    cvta.shared.u64 %rd6, dyn;
+    cvt.u64.u32 %rd7, %r1;
+    add.u64 %rd8, %rd6, %rd7;
+    add.u32 %r4, %r1, 1;
+    st.u8 [%rd8], %r4;
+    bar.sync 0;
+    // out[tid] = stat[7 - tid]
+    sub.u32 %r5, 7, %r1;
+    mul.wide.u32 %rd9, %r5, 4;
+    add.u64 %rd10, %rd3, %rd9;
+    ld.shared.u32 %r6, [%rd10];
+    add.u64 %rd11, %rd1, %rd4;
+    st.global.u32 [%rd11], %r6;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra $Ldone;
+    // thread 0: the dynamic bytes as two words, by a 32-bit shared address made from the generic one
+    cvta.to.shared.u64 %rd12, %rd6;
+    cvt.u32.u64 %r7, %rd12;
+    ld.shared.u32 %r8, [%r7];
+    st.global.u32 [%rd1+32], %r8;
+    ld.shared.u32 %r8, [%r7+4];
+    st.global.u32 [%rd1+36], %r8;
+    // the sizes: static 32 bytes, dynamic 64 as asked at the launch, the offset of dyn, and what isspacep says
+    mov.u32 %r9, %dynamic_smem_size;
+    st.global.u32 [%rd1+40], %r9;
+    // (the hardware rounds the total up, to 128 here, and its shared addresses start at 0x400, not at 0)
+    mov.u32 %r9, %total_smem_size;
+    min.u32 %r9, %r9, 96;
+    st.global.u32 [%rd1+44], %r9;
+    cvt.u32.u64 %r9, %rd3;
+    sub.u32 %r9, %r7, %r9;
+    st.global.u32 [%rd1+48], %r9;
+    isspacep.shared %p2, %rd6;
+    selp.u32 %r9, 1, 0, %p2;
+    st.global.u32 [%rd1+52], %r9;
+    isspacep.global %p2, %rd6;
+    selp.u32 %r9, 1, 0, %p2;
+    st.global.u32 [%rd1+56], %r9;
+    // the generic address of a shared word reads the same word
+    cvta.shared.u64 %rd13, %rd3;
+    ld.u32 %r9, [%rd13+12];
+    st.global.u32 [%rd1+60], %r9;
+    // and through cvta.to.shared again
+    cvta.to.shared.u64 %rd14, %rd13;
+    ld.shared.u32 %r9, [%rd14+16];
+    st.global.u32 [%rd1+64], %r9;
+$Ldone:
+    ret;
+}

@@ -1,0 +1,3225 @@
+/* x86-64 backend: instruction selection, frame layout, encoding.
+   Calling convention: System V AMD64. Records are classified by the front
+   end (parse.c): what goes in registers arrives here as scalar arguments,
+   what goes in memory as an OP_BYVAL argument or a block parameter.
+   Machine instructions are kept in three-address form with virtual
+   registers until they are encoded; the encoder makes the two-address
+   forms and reads spilled operands from the frame. */
+#include "mir.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+/* physical register ids: 0..15 as the processor numbers them, 32..47 = xmm0..xmm15 */
+enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+#define XMM0 32
+#define SCR0 R10 /* never allocated: for spilled operands and long sequences */
+#define SCR1 R11
+#define FSCR0 (XMM0 + 14)
+#define FSCR1 (XMM0 + 15)
+#define NOSLOT 0xffffffffU
+#define ARGSLOT 0xfffffffeU /* pseudo slot: the incoming stack argument area */
+#define BIT(r) ((u64)1 << (r))
+
+/* MIns.flags (bit 0 is MF_CALL) */
+#define XF_SLOT 2      /* memory operand: sym is a stack slot (or ARGSLOT), imm the offset in it */
+#define XF_SYM 4       /* memory operand: sym is an object symbol, imm the offset from it */
+#define XF_SCALE(f) ((f) >> 4 & 3) /* log2 of the index scale */
+#define XF_SCALE_SHIFT 4
+
+/* parameter kinds beyond the IT_* codes (Func.param_ty), set by the front end */
+#define PT_BLK 0x80  /* the parameter is a block on the stack that starts here; its value is the address */
+#define PT_PAD 0x40  /* eight more bytes of the block before */
+#define PT_A16 0x20  /* with PT_BLK: the block is aligned to 16 bytes */
+
+enum {
+    X_MOV, X_MOVI, X_FMOVI, X_LEA, X_SLOTADDR,
+    X_ADD, X_SUB, X_IMUL, X_AND, X_OR, X_XOR,
+    X_ADDI, X_IMULI, X_ANDI, X_ORI, X_XORI,
+    X_SHL, X_SHR, X_SAR,     /* the count is in rcx */
+    X_SHLI, X_SHRI, X_SARI, X_RORI,
+    X_NEG, X_NOT, X_BSWAP, X_BSF, X_CLZ,
+    X_CQO,                   /* rdx = the sign of rax */
+    X_IDIV, X_DIV,           /* rdx:rax by s0; quotient to rax, remainder to rdx */
+    X_MULH, X_IMULH,         /* rdx = the high half of rax * s0 */
+    X_MOVSX8, X_MOVSX16, X_MOVZX8, X_MOVZX16, X_MOVSXD, X_MOVZXD,
+    X_CMP, X_CMPI, X_TEST, X_TESTI, X_FCMP,
+    X_SETCC, X_CMOV, X_FSEL, /* d = cc ? s0 : s1 */
+    X_LOAD,                  /* d = [s0 + s1 * scale + imm]; cc = access kind */
+    X_STORE,                 /* [s1 + s2 * scale + imm] = s0 */
+    X_STOREI,                /* [s1 + s2 * scale + (i32)imm] = imm >> 32 */
+    X_ADDM, X_SUBM, X_IMULM, X_ANDM, X_ORM, X_XORM, /* d = s0 op [s1 + s2 * scale + imm] */
+    X_FADDM, X_FSUBM, X_FMULM, X_FDIVM,
+    X_CMPM,                  /* s0 with [s1 + s2 * scale + imm]; cc: the memory operand is the left one */
+    X_CMPMI,                 /* [s1 + s2 * scale + (i32)imm] with imm >> 32; cc = access kind */
+    X_RMW,                   /* [s1 + s2 * scale + imm] op= s0; cc = access kind, w = which (the processor's number: */
+    X_RMWI,                  /* [s1 + s2 * scale + (i32)imm] op= imm >> 32                0 add 1 or 4 and 5 sub 6 xor) */
+    X_FADD, X_FSUB, X_FMUL, X_FDIV, X_FNEG,
+    X_SITOF, X_UITOF, X_FTOSI, X_FTOUI, X_FCVT, /* cc: the source is 64 bits wide */
+    X_JMP, X_JCC, X_CALL, X_CALLR, X_TAIL, X_RET,
+    X_ALLOCA, X_FRAMEADDR, X_TLS,
+    X_ATOMIC,                /* read-modify-write of [rdi] with rsi (and rdx); imm as the callee of an IF_ATOMIC call; old value to rax */
+    X_MFENCE, X_UD2,
+    X_VASAVE,                /* variadic function: the argument registers go to slot sym */
+    X_ASM,                   /* inline assembly: imm = index of the AsmStmt */
+    X_DEFREG                 /* no code: d is written by the instruction before */
+};
+
+/* conditions: the processor's own, then two that take two tests after a
+   floating point comparison (equal: ZF and not PF; not equal: the opposite) */
+enum { CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A, CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G,
+       CC_FEQ, CC_FNE };
+
+static const MTarget target = {
+    { 0xf3cfUL,               /* rax rcx rdx rbx rsi rdi r8 r9 r12-r15 */
+      0x3fffUL << 32 },       /* xmm0-xmm13 */
+    0x3c7UL | (0xffffUL << 32), /* rax rcx rdx rsi rdi r8 r9; every xmm */
+    X_MOV
+};
+
+static const u8 arg_gr[6] = { RDI, RSI, RDX, RCX, R8, R9 };
+
+static Func *f;
+static Obj *obj;
+static MFunc mf;
+static u32 *uses;      /* per IR value: number of uses */
+#define FUSE_CMP 1   /* a comparison used only as a condition: whoever uses it sets the flags */
+#define FUSE_OFF 2   /* add of a constant folded into an address */
+#define FUSE_IDX 3   /* add of an index register folded into an address */
+#define FUSE_SKIP 4  /* shift that is the scale of a folded index */
+#define FUSE_MOV 5   /* extension made redundant by changing the load it reads */
+#define FUSE_LOAD 6  /* load that is the memory operand of its one user */
+#define FUSE_TEST 9  /* and whose result only says zero or not: a test where that is asked */
+#define FUSE_RMW 8   /* operation on a loaded value, stored back: done in memory by the store */
+#define FUSE_ALIAS 7 /* truncation or extension that is its operand's register, unchanged */
+#define FUSE_NOT 0x80 /* while counting uses: the value is used as a value */
+#define LOAD_SIGNED32 8 /* access kind, here only: a 32-bit load that sign-extends to 64 bits */
+static u8 *fused;
+static u32 *cache_reg; /* per floating IR value: register holding it ... */
+static u32 *cache_blk; /* ... in this block */
+static u32 cur_blk;
+static u32 *blk_index; /* IR block -> layout index */
+static u32 *layout;    /* layout index -> IR block */
+static u32 nlayout;
+static u32 outargs;     /* bytes of outgoing stack arguments */
+static u32 named_stack; /* bytes of incoming named stack arguments */
+static u32 sym_memcpy, sym_memset;
+static Obj *sym_obj_owner;
+static int has_calls, uses_args, uses_fp, uses_alloca;
+static u32 ret_slot;  /* where a record returned in registers is put together */
+static u32 sret_slot; /* where the address of a record returned in memory is kept */
+static u32 va_slot;   /* variadic function: the register save area */
+static u32 *alink;    /* inline assembly call -> its first OP_ASMOUT -> the next; made when first needed */
+static u64 asm_saved; /* registers written by inline assembly */
+static u32 fn_serial;
+
+/* ---- machine IR construction ---- */
+
+static MIns *emit(int op, int w, u32 d, u32 s0, u32 s1)
+{
+    MIns *i;
+    if (mf.n == mf.cap) {
+        mf.cap = mf.cap ? mf.cap * 2 : 1024;
+        mf.ins = (MIns *)xrealloc(mf.ins, mf.cap * sizeof(MIns));
+    }
+    i = &mf.ins[mf.n++];
+    i->op = (u16)op;
+    i->w = (u8)w;
+    i->cc = 0;
+    i->flags = 0;
+    i->d = d;
+    i->s0 = s0;
+    i->s1 = s1;
+    i->s2 = NOREG;
+    i->sym = NOSLOT;
+    i->imm = 0;
+    i->pmask = 0;
+    return i;
+}
+
+static u32 new_vreg(int cls)
+{
+    if (mf.nvreg == mf.capvreg) {
+        mf.capvreg = mf.capvreg ? mf.capvreg * 2 : 1024;
+        mf.vclass = (u8 *)xrealloc(mf.vclass, mf.capvreg);
+    }
+    mf.vclass[mf.nvreg] = (u8)cls;
+    return VREG0 + mf.nvreg++;
+}
+
+static int is_fp(int ty)
+{
+    return ty == IT_F32 || ty == IT_F64;
+}
+
+static int is_w(int ty)
+{
+    return ty == IT_I64 || ty == IT_F64;
+}
+
+static int fits32(i64 v)
+{
+    return v >= -0x7fffffffL - 1 && v <= 0x7fffffffL;
+}
+
+/* The integer constant v as an instruction of its type would see it. */
+static int const_of(u32 v, i64 *c)
+{
+    u64 u;
+    if (!ir_is_const(f, v, &u))
+        return 0;
+    *c = f->ins[v].ty == IT_I64 ? (i64)u : (i64)(i32)(u32)u;
+    return 1;
+}
+
+/* Materialise a floating value into register d. */
+static void materialise(u32 v, u32 d)
+{
+    Ins *i = &f->ins[v];
+    MIns *m;
+    switch (i->op) {
+    case OP_CONST:
+        m = emit(X_MOVI, i->ty == IT_I64, d, NOREG, NOREG);
+        m->imm = (i64)((u64)i->a | ((u64)i->b << 32));
+        break;
+    case OP_FCONST:
+        m = emit(X_FMOVI, i->ty == IT_F64, d, NOREG, NOREG);
+        m->imm = (i64)((u64)i->a | ((u64)i->b << 32));
+        break;
+    case OP_ADDR:
+        m = emit(X_LEA, 1, d, NOREG, NOREG);
+        m->sym = i->a;
+        m->imm = (i32)i->b;
+        break;
+    case OP_SLOT:
+        m = emit(X_SLOTADDR, 1, d, NOREG, NOREG);
+        m->sym = i->a;
+        m->imm = (i32)i->b;
+        break;
+    default:
+        emit(X_MOV, 1, d, VREG0 + v, NOREG);
+        break;
+    }
+}
+
+static int is_floating(u32 v)
+{
+    int op = f->ins[v].op;
+    return op == OP_CONST || op == OP_FCONST || op == OP_ADDR || op == OP_SLOT;
+}
+
+/* The register holding IR value v. */
+static u32 reg_of(u32 v)
+{
+    u32 r;
+    while (fused[v] == FUSE_ALIAS)
+        v = f->ins[v].a;
+    if (!is_floating(v))
+        return VREG0 + v;
+    if (cache_blk[v] == cur_blk)
+        return cache_reg[v];
+    r = new_vreg(is_fp(f->ins[v].ty));
+    materialise(v, r);
+    cache_blk[v] = cur_blk;
+    cache_reg[v] = r;
+    return r;
+}
+
+/* Copy IR value v into register d (which may be physical). */
+static void move_to(u32 d, u32 v)
+{
+    while (fused[v] == FUSE_ALIAS)
+        v = f->ins[v].a;
+    if (is_floating(v))
+        materialise(v, d);
+    else
+        emit(X_MOV, 1, d, VREG0 + v, NOREG);
+}
+
+static const u8 mem_bytes[] = { 1, 1, 2, 2, 4, 8, 4, 8, 4 };
+
+typedef struct Addr {
+    u32 base;  /* register or NOREG */
+    u32 idx;   /* index register or NOREG */
+    u32 sym;   /* slot or symbol, by flags */
+    i64 off;
+    u8 flags;  /* XF_SLOT, XF_SYM, scale */
+} Addr;
+
+/* The address v as a memory operand. */
+static void addr_of(u32 v, Addr *a)
+{
+    Ins *i = &f->ins[v];
+    i64 c;
+    a->base = a->idx = NOREG;
+    a->sym = NOSLOT;
+    a->off = 0;
+    a->flags = 0;
+    while (fused[v] == FUSE_ALIAS) {
+        v = i->a;
+        i = &f->ins[v];
+    }
+    if (fused[v] == FUSE_IDX) {
+        u32 x = i->a, y = i->b;
+        if (fused[x] == FUSE_SKIP) {
+            x = i->b;
+            y = i->a;
+        }
+        a->base = reg_of(x);
+        if (fused[y] == FUSE_SKIP) {
+            u64 sh = 0;
+            ir_is_const(f, f->ins[y].b, &sh);
+            a->flags |= (u8)(sh << XF_SCALE_SHIFT);
+            y = f->ins[y].a;
+        }
+        a->idx = reg_of(y);
+        return;
+    }
+    if (i->op == OP_SLOT) {
+        a->flags = XF_SLOT;
+        a->sym = i->a;
+        a->off = (i32)i->b;
+    } else if (i->op == OP_ADDR && cache_blk[v] != cur_blk) {
+        a->flags = XF_SYM;
+        a->sym = i->a;
+        a->off = (i32)i->b;
+    } else if (fused[v] == FUSE_OFF && const_of(i->b, &c)) {
+        Ins *b = &f->ins[i->a];
+        a->off = c;
+        if (b->op == OP_SLOT) {
+            a->flags = XF_SLOT;
+            a->sym = b->a;
+            a->off += (i32)b->b;
+        } else if (b->op == OP_ADDR && fits32(a->off + (i32)b->b)) {
+            a->flags = XF_SYM;
+            a->sym = b->a;
+            a->off += (i32)b->b;
+        } else {
+            a->base = reg_of(i->a);
+        }
+    } else {
+        a->base = reg_of(v);
+    }
+}
+
+static void set_mem(MIns *m, const Addr *a)
+{
+    m->sym = a->sym;
+    m->imm = a->off;
+    m->flags = a->flags;
+}
+
+static void emit_load(u32 d, const Addr *a, int mem)
+{
+    MIns *m = emit(X_LOAD, 0, d, a->base, a->idx);
+    m->cc = (u8)mem;
+    set_mem(m, a);
+}
+
+static void emit_store(u32 val, const Addr *a, int mem)
+{
+    MIns *m = emit(X_STORE, 0, NOREG, val, a->base);
+    m->s2 = a->idx;
+    m->cc = (u8)mem;
+    set_mem(m, a);
+}
+
+static void emit_store_imm(i64 val, const Addr *a, int mem)
+{
+    MIns *m = emit(X_STOREI, 0, NOREG, NOREG, a->base);
+    m->s2 = a->idx;
+    m->cc = (u8)mem;
+    set_mem(m, a);
+    m->imm = (i64)(((u64)val << 32) | (u32)a->off);
+}
+
+static void slot_addr(Addr *a, u32 slot, i64 off)
+{
+    a->base = a->idx = NOREG;
+    a->flags = XF_SLOT;
+    a->sym = slot;
+    a->off = off;
+}
+
+static void reg_addr(Addr *a, u32 base, i64 off)
+{
+    a->base = base;
+    a->idx = NOREG;
+    a->flags = 0;
+    a->sym = NOSLOT;
+    a->off = off;
+}
+
+static int is_compare(int op)
+{
+    return (op >= OP_EQ && op <= OP_UGE) || (op >= OP_FEQ && op <= OP_FGE);
+}
+
+/* the flags of a & b, for an and that is not made into a value */
+static void emit_test(u32 v)
+{
+    Ins *i = &f->ins[v];
+    int w = i->ty == IT_I64;
+    i64 c;
+    MIns *m;
+    if (const_of(i->b, &c) && fits32(c)) {
+        m = emit(X_TESTI, w, NOREG, reg_of(i->a), NOREG);
+        m->imm = c;
+    } else {
+        u32 ra = reg_of(i->a);
+        emit(X_TEST, w, NOREG, ra, reg_of(i->b));
+    }
+}
+
+static void emit_cmp_mem_imm(const Addr *a, int mem, i64 val)
+{
+    MIns *m = emit(X_CMPMI, mem == M_64, NOREG, NOREG, a->base);
+    m->s2 = a->idx;
+    m->cc = (u8)mem;
+    set_mem(m, a);
+    m->imm = (i64)(((u64)val << 32) | (u32)a->off);
+}
+
+/* Emits the flag-setting instruction for compare v; returns the condition. */
+static int emit_compare(u32 v)
+{
+    Ins *i = &f->ins[v];
+    int ty = f->ins[i->a].ty;
+    i64 c;
+    MIns *m;
+    if (is_fp(ty)) {
+        u32 ra = reg_of(i->a), rb = reg_of(i->b);
+        switch (i->op) {
+        case OP_FEQ: emit(X_FCMP, ty == IT_F64, NOREG, ra, rb); return CC_FEQ;
+        case OP_FNE: emit(X_FCMP, ty == IT_F64, NOREG, ra, rb); return CC_FNE;
+        case OP_FLT: emit(X_FCMP, ty == IT_F64, NOREG, rb, ra); return CC_A;
+        case OP_FLE: emit(X_FCMP, ty == IT_F64, NOREG, rb, ra); return CC_AE;
+        case OP_FGT: emit(X_FCMP, ty == IT_F64, NOREG, ra, rb); return CC_A;
+        default: emit(X_FCMP, ty == IT_F64, NOREG, ra, rb); return CC_AE;
+        }
+    }
+    if (fused[i->a] == FUSE_LOAD || fused[i->b] == FUSE_LOAD) {
+        int left = fused[i->a] == FUSE_LOAD;
+        Ins *l = &f->ins[left ? i->a : i->b];
+        Addr a;
+        if (left && const_of(i->b, &c)) {
+            addr_of(l->a, &a);
+            emit_cmp_mem_imm(&a, l->mem, c);
+        } else {
+            u32 r = reg_of(left ? i->b : i->a);
+            addr_of(l->a, &a);
+            m = emit(X_CMPM, ty == IT_I64, NOREG, r, a.base);
+            m->s2 = a.idx;
+            m->cc = (u8)left;
+            set_mem(m, &a);
+        }
+    } else if (const_of(i->b, &c) && c == 0 && fused[i->a] == FUSE_TEST) {
+        emit_test(i->a);
+    } else if (const_of(i->b, &c) && fits32(c)) {
+        if (c == 0) {
+            u32 r = reg_of(i->a);
+            emit(X_TEST, ty == IT_I64, NOREG, r, r);
+        } else {
+            m = emit(X_CMPI, ty == IT_I64, NOREG, reg_of(i->a), NOREG);
+            m->imm = c;
+        }
+    } else {
+        u32 ra = reg_of(i->a);
+        emit(X_CMP, ty == IT_I64, NOREG, ra, reg_of(i->b));
+    }
+    switch (i->op) {
+    case OP_EQ: return CC_E;
+    case OP_NE: return CC_NE;
+    case OP_SLT: return CC_L;
+    case OP_SLE: return CC_LE;
+    case OP_SGT: return CC_G;
+    case OP_SGE: return CC_GE;
+    case OP_ULT: return CC_B;
+    case OP_ULE: return CC_BE;
+    case OP_UGT: return CC_A;
+    }
+    return CC_AE;
+}
+
+/* The flags for "v is not zero", v a value or a fused comparison; returns the condition. */
+static int emit_cond(u32 v)
+{
+    u32 r;
+    if (fused[v] == FUSE_CMP)
+        return emit_compare(v);
+    if (fused[v] == FUSE_LOAD) {
+        Addr a;
+        addr_of(f->ins[v].a, &a);
+        emit_cmp_mem_imm(&a, f->ins[v].mem, 0);
+        return CC_NE;
+    }
+    if (fused[v] == FUSE_TEST) {
+        emit_test(v);
+        return CC_NE;
+    }
+    r = reg_of(v);
+    emit(X_TEST, f->ins[v].ty == IT_I64, NOREG, r, r);
+    return CC_NE;
+}
+
+/* Does an instruction of this kind leave the upper half of its register clear? */
+static int clean32(int op)
+{
+    return (op >= OP_ADD && op <= OP_ZEXT16) || op == OP_FTOSI || op == OP_FTOUI || op == OP_LOAD;
+}
+
+/* ---- calling convention ---- */
+
+#define LOC_STACK 0x40000000U /* flag: the rest is a stack offset */
+#define LOC_NONE 0xffffffffU
+#define AK_INT 0
+#define AK_FP 1
+#define AK_BLK 2  /* a block of bsize bytes on the stack */
+#define AK_SKIP 3 /* not passed */
+
+static u8 *a_kind;
+static u32 *a_size, *a_loc, a_cap;
+
+static void args_reserve(u32 n)
+{
+    if (n <= a_cap)
+        return;
+    a_cap = n * 2;
+    a_kind = (u8 *)xrealloc(a_kind, a_cap);
+    a_size = (u32 *)xrealloc(a_size, a_cap * sizeof(u32));
+    a_loc = (u32 *)xrealloc(a_loc, a_cap * sizeof(u32));
+}
+
+/* Assigns locations to the n arguments described by a_kind and a_size (the
+   size of a block; bit 31: it is aligned to 16 bytes); returns the stack
+   bytes used. *nfr gets the number of xmm registers taken. */
+static u32 abi_assign(u32 n, u32 *nfr_out)
+{
+    u32 ngr = 0, nfr = 0, stack = 0, k;
+    for (k = 0; k < n; k++) {
+        switch (a_kind[k]) {
+        case AK_SKIP:
+            a_loc[k] = LOC_NONE;
+            break;
+        case AK_BLK:
+            if (a_size[k] >> 31)
+                stack = (u32)align_up(stack, 16);
+            a_loc[k] = LOC_STACK | stack;
+            stack += (u32)align_up(a_size[k] & 0x7fffffffU, 8);
+            break;
+        case AK_FP:
+            if (nfr < 8) {
+                a_loc[k] = XMM0 + nfr++;
+            } else {
+                a_loc[k] = LOC_STACK | stack;
+                stack += 8;
+            }
+            break;
+        default:
+            if (ngr < 6) {
+                a_loc[k] = arg_gr[ngr++];
+            } else {
+                a_loc[k] = LOC_STACK | stack;
+                stack += 8;
+            }
+        }
+    }
+    if (nfr_out)
+        *nfr_out = nfr;
+    return (u32)align_up(stack, 16);
+}
+
+static int ty_mem(int ty)
+{
+    return ty == IT_I64 ? M_64 : ty == IT_F32 ? M_F32 : ty == IT_F64 ? M_F64 : M_32;
+}
+
+static u32 runtime_sym(const char *name, u32 *cache)
+{
+    if (sym_obj_owner != obj) {
+        sym_obj_owner = obj;
+        sym_memcpy = sym_memset = NOSLOT;
+    }
+    if (*cache == NOSLOT)
+        *cache = obj_add_sym(obj, intern_cstr(name), SEC_UNDEF, 0, 1);
+    return *cache;
+}
+
+/* memcpy(dst, src, size) or memset(dst, 0, size); the addresses are in registers already or are IR values */
+static void runtime_call(u32 sym, u32 dreg, u32 dv, u32 sreg, u32 sv, int has_src, u32 size)
+{
+    MIns *m;
+    if (dreg != NOREG)
+        emit(X_MOV, 1, RDI, dreg, NOREG);
+    else
+        move_to(RDI, dv);
+    if (!has_src) {
+        m = emit(X_MOVI, 0, RSI, NOREG, NOREG);
+        m->imm = 0;
+    } else if (sreg != NOREG) {
+        emit(X_MOV, 1, RSI, sreg, NOREG);
+    } else {
+        move_to(RSI, sv);
+    }
+    m = emit(X_MOVI, 1, RDX, NOREG, NOREG);
+    m->imm = size;
+    m = emit(X_CALL, 0, NOREG, NOREG, NOREG);
+    m->sym = sym;
+    m->flags = MF_CALL;
+    m->pmask = BIT(RDI) | BIT(RSI) | BIT(RDX);
+    has_calls = 1;
+}
+
+/* Copies (or with no source clears) size bytes, a doubleword at a time and then the rest. */
+static void block_move(const Addr *d, const Addr *s, u32 size)
+{
+    u32 off = 0, t = NOREG;
+    if (s)
+        t = new_vreg(0);
+    while (size) {
+        u32 n = size >= 8 ? 8 : size >= 4 ? 4 : size >= 2 ? 2 : 1;
+        int mem = n == 8 ? M_64 : n == 4 ? M_32 : n == 2 ? M_16U : M_8U;
+        Addr da = *d, sa;
+        da.off += off;
+        if (s) {
+            sa = *s;
+            sa.off += off;
+            emit_load(t, &sa, mem);
+            emit_store(t, &da, mem);
+        } else {
+            emit_store_imm(0, &da, mem);
+        }
+        off += n;
+        size -= n;
+    }
+}
+
+static void plain_addr(u32 v, Addr *a)
+{
+    Ins *i = &f->ins[v];
+    if (i->op == OP_SLOT)
+        slot_addr(a, i->a, (i32)i->b);
+    else
+        reg_addr(a, reg_of(v), 0);
+}
+
+static void sel_block_op(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u32 size = i->c;
+    Addr d, s;
+    int copy = i->op == OP_MEMCPY;
+
+    if (size == 0)
+        return;
+    if (size > 64) {
+        if (copy)
+            runtime_call(runtime_sym("memcpy", &sym_memcpy), NOREG, i->a, NOREG, i->b, 1, size);
+        else
+            runtime_call(runtime_sym("memset", &sym_memset), NOREG, i->a, NOREG, 0, 0, size);
+        return;
+    }
+    plain_addr(i->a, &d);
+    if (copy)
+        plain_addr(i->b, &s);
+    block_move(&d, copy ? &s : 0, size);
+}
+
+static void sel_asm(u32 v);
+
+/* Atomic operations. Loads and stores are ordinary ones (a store that must
+   be seen in order is followed by a fence). The others work in fixed
+   registers: the address in rdi, the operand in rsi (compare and swap: the
+   expected value in rax, the new one in rdx), and the old value comes back in rax. */
+static void sel_atomic(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u32 code = f->ins[i->c].a, kind = code & 255, lg = code >> 8 & 3, d = VREG0 + v;
+    int relaxed = (int)(code >> 12 & 1), mem = lg == 0 ? M_8U : lg == 1 ? M_16U : lg == 2 ? M_32 : M_64;
+    MIns *m;
+    Addr a;
+    u32 r;
+
+    switch (kind) {
+    case ATOM_FENCE:
+        emit(X_MFENCE, 0, NOREG, NOREG, NOREG);
+        return;
+    case ATOM_LOAD:
+        plain_addr(f->xargs[i->a], &a);
+        emit_load(d, &a, mem);
+        return;
+    case ATOM_STORE:
+        r = reg_of(f->xargs[i->a + 1]);
+        plain_addr(f->xargs[i->a], &a);
+        emit_store(r, &a, mem);
+        if (!relaxed)
+            emit(X_MFENCE, 0, NOREG, NOREG, NOREG);
+        return;
+    }
+    move_to(RDI, f->xargs[i->a]);
+    if (kind == ATOM_CAS) {
+        move_to(RAX, f->xargs[i->a + 1]);
+        move_to(RDX, f->xargs[i->a + 2]);
+    } else {
+        move_to(RSI, f->xargs[i->a + 1]);
+    }
+    m = emit(X_ATOMIC, 0, RAX, NOREG, NOREG);
+    m->imm = code;
+    m->pmask = kind == ATOM_CAS ? BIT(RDI) | BIT(RAX) | BIT(RDX) : BIT(RDI) | BIT(RSI);
+    if (kind != ATOM_CAS)
+        emit(X_DEFREG, 1, RSI, NOREG, NOREG);
+    if (uses[v])
+        emit(X_MOV, 1, d, RAX, NOREG);
+}
+
+static void sel_call(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u32 n = i->b, nfixed = f->xargs[i->a - 1], k, stack, nfr = 0;
+    u64 pmask = 0;
+    MIns *m;
+    Addr a;
+    u32 callee = NOREG;
+    int sret_regs = (i->flags & IF_SRET) && i->mem;
+
+    if (i->flags & IF_ASM) {
+        sel_asm(v);
+        return;
+    }
+    if (f->ins[i->c].op == OP_ADDR && obj->syms[f->ins[i->c].a].isdev) {
+        m = emit(X_MOVI, 0, VREG0 + v, NOREG, NOREG); /* CUDA: this is not device code */
+        m->imm = 0;
+        return;
+    }
+    if (i->flags & IF_ATOMIC) {
+        sel_atomic(v);
+        return;
+    }
+    if (i->flags & IF_ALLOCA) {
+        k = (u32)f->ins[i->c].a; /* 0: take stack, 1: the stack pointer, 2: set it */
+        m = k == 2 ? emit(X_ALLOCA, 1, NOREG, reg_of(f->xargs[i->a]), NOREG)
+            : emit(X_ALLOCA, 1, VREG0 + v, k == 1 ? NOREG : reg_of(f->xargs[i->a]), NOREG);
+        m->imm = k;
+        uses_fp = uses_alloca = 1;
+        return;
+    }
+    args_reserve(n + 1);
+    for (k = 0; k < n; k++) {
+        Ins *ai = &f->ins[f->xargs[i->a + k]];
+        if (k == 0 && sret_regs) {
+            a_kind[k] = AK_SKIP;
+        } else if (ai->op == OP_BYVAL) {
+            a_kind[k] = AK_BLK;
+            a_size[k] = ai->b | (ai->c > 8 ? 0x80000000U : 0);
+        } else {
+            a_kind[k] = is_fp(ai->ty) ? AK_FP : AK_INT;
+        }
+    }
+    stack = abi_assign(n, &nfr);
+    if (stack > outargs)
+        outargs = stack;
+    if (f->ins[i->c].op != OP_ADDR || f->ins[i->c].b != 0)
+        callee = reg_of(i->c);
+    /* blocks first: a long one is copied by a call */
+    for (k = 0; k < n; k++) {
+        if (a_kind[k] == AK_BLK) {
+            Ins *ai = &f->ins[f->xargs[i->a + k]];
+            u32 off = a_loc[k] & ~LOC_STACK, src = reg_of(f->xargs[i->a + k]);
+            if (ai->b > 128) {
+                u32 t = new_vreg(0);
+                m = emit(X_ADDI, 1, t, RSP, NOREG);
+                m->imm = off;
+                runtime_call(runtime_sym("memcpy", &sym_memcpy), t, 0, src, 0, 1, ai->b);
+                /* the registers of this call's own arguments were not disturbed: none is set yet */
+            } else {
+                Addr s;
+                reg_addr(&a, RSP, off);
+                reg_addr(&s, src, 0);
+                block_move(&a, &s, ai->b);
+            }
+        }
+    }
+    for (k = 0; k < n; k++) {
+        if (a_kind[k] != AK_BLK && a_loc[k] != LOC_NONE && (a_loc[k] & LOC_STACK)) {
+            int ty = f->ins[f->xargs[i->a + k]].ty;
+            reg_addr(&a, RSP, a_loc[k] & ~LOC_STACK);
+            emit_store(reg_of(f->xargs[i->a + k]), &a, is_fp(ty) ? ty_mem(ty) : M_64);
+        }
+    }
+    for (k = 0; k < n; k++) {
+        if (a_loc[k] != LOC_NONE && !(a_loc[k] & LOC_STACK)) {
+            move_to(a_loc[k], f->xargs[i->a + k]);
+            pmask |= BIT(a_loc[k]);
+        }
+    }
+    if (callee == NOREG && obj->syms[f->ins[i->c].a].trap) {
+        /* a function declared with the error attribute: the call was to be
+           optimised away, and what could not be proved dead traps */
+        emit(X_UD2, 0, NOREG, NOREG, NOREG);
+        return;
+    }
+    if (nfixed != 0xffffffffU) {
+        /* a function that takes any arguments wants to know how many are in xmm registers */
+        m = emit(X_MOVI, 0, RAX, NOREG, NOREG);
+        m->imm = nfr;
+        pmask |= BIT(RAX);
+    }
+    if (callee == NOREG) {
+        m = emit(X_CALL, 0, NOREG, NOREG, NOREG);
+        m->sym = f->ins[i->c].a;
+    } else {
+        m = emit(X_CALLR, 0, NOREG, callee, NOREG);
+    }
+    m->flags = MF_CALL;
+    m->pmask = pmask;
+    has_calls = 1;
+    if (sret_regs) {
+        /* a small record comes back in two registers, each rax/rdx or xmm0/xmm1 by its class; the place for it holds 16 bytes */
+        u32 r0 = i->flags & IF_SSE0 ? XMM0 : RAX;
+        u32 r1 = i->flags & IF_SSE1 ? (i->flags & IF_SSE0 ? XMM0 + 1 : XMM0) : (i->flags & IF_SSE0 ? RAX : RDX);
+        plain_addr(f->xargs[i->a], &a);
+        emit_store(r0, &a, r0 >= XMM0 ? M_F64 : M_64);
+        if (i->mem > 8) {
+            a.off += 8;
+            emit_store(r1, &a, r1 >= XMM0 ? M_F64 : M_64);
+        }
+    }
+    if (i->ty != IT_VOID && uses[v])
+        emit(X_MOV, 1, VREG0 + v, is_fp(i->ty) ? XMM0 : RAX, NOREG);
+}
+
+static void sel_ins(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u32 d = VREG0 + v;
+    int w = is_w(i->ty), op = 0;
+    i64 c;
+    MIns *m;
+    Addr a;
+
+    if (i->ty == IT_V128 || i->op == OP_VSTORE || i->op == OP_VSUM)
+        die("%s: vector operations are not supported for x86-64", f->name);
+
+    switch (i->op) {
+    case OP_PARAM:
+        return; /* handled at function entry */
+    case OP_ADD:
+    case OP_SUB:
+        if (fused[v])
+            return;
+        if (const_of(i->b, &c) && fits32(c) && c != -0x7fffffffL - 1) {
+            m = emit(X_ADDI, w, d, reg_of(i->a), NOREG);
+            m->imm = i->op == OP_ADD ? c : -c;
+            return;
+        }
+        op = i->op == OP_ADD ? X_ADD : X_SUB;
+        goto binary;
+    case OP_MUL:
+        if (const_of(i->b, &c) && fits32(c)) {
+            m = emit(X_IMULI, w, d, reg_of(i->a), NOREG);
+            m->imm = c;
+            return;
+        }
+        op = X_IMUL;
+        goto binary;
+    case OP_FADD: op = X_FADD; goto binary;
+    case OP_FSUB: op = X_FSUB; goto binary;
+    case OP_FMUL: op = X_FMUL; goto binary;
+    case OP_FDIV: op = X_FDIV; goto binary;
+    binary: {
+        u32 ra;
+        if (fused[i->a] == FUSE_LOAD || fused[i->b] == FUSE_LOAD) {
+            int left = fused[i->a] == FUSE_LOAD;
+            ra = reg_of(left ? i->b : i->a);
+            addr_of(f->ins[left ? i->a : i->b].a, &a);
+            switch (op) {
+            case X_ADD: op = X_ADDM; break;
+            case X_SUB: op = X_SUBM; break;
+            case X_IMUL: op = X_IMULM; break;
+            case X_AND: op = X_ANDM; break;
+            case X_OR: op = X_ORM; break;
+            case X_XOR: op = X_XORM; break;
+            case X_FADD: op = X_FADDM; break;
+            case X_FSUB: op = X_FSUBM; break;
+            case X_FMUL: op = X_FMULM; break;
+            default: op = X_FDIVM; break;
+            }
+            m = emit(op, i->ty == IT_I64 || i->ty == IT_F64, d, ra, a.base);
+            m->s2 = a.idx;
+            set_mem(m, &a);
+            return;
+        }
+        ra = reg_of(i->a);
+        emit(op, w, d, ra, reg_of(i->b));
+        return;
+    }
+    case OP_SDIV:
+    case OP_UDIV:
+    case OP_SREM:
+    case OP_UREM: {
+        int sgn = i->op == OP_SDIV || i->op == OP_SREM, rem = i->op == OP_SREM || i->op == OP_UREM;
+        u32 ra = reg_of(i->a), rb = reg_of(i->b);
+        emit(X_MOV, 1, RAX, ra, NOREG);
+        if (sgn) {
+            m = emit(X_CQO, w, RDX, NOREG, NOREG);
+            m->pmask = BIT(RAX);
+        } else {
+            m = emit(X_MOVI, 0, RDX, NOREG, NOREG);
+            m->imm = 0;
+        }
+        m = emit(sgn ? X_IDIV : X_DIV, w, RAX, rb, NOREG);
+        m->pmask = BIT(RAX) | BIT(RDX);
+        emit(X_DEFREG, 1, RDX, NOREG, NOREG);
+        emit(X_MOV, 1, d, rem ? RDX : RAX, NOREG);
+        return;
+    }
+    case OP_UMULH:
+    case OP_SMULH: {
+        u32 ra = reg_of(i->a), rb = reg_of(i->b);
+        emit(X_MOV, 1, RAX, ra, NOREG);
+        m = emit(i->op == OP_UMULH ? X_MULH : X_IMULH, 1, RDX, rb, NOREG);
+        m->pmask = BIT(RAX);
+        emit(X_DEFREG, 1, RAX, NOREG, NOREG);
+        emit(X_MOV, 1, d, RDX, NOREG);
+        return;
+    }
+    case OP_AND:
+    case OP_OR:
+    case OP_XOR:
+        if (fused[v])
+            return;
+        op = i->op == OP_AND ? X_AND : i->op == OP_OR ? X_OR : X_XOR;
+        if (const_of(i->b, &c)) {
+            if (i->op == OP_AND && w && c == 0xffffffffL) {
+                emit(X_MOVZXD, 0, d, reg_of(i->a), NOREG);
+                return;
+            }
+            if (fits32(c)) {
+                m = emit(op + (X_ANDI - X_AND), w, d, reg_of(i->a), NOREG);
+                m->imm = c;
+                return;
+            }
+        }
+        goto binary;
+    case OP_SHL:
+    case OP_SHR:
+    case OP_SAR:
+        if (fused[v])
+            return;
+        op = i->op == OP_SHL ? X_SHL : i->op == OP_SHR ? X_SHR : X_SAR;
+        if (const_of(i->b, &c)) {
+            m = emit(op + (X_SHLI - X_SHL), w, d, reg_of(i->a), NOREG);
+            m->imm = c & (w ? 63 : 31);
+            return;
+        } else {
+            u32 ra = reg_of(i->a);
+            move_to(RCX, i->b);
+            m = emit(op, w, d, ra, NOREG);
+            m->pmask = BIT(RCX);
+        }
+        return;
+    case OP_NEG: op = X_NEG; goto unary;
+    case OP_NOT: op = X_NOT; goto unary;
+    case OP_FNEG: op = X_FNEG; goto unary;
+    case OP_CLZ: op = X_CLZ; goto unary;
+    case OP_CTZ: op = X_BSF; goto unary;
+    case OP_BSWAP: op = X_BSWAP; goto unary;
+    case OP_ASMOUT:
+        return; /* moved out of its register where the assembly is */
+    case OP_BYVAL:
+    case OP_PIN:
+        move_to(d, i->a);
+        return;
+    case OP_TLS:
+        if (f->ins[i->a].op != OP_ADDR)
+            die("internal: thread-local address of no symbol");
+        m = emit(X_TLS, 1, d, NOREG, NOREG);
+        m->sym = f->ins[i->a].a;
+        m->imm = (i32)f->ins[i->a].b;
+        return;
+    case OP_FRAMEADDR:
+        m = emit(X_FRAMEADDR, 1, d, NOREG, NOREG);
+        m->imm = i->a;
+        if (i->a < 2)
+            uses_fp = 1;
+        return;
+    case OP_SEXT8: op = X_MOVSX8; goto ext;
+    case OP_SEXT16: op = X_MOVSX16; goto ext;
+    case OP_ZEXT8: op = X_MOVZX8; goto ext;
+    case OP_ZEXT16: op = X_MOVZX16; goto ext;
+    ext:
+        if (fused[v] == FUSE_MOV) {
+            emit(X_MOV, 1, d, reg_of(i->a), NOREG);
+            return;
+        }
+        goto unary;
+    case OP_SEXT32:
+        if (fused[v])
+            return;
+        op = X_MOVSXD;
+        goto unary;
+    case OP_ZEXT32:
+        if (fused[v])
+            return;
+        op = X_MOVZXD;
+        w = 0;
+        goto unary;
+    case OP_TRUNC:
+        if (fused[v])
+            return;
+        op = X_MOV;
+        w = 1;
+        goto unary;
+    unary:
+        emit(op, w, d, reg_of(i->a), NOREG);
+        return;
+    case OP_SITOF:
+    case OP_UITOF:
+        m = emit(i->op == OP_SITOF ? X_SITOF : X_UITOF, w, d, reg_of(i->a), NOREG);
+        m->cc = f->ins[i->a].ty == IT_I64;
+        return;
+    case OP_FTOSI:
+    case OP_FTOUI:
+        m = emit(i->op == OP_FTOSI ? X_FTOSI : X_FTOUI, w, d, reg_of(i->a), NOREG);
+        m->cc = f->ins[i->a].ty == IT_F64;
+        return;
+    case OP_FEXT:
+    case OP_FTRUNC:
+        emit(X_FCVT, w, d, reg_of(i->a), NOREG);
+        return;
+    case OP_LOAD:
+        if (fused[v] == FUSE_LOAD)
+            return;
+        addr_of(i->a, &a);
+        emit_load(d, &a, (i->flags & 0x80) ? LOAD_SIGNED32 : i->mem);
+        return;
+    case OP_STORE: {
+        Ins *bi = &f->ins[i->b];
+        u64 bits = (u64)bi->a | ((u64)bi->b << 32);
+        if (fused[i->b] == FUSE_RMW) {
+            int alu = bi->op == OP_ADD ? 0 : bi->op == OP_OR ? 1 : bi->op == OP_AND ? 4 : bi->op == OP_SUB ? 5 : 6;
+            u32 other = fused[bi->a] == FUSE_LOAD ? bi->b : bi->a;
+            if (const_of(other, &c)) {
+                addr_of(i->a, &a);
+                m = emit(X_RMWI, alu, NOREG, NOREG, a.base);
+                m->s2 = a.idx;
+                m->cc = i->mem;
+                set_mem(m, &a);
+                m->imm = (i64)(((u64)c << 32) | (u32)a.off);
+            } else {
+                u32 val = reg_of(other);
+                addr_of(i->a, &a);
+                m = emit(X_RMW, alu, NOREG, val, a.base);
+                m->s2 = a.idx;
+                m->cc = i->mem;
+                set_mem(m, &a);
+            }
+            return;
+        }
+        if (const_of(i->b, &c) && (i->mem < M_64 || fits32(c))) {
+            addr_of(i->a, &a);
+            emit_store_imm(c, &a, i->mem);
+        } else if (bi->op == OP_FCONST && (i->mem == M_F32 || fits32((i64)bits))) {
+            addr_of(i->a, &a);
+            emit_store_imm((i64)bits, &a, i->mem == M_F32 ? M_32 : M_64);
+        } else {
+            u32 val = reg_of(i->b);
+            addr_of(i->a, &a);
+            emit_store(val, &a, i->mem);
+        }
+        return;
+    }
+    case OP_CALL:
+        sel_call(v);
+        return;
+    case OP_MEMCPY:
+    case OP_MEMZERO:
+        sel_block_op(v);
+        return;
+    case OP_VASTART:
+        m = emit(X_SLOTADDR, 1, d, NOREG, NOREG);
+        if (i->a == 0) {
+            m->sym = ARGSLOT;
+            m->imm = named_stack;
+            uses_args = 1;
+        } else {
+            m->sym = va_slot; /* where the argument registers were saved */
+        }
+        return;
+    case OP_SELECT: {
+        u32 rb = reg_of(i->b), rc = reg_of(i->c);
+        int cc = emit_cond(i->a);
+        m = emit(is_fp(i->ty) ? X_FSEL : X_CMOV, w, d, rb, rc);
+        m->cc = (u8)cc;
+        return;
+    }
+    default:
+        if (is_compare(i->op)) {
+            if (fused[v])
+                return;
+            op = emit_compare(v);
+            m = emit(X_SETCC, 0, d, NOREG, NOREG);
+            m->cc = (u8)op;
+            return;
+        }
+        die("internal: x86-64 instruction selection: op %d in %s", i->op, f->name);
+    }
+}
+
+/* Copies for the phis of successor s along the edge from block b. */
+static void sel_phi_moves(u32 b, u32 s)
+{
+    Block *sb = &f->blk[s];
+    u32 k, p, pred = 0;
+    Buf tmp;
+    u32 n = 0;
+
+    if (!sb->phis)
+        return;
+    for (k = 0; k < sb->npreds; k++)
+        if (sb->preds[k] == b)
+            pred = k;
+    memset(&tmp, 0, sizeof tmp);
+    /* a source that is itself overwritten by this parallel copy is saved first */
+    for (p = sb->phis; p; p = f->ins[p].next) {
+        u32 src = f->xargs[f->ins[p].a + pred], t = NOREG;
+        if (src != p && f->ins[src].op == OP_PHI && f->ins[src].blk == s) {
+            t = new_vreg(is_fp(f->ins[src].ty));
+            emit(X_MOV, 1, t, VREG0 + src, NOREG);
+        }
+        buf_put(&tmp, &t, sizeof t);
+    }
+    for (p = sb->phis; p; p = f->ins[p].next, n++) {
+        u32 src = f->xargs[f->ins[p].a + pred], t;
+        memcpy(&t, tmp.p + n * sizeof(u32), sizeof t);
+        if (src == p)
+            continue;
+        if (t != NOREG)
+            emit(X_MOV, 1, VREG0 + p, t, NOREG);
+        else
+            move_to(VREG0 + p, src);
+    }
+    buf_free(&tmp);
+}
+
+static void sel_term(u32 b, u32 next)
+{
+    Block *bb = &f->blk[b];
+    MIns *m;
+    Addr ra;
+    switch (bb->term) {
+    case TERM_JMP:
+        sel_phi_moves(b, bb->succ[0]);
+        if (bb->succ[0] != next) {
+            m = emit(X_JMP, 0, NOREG, NOREG, NOREG);
+            m->imm = blk_index[bb->succ[0]];
+        }
+        break;
+    case TERM_BR: {
+        u32 t = bb->succ[0], e = bb->succ[1];
+        int cc = emit_cond(bb->arg);
+        if (t != next && e != next && f->blk[e].freq > f->blk[t].freq && f->blk[t].freq) {
+            /* neither follows: the conditional branch goes to the likelier one */
+            cc ^= 1;
+            t = e;
+            e = bb->succ[0];
+        } else if (t == next) {
+            cc ^= 1;
+            t = e;
+            e = next;
+        }
+        m = emit(X_JCC, 0, NOREG, NOREG, NOREG);
+        m->cc = (u8)cc;
+        m->imm = blk_index[t];
+        if (e != next) {
+            m = emit(X_JMP, 0, NOREG, NOREG, NOREG);
+            m->imm = blk_index[e];
+        }
+        break;
+    }
+    case TERM_RET:
+        if (f->has_sret > 1) {
+            /* a small record: its two halves, each in the next register of its class */
+            u32 size = (f->has_sret & 0x3f) - 1;
+            u32 r0 = f->has_sret & 0x40 ? XMM0 : RAX;
+            u32 r1 = f->has_sret & 0x80 ? (f->has_sret & 0x40 ? XMM0 + 1 : XMM0) : (f->has_sret & 0x40 ? RAX : RDX);
+            slot_addr(&ra, ret_slot, 0);
+            emit_load(r0, &ra, r0 >= XMM0 ? M_F64 : M_64);
+            if (size > 8) {
+                ra.off = 8;
+                emit_load(r1, &ra, r1 >= XMM0 ? M_F64 : M_64);
+            }
+            m = emit(X_RET, 0, NOREG, NOREG, NOREG);
+            m->pmask = BIT(r0) | (size > 8 ? BIT(r1) : 0);
+        } else if (f->has_sret == 1) {
+            /* the address the caller gave for the record goes back to it */
+            slot_addr(&ra, sret_slot, 0);
+            emit_load(RAX, &ra, M_64);
+            m = emit(X_RET, 0, NOREG, NOREG, NOREG);
+            m->pmask = BIT(RAX);
+        } else if (bb->arg) {
+            u32 r = is_fp(f->ins[bb->arg].ty) ? XMM0 : RAX;
+            move_to(r, bb->arg);
+            m = emit(X_RET, 0, NOREG, NOREG, NOREG);
+            m->pmask = BIT(r);
+        } else {
+            emit(X_RET, 0, NOREG, NOREG, NOREG);
+        }
+        break;
+    default:
+        emit(X_RET, 0, NOREG, NOREG, NOREG);
+        break;
+    }
+}
+
+/* ---- IR preparation ---- */
+
+static void split_critical_edges(void)
+{
+    u32 b, k, nblk = f->nblk;
+    for (b = 1; b < nblk; b++) {
+        if (!f->blk[b].phis || f->blk[b].npreds < 2)
+            continue;
+        for (k = 0; k < f->blk[b].npreds; k++) {
+            u32 p = f->blk[b].preds[k], n, s;
+            if (f->blk[p].term != TERM_BR)
+                continue;
+            n = ir_new_block(f);
+            f->blk[n].term = TERM_JMP;
+            f->blk[n].succ[0] = b;
+            f->blk[n].flag = 1;
+            if (f->blk[p].freq && f->blk[b].freq)
+                f->blk[n].freq = f->blk[p].freq < f->blk[b].freq ? f->blk[p].freq : f->blk[b].freq;
+            ir_add_pred(f, n, p);
+            f->blk[b].preds[k] = n;
+            for (s = 0; s < 2; s++)
+                if (f->blk[p].succ[s] == b) {
+                    f->blk[p].succ[s] = n;
+                    break; /* both ways to b: each gets a block of its own */
+                }
+        }
+    }
+}
+
+static u32 rpo_n;
+
+static void rpo_visit(u32 b)
+{
+    /* iterative depth-first search; blocks are numbered in postorder */
+    u32 *stack = (u32 *)xmalloc(f->nblk * 2 * sizeof(u32));
+    u32 sp = 0;
+    stack[sp++] = b;
+    stack[sp++] = 0;
+    f->blk[b].flag = 2;
+    while (sp) {
+        u32 k = stack[sp - 1], cb = stack[sp - 2];
+        Block *bb = &f->blk[cb];
+        u32 ns = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
+        if (k < ns) {
+            /* visit the fall-through candidate (succ[1]) last so it follows in RPO */
+            u32 s = bb->succ[ns - 1 - k];
+            stack[sp - 1] = k + 1;
+            if (f->blk[s].flag != 2) {
+                f->blk[s].flag = 2;
+                stack[sp++] = s;
+                stack[sp++] = 0;
+            }
+        } else {
+            layout[rpo_n++] = cb;
+            sp -= 2;
+        }
+    }
+    free(stack);
+}
+
+/* ---- layout from a profile ----
+   Blocks are joined into chains along the edges taken most often, heaviest
+   first, so the common path through the function falls through. Chains keep
+   the order their first blocks had, except that those never executed go to
+   the end of the function. */
+
+typedef struct Edge {
+    u32 w, from, to, n;
+} Edge;
+
+static int edge_cmp(const void *a, const void *b)
+{
+    const Edge *x = (const Edge *)a, *y = (const Edge *)b;
+    if (x->w != y->w)
+        return x->w > y->w ? -1 : 1;
+    return x->n < y->n ? -1 : x->n > y->n;
+}
+
+#define COUNT(b) (f->blk[b].freq ? f->blk[b].freq - 1 : 1)
+
+static void profile_layout(void)
+{
+    Edge *e = (Edge *)xmalloc((size_t)nlayout * 2 * sizeof(Edge));
+    u32 *chain = (u32 *)xmalloc((size_t)f->nblk * 4 * sizeof(u32)); /* chain a block is in, by its first block */
+    u32 *next = chain + f->nblk, *tail = next + f->nblk, *out = tail + f->nblk;
+    u32 k, s, ne = 0, n = 0, pass;
+    for (k = 0; k < nlayout; k++) {
+        u32 b = layout[k];
+        Block *bb = &f->blk[b];
+        u32 ns = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
+        chain[b] = tail[b] = b;
+        next[b] = 0;
+        for (s = 0; s < ns; s++) {
+            u32 t = bb->succ[s], w;
+            if (ns == 2 && bb->succ[0] == bb->succ[1] && s)
+                break;
+            w = f->blk[t].npreds == 1 ? COUNT(t) : ns == 1 ? COUNT(b) : COUNT(b) < COUNT(t) ? COUNT(b) : COUNT(t);
+            if (!w && (COUNT(b) || COUNT(t)))
+                continue; /* nothing cold goes on the end of a path that runs */
+            e[ne].w = w;
+            e[ne].from = b;
+            e[ne].to = t;
+            e[ne].n = ne;
+            ne++;
+        }
+    }
+    qsort(e, ne, sizeof(Edge), edge_cmp);
+    for (k = 0; k < ne; k++) {
+        u32 a = e[k].from, b = e[k].to, ca = chain[a], cb = chain[b];
+        if (b == 1 || ca == cb || tail[ca] != a || cb != b)
+            continue;
+        next[a] = b;
+        tail[ca] = tail[cb];
+        for (; b; b = next[b])
+            chain[b] = ca;
+    }
+    for (pass = 0; pass < 2; pass++) {
+        for (k = 0; k < nlayout; k++) {
+            u32 b = layout[k], cold = 1;
+            if (chain[b] != b)
+                continue;
+            for (s = b; s; s = next[s])
+                if (COUNT(s))
+                    cold = 0;
+            if (cold != pass)
+                continue;
+            for (s = b; s; s = next[s])
+                out[n++] = s;
+        }
+    }
+    memcpy(layout, out, nlayout * sizeof(u32));
+    free(e);
+    free(chain);
+}
+
+/* How likely is the branch at the end of b to go to its first successor,
+   in sixteenths? A guess from the shape of the code; the weights were fitted
+   to profiles of mcc compiling itself, where they call 63% of executed
+   branches right (a coin calls 45%, the profile itself 81%). */
+static u32 branch_chance(u32 b)
+{
+    Block *bb = &f->blk[b];
+    Ins *c = &f->ins[bb->arg];
+    u32 n[2], st[2], cr[2], rt[2], s, v;
+    int sc;
+    switch (c->op) {
+    case OP_EQ: sc = -3; break;
+    case OP_NE: sc = 2; break;
+    case OP_SLT: case OP_SLE: sc = 3; break;
+    case OP_SGT: case OP_SGE: sc = 2; break;
+    case OP_ULT: sc = 5; break;
+    case OP_UGT: sc = 3; break;
+    case OP_ULE: case OP_UGE: sc = 0; break;
+    default: sc = -2;
+    }
+    for (s = 0; s < 2; s++) {
+        u32 t = bb->succ[s], hops = 0, calls = 0;
+        while (f->blk[t].flag == 1 && f->blk[t].term == TERM_JMP && !f->blk[t].first && hops++ < 4)
+            t = f->blk[t].succ[0];
+        n[s] = st[s] = 0;
+        for (v = f->blk[t].first; v; v = f->ins[v].next) {
+            n[s]++;
+            calls += f->ins[v].op == OP_CALL;
+            st[s] |= f->ins[v].op == OP_STORE;
+        }
+        rt[s] = f->blk[t].term == TERM_RET;
+        cr[s] = calls && rt[s];
+    }
+    /* the smaller side, the one that stores nothing, the one that does not call and return */
+    if (n[0] != n[1])
+        sc += n[0] < n[1] ? 2 : -2;
+    if (st[0] != st[1])
+        sc += st[0] ? -2 : 2;
+    if (cr[0] != cr[1])
+        sc += cr[0] ? -4 : 4;
+    if (rt[0] != rt[1])
+        sc += rt[0] ? -1 : 1;
+    sc += 8;
+    return sc < 1 ? 1 : sc > 15 ? 15 : (u32)sc;
+}
+
+/* ---- frequencies without a profile ----
+   Blocks are visited in reverse postorder, each passing its frequency on to
+   its successors; an edge to a block not later in that order closes a loop,
+   whose header is taken to run LOOP_TIMES as often as it is entered. */
+#define LOOP_TIMES 8
+
+static void estimate_freq(void)
+{
+    u32 *fr = (u32 *)xmalloc((size_t)f->nblk * 2 * sizeof(u32)), *pos = fr + f->nblk;
+    u32 k, s;
+    memset(fr, 0, f->nblk * sizeof(u32));
+    for (k = 0; k < nlayout; k++)
+        pos[layout[k]] = k;
+    fr[1] = 1024;
+    for (k = 0; k < nlayout; k++) {
+        u32 b = layout[k], x = fr[b], p0;
+        Block *bb = &f->blk[b];
+        int header = 0, back0, back1;
+        for (s = 0; s < bb->npreds; s++)
+            if (pos[bb->preds[s]] >= k)
+                header = 1;
+        if (header)
+            x = x > 0x4000000 ? x : x * LOOP_TIMES;
+        if (!x)
+            x = 1;
+        fr[b] = x;
+        if (bb->term == TERM_JMP) {
+            if (pos[bb->succ[0]] > k)
+                fr[bb->succ[0]] += x;
+        } else if (bb->term == TERM_BR) {
+            back0 = pos[bb->succ[0]] <= k;
+            back1 = pos[bb->succ[1]] <= k;
+            if (back0 && back1)
+                continue;
+            if (back0 || back1) {
+                /* the way out of a loop */
+                fr[bb->succ[back0 ? 1 : 0]] += x / LOOP_TIMES;
+                continue;
+            }
+            p0 = branch_chance(b); /* of 16 */
+            fr[bb->succ[0]] += (u32)((u64)x * p0 / 16);
+            fr[bb->succ[1]] += (u32)((u64)x * (16 - p0) / 16);
+        }
+    }
+    for (k = 0; k < nlayout; k++)
+        f->blk[layout[k]].freq = fr[layout[k]] + 2; /* never "known not to run" */
+    free(fr);
+}
+
+/* Is v a shift that an address can have as the scale of its index? */
+static int is_scale(u32 v)
+{
+    u64 sh;
+    return f->ins[v].op == OP_SHL && !fused[v] && f->ins[v].ty == IT_I64 && ir_is_const(f, f->ins[v].b, &sh) &&
+           sh >= 1 && sh <= 3;
+}
+
+static void prepare(void)
+{
+    u32 b, v, k, n;
+    split_critical_edges();
+    layout = (u32 *)xmalloc(f->nblk * sizeof(u32));
+    blk_index = (u32 *)xmalloc(f->nblk * sizeof(u32));
+    rpo_n = 0;
+    rpo_visit(1);
+    nlayout = rpo_n;
+    for (k = 0; k < nlayout / 2; k++) {
+        u32 t = layout[k];
+        layout[k] = layout[nlayout - 1 - k];
+        layout[nlayout - 1 - k] = t;
+    }
+    if (!f->blk[1].freq && opt_level >= 3 && !opt_size)
+        estimate_freq();
+    if (f->blk[1].freq > 1)
+        profile_layout();
+    for (k = 0; k < nlayout; k++)
+        blk_index[layout[k]] = k;
+    /* Loop rotation: a loop header that only tests the condition moves below
+       the block that jumps back to it, so each iteration has one branch. */
+    for (k = 1; k < nlayout; k++) {
+        Block *lb = &f->blk[layout[k]];
+        u32 h, hk;
+        if (lb->term != TERM_JMP)
+            continue;
+        h = lb->succ[0];
+        hk = blk_index[h];
+        if (hk == 0 || hk >= k || f->blk[h].term != TERM_BR || f->blk[h].flag == 3)
+            continue;
+        f->blk[h].flag = 3; /* rotate each header once */
+        for (n = hk; n < k; n++) {
+            layout[n] = layout[n + 1];
+            blk_index[layout[n]] = n;
+        }
+        layout[k] = h;
+        blk_index[h] = k;
+    }
+
+    uses = (u32 *)xmalloc(f->nins * sizeof(u32));
+    fused = (u8 *)xmalloc(f->nins);
+    cache_reg = (u32 *)xmalloc(f->nins * sizeof(u32));
+    cache_blk = (u32 *)xmalloc(f->nins * sizeof(u32));
+    memset(uses, 0, f->nins * sizeof(u32));
+    memset(fused, 0, f->nins);
+    memset(cache_blk, 0, f->nins * sizeof(u32));
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        for (v = bb->phis; v; v = f->ins[v].next) {
+            for (n = 0; n < f->ins[v].b; n++) {
+                u32 x = f->xargs[f->ins[v].a + n];
+                uses[x]++;
+                fused[x] = FUSE_NOT;
+            }
+        }
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            int sel = i->op == OP_SELECT;
+            u32 *ops;
+            IR_OPS(f, i, ops, n);
+            if (i->op == OP_CALL) {
+                uses[i->c]++;
+                fused[i->c] = FUSE_NOT;
+            }
+            for (b = 0; b < n; b++) {
+                u32 x = ops[b];
+                uses[x]++;
+                if (b || !sel)
+                    fused[x] = FUSE_NOT; /* used as a value, not as a condition */
+            }
+        }
+        if (bb->arg) {
+            uses[bb->arg]++;
+            if (bb->term != TERM_BR)
+                fused[bb->arg] = FUSE_NOT;
+        }
+    }
+    /* a comparison used only as the condition of branches and selects is
+       never made into a value: each of them sets the flags again */
+    for (v = 1; v < f->nins; v++) {
+        int op = f->ins[v].op, cond = fused[v] != FUSE_NOT && uses[v];
+        fused[v] = (u8)(cond && is_compare(op) ? FUSE_CMP : 0);
+        /* a truncation leaves the low half where it is; so does extending
+           what a 32-bit operation produced, since that cleared the upper half */
+        if (uses[v] && f->ins[v].blk && (op == OP_TRUNC || (op == OP_ZEXT32 && clean32(f->ins[f->ins[v].a].op))))
+            fused[v] = FUSE_ALIAS;
+    }
+    /* cache_reg doubles as a count of each value's uses as a memory address */
+    memset(cache_reg, 0, f->nins * sizeof(u32));
+    for (k = 0; k < nlayout; k++)
+        for (v = f->blk[layout[k]].first; v; v = f->ins[v].next)
+            if (f->ins[v].op == OP_LOAD || f->ins[v].op == OP_STORE)
+                cache_reg[f->ins[v].a]++;
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        i64 c;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            if (i->op == OP_SEXT32 && !fused[v] && f->ins[i->a].op == OP_LOAD && f->ins[i->a].mem == M_32 &&
+                uses[i->a] == 1) {
+                /* load it sign-extended */
+                f->ins[i->a].flags |= 0x80;
+                fused[v] = FUSE_ALIAS;
+                continue;
+            }
+            if (i->op >= OP_SEXT8 && i->op <= OP_ZEXT16 && f->ins[i->a].op == OP_LOAD && uses[i->a] == 1 &&
+                (i->ty == IT_I32 || i->op == OP_ZEXT8 || i->op == OP_ZEXT16)) {
+                /* an extension of a narrow load: load with that extension */
+                Ins *l = &f->ins[i->a];
+                int want = i->op == OP_SEXT8 ? M_8S : i->op == OP_ZEXT8 ? M_8U : i->op == OP_SEXT16 ? M_16S : M_16U;
+                if ((l->mem ^ want) == 1) {
+                    l->mem = (u8)want;
+                    fused[v] = FUSE_MOV;
+                }
+                continue;
+            }
+            if (i->op == OP_LOAD || i->op == OP_STORE) {
+                Ins *a = &f->ins[i->a];
+                if (a->op != OP_ADD || fused[i->a] || uses[i->a] != cache_reg[i->a])
+                    continue; /* also used as a value */
+                if (const_of(a->b, &c)) {
+                    /* a constant offset folds into every access that uses it */
+                    if (c > -0x40000000L && c < 0x40000000L)
+                        fused[i->a] = FUSE_OFF;
+                    continue;
+                }
+                if (f->ins[a->a].op != OP_SLOT && f->ins[a->b].op != OP_SLOT && f->ins[a->a].op != OP_CONST) {
+                    /* base + index, the index optionally scaled */
+                    u32 y = a->b;
+                    fused[i->a] = FUSE_IDX;
+                    if (a->a == a->b)
+                        continue;
+                    if (!is_scale(y))
+                        y = a->a;
+                    if (is_scale(y))
+                        cache_blk[y]++; /* here: in how many addresses the shift is the scale */
+                }
+            }
+        }
+    }
+    /* a shift that is nothing but the scale of indexes is not computed */
+    for (v = 1; v < f->nins; v++) {
+        if (cache_blk[v] && cache_blk[v] == uses[v])
+            fused[v] = FUSE_SKIP;
+        cache_blk[v] = 0;
+    }
+    /* an and used once, to branch on whether it is zero, or by comparisons with zero that are
+       themselves only conditions */
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        u32 x = bb->arg;
+        i64 c;
+        if (bb->term == TERM_BR && f->ins[x].op == OP_AND && uses[x] == 1 && !fused[x])
+            fused[x] = FUSE_TEST;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            if ((i->op == OP_EQ || i->op == OP_NE) && fused[v] == FUSE_CMP && f->ins[i->a].op == OP_AND &&
+                uses[i->a] == 1 && !fused[i->a] && const_of(i->b, &c) && c == 0)
+                fused[i->a] = FUSE_TEST;
+        }
+    }
+    /* load, operation, store to the same place: one instruction on memory, where the store is */
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v], *o, *l;
+            u32 u, lv, other;
+            i64 c;
+            if (i->op != OP_STORE || uses[i->b] != 1 || fused[i->b] || mem_bytes[i->mem] == 2 || i->mem > M_64)
+                continue;
+            o = &f->ins[i->b];
+            if (o->op != OP_ADD && o->op != OP_SUB && o->op != OP_AND && o->op != OP_OR && o->op != OP_XOR)
+                continue;
+            if ((o->ty == IT_I64) != (i->mem == M_64) || o->a == o->b)
+                continue;
+            lv = o->a;
+            l = &f->ins[lv];
+            if (!(l->op == OP_LOAD && l->a == i->a && uses[lv] == 1) && o->op != OP_SUB) {
+                lv = o->b;
+                l = &f->ins[lv];
+            }
+            if (l->op != OP_LOAD || l->a != i->a || uses[lv] != 1 || fused[lv] || (l->flags & 0x80) ||
+                mem_bytes[l->mem] != mem_bytes[i->mem] || l->mem > M_64)
+                continue;
+            other = lv == o->a ? o->b : o->a;
+            if (const_of(other, &c) && !fits32(c))
+                continue;
+            /* the load is earlier in this block, and nothing between writes memory */
+            for (u = bb->first; u && u != lv && u != v; u = f->ins[u].next)
+                ;
+            if (u != lv)
+                continue;
+            for (u = l->next; u != v; u = f->ins[u].next) {
+                int op = f->ins[u].op;
+                if (op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_VSTORE)
+                    break;
+            }
+            if (u != v)
+                continue;
+            fused[lv] = FUSE_LOAD;
+            fused[i->b] = FUSE_RMW;
+        }
+    }
+    /* A load used once, by an operation after it in its block that can take the operand from memory,
+       with nothing between that may write memory, is left to that operation. A comparison here is
+       one made where the block ends. */
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 u, usr = 0;
+            int full, ok = 0;
+            i64 c;
+            if (i->op != OP_LOAD || uses[v] != 1 || fused[v] || (i->flags & 0x80))
+                continue;
+            full = (i->mem == M_32 && i->ty == IT_I32) || (i->mem == M_64 && i->ty == IT_I64) ||
+                   (i->mem == M_F32 && i->ty == IT_F32) || (i->mem == M_F64 && i->ty == IT_F64);
+            for (u = i->next; u; u = f->ins[u].next) {
+                Ins *x = &f->ins[u];
+                int op = x->op;
+                if (op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_VSTORE)
+                    break;
+                if (usr || (x->a != v && x->b != v) || x->a == x->b)
+                    continue;
+                if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_AND || op == OP_OR || op == OP_XOR ||
+                    (op >= OP_FADD && op <= OP_FDIV)) {
+                    int commut = op != OP_SUB && op != OP_FSUB && op != OP_FDIV;
+                    if (full && !fused[u] && x->ty == i->ty && (x->b == v || commut) &&
+                        fused[x->a == v ? x->b : x->a] != FUSE_LOAD && /* one memory operand each */
+                        !const_of(x->a == v ? x->b : x->a, &c))
+                        ok = 1;
+                    break;
+                }
+                if (op >= OP_EQ && op <= OP_UGE) {
+                    if (fused[u] != FUSE_CMP || uses[u] != 1 || bb->arg != u || bb->term != TERM_BR ||
+                        fused[x->a == v ? x->b : x->a] == FUSE_LOAD)
+                        break;
+                    if (full && !is_fp(i->ty)) {
+                        if (!const_of(x->a, &c) && (!const_of(x->b, &c) || (fits32(c) && x->a == v)))
+                            usr = u;
+                    } else if ((op == OP_EQ || op == OP_NE) && x->a == v && const_of(x->b, &c) &&
+                               ((i->mem == M_8U && c >= 0 && c <= 255) || (i->mem == M_8S && c >= -128 && c <= 127))) {
+                        usr = u;
+                    }
+                    if (!usr)
+                        break;
+                }
+            }
+            if (!u && usr)
+                ok = 1;
+            if (!u && !usr && bb->arg == v && bb->term == TERM_BR && !is_fp(i->ty) &&
+                (i->mem == M_8S || i->mem == M_8U || full))
+                ok = 1;
+            if (ok)
+                fused[v] = FUSE_LOAD;
+        }
+    }
+    memset(cache_reg, 0, f->nins * sizeof(u32));
+}
+
+static void select_all(void)
+{
+    u32 k, v, n = 0, np = f->nparams;
+    Addr a;
+    MIns *m;
+
+    mf.n = 0;
+    mf.nblk = 0;
+    mf.nvreg = 0;
+    outargs = 0;
+    has_calls = uses_args = uses_fp = uses_alloca = 0;
+    asm_saved = 0;
+    free(alink);
+    alink = 0;
+    /* one virtual register per IR value */
+    if (mf.capvreg < f->nins) {
+        mf.capvreg = f->nins * 2;
+        mf.vclass = (u8 *)xrealloc(mf.vclass, mf.capvreg);
+    }
+    for (v = 0; v < f->nins; v++)
+        mf.vclass[v] = (u8)is_fp(f->ins[v].ty);
+    mf.nvreg = f->nins;
+    if (mf.capblk < nlayout) {
+        mf.capblk = nlayout * 2;
+        mf.blk = (MBlock *)xrealloc(mf.blk, mf.capblk * sizeof(MBlock));
+    }
+    mf.nblk = nlayout;
+
+    args_reserve(np + 1);
+    for (k = 0; k < np; k++) {
+        int ty = f->param_ty[k];
+        a_size[k] = 8 | (ty & PT_A16 ? 0x80000000U : 0);
+        a_kind[k] = (u8)(ty & (PT_BLK | PT_PAD) ? AK_BLK : is_fp(ty) ? AK_FP : AK_INT);
+    }
+    ret_slot = sret_slot = va_slot = NOSLOT;
+    if (f->has_sret > 1) {
+        ret_slot = ir_new_slot(f, 16, 8);
+        a_kind[0] = AK_SKIP;
+    } else if (f->has_sret == 1) {
+        sret_slot = ir_new_slot(f, 8, 8);
+    }
+    named_stack = abi_assign(np, 0);
+    /* abi_assign rounds up to 16; the unnamed arguments follow the last named one */
+    {
+        u32 top = 0;
+        for (k = 0; k < np; k++)
+            if (a_loc[k] != LOC_NONE && (a_loc[k] & LOC_STACK) && (a_loc[k] & ~LOC_STACK) + 8 > top)
+                top = (a_loc[k] & ~LOC_STACK) + 8;
+        named_stack = top;
+    }
+    if (f->variadic) {
+        for (v = 1; v < f->nins; v++)
+            if (f->ins[v].op == OP_VASTART && f->ins[v].blk) {
+                va_slot = ir_new_slot(f, 176, 16);
+                break;
+            }
+    }
+
+    for (k = 0; k < nlayout; k++) {
+        u32 b = layout[k];
+        Block *bb = &f->blk[b];
+        MBlock *mb = &mf.blk[k];
+        mb->first = mf.n;
+        mb->freq = bb->freq;
+        /* constants and addresses already in registers stay usable in a
+           block entered only from the block just before it */
+        if (!(k > 0 && bb->npreds == 1 && bb->preds[0] == layout[k - 1]))
+            cur_blk = b;
+        if (k == 0) {
+            if (va_slot != NOSLOT) {
+                m = emit(X_VASAVE, 0, NOREG, NOREG, NOREG);
+                m->sym = va_slot;
+                m->pmask = BIT(RAX) | BIT(RDI) | BIT(RSI) | BIT(RDX) | BIT(RCX) | BIT(R8) | BIT(R9) | ((u64)0xff << XMM0);
+            }
+            if (sret_slot != NOSLOT) {
+                slot_addr(&a, sret_slot, 0);
+                emit_store(RDI, &a, M_64);
+            }
+            /* incoming arguments: registers first, then stack */
+            for (v = bb->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                if (i->op != OP_PARAM)
+                    continue;
+                if (i->a == 0 && f->has_sret > 1) {
+                    m = emit(X_SLOTADDR, 1, VREG0 + v, NOREG, NOREG);
+                    m->sym = ret_slot;
+                } else if (!(a_loc[i->a] & LOC_STACK)) {
+                    emit(X_MOV, 1, VREG0 + v, a_loc[i->a], NOREG);
+                }
+            }
+            for (v = bb->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                if (i->op != OP_PARAM || (i->a == 0 && f->has_sret > 1) || !(a_loc[i->a] & LOC_STACK))
+                    continue;
+                uses_args = 1;
+                if (f->param_ty[i->a] & PT_BLK) {
+                    m = emit(X_SLOTADDR, 1, VREG0 + v, NOREG, NOREG);
+                    m->sym = ARGSLOT;
+                    m->imm = a_loc[i->a] & ~LOC_STACK;
+                } else {
+                    slot_addr(&a, ARGSLOT, a_loc[i->a] & ~LOC_STACK);
+                    emit_load(VREG0 + v, &a, ty_mem(i->ty));
+                }
+            }
+        }
+        for (v = bb->first; v; v = f->ins[v].next)
+            sel_ins(v);
+        sel_term(b, k + 1 < nlayout ? layout[k + 1] : 0);
+        mb->n = mf.n - mb->first;
+        mb->nsucc = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
+        for (n = 0; n < mb->nsucc; n++)
+            mb->succ[n] = blk_index[bb->succ[n]];
+    }
+}
+
+/* ---- encoding ---- */
+
+/* a jump to a block: written with a 32-bit displacement, shortened afterwards (relax) */
+enum { FK_JMP, FK_JCC, FK_JCC_PAIR /* one of two for one condition */, FK_JCC_JP /* behind a jp over it */ };
+typedef struct Fixup {
+    u32 off;    /* of the 32-bit displacement */
+    u32 target; /* layout index */
+    u8 kind;
+    u8 state;   /* 0 as written, 1 short, 2 gone */
+} Fixup;
+
+static Buf *text;
+static Fixup *fixups;
+static u32 nfixups, capfixups;
+static u32 spill_base, frame_size;
+static u64 saved_regs;
+static int has_frame;
+
+/* an opcode: the byte, then what goes before it */
+#define O_0F 0x100       /* the 0f escape */
+#define O_66 0x660000    /* a prefix */
+#define O_F2 0xf20000
+#define O_F3 0xf30000
+#define O_B8R 0x1000000  /* the reg field names a byte register */
+#define O_B8M 0x2000000  /* the r/m field names a byte register */
+
+typedef struct EA {
+    u32 base, idx; /* registers or NOREG */
+    u32 scale;     /* log2 */
+    i64 disp;
+    u32 sym;       /* NOSLOT, or the symbol this is relative to (and no registers) */
+    int force32;   /* a 32-bit displacement whatever its value */
+    int fs;        /* in the thread's segment */
+} EA;
+
+static void b1(u32 v)
+{
+    buf_u8(text, v & 0xff);
+}
+
+static void b4(u32 v)
+{
+    buf_u32(text, v);
+}
+
+static void op_prefix(u32 op, int w, u32 reg, u32 idx, u32 base)
+{
+    u32 rex = 0;
+    if (op >> 16 & 0xff)
+        b1(op >> 16);
+    if (w)
+        rex |= 8;
+    if (reg != NOREG && (reg & 8))
+        rex |= 4;
+    if (idx != NOREG && (idx & 8))
+        rex |= 2;
+    if (base != NOREG && (base & 8))
+        rex |= 1;
+    if ((op & O_B8R) && reg >= 4 && reg < 8)
+        rex |= 0x40;
+    if ((op & O_B8M) && base >= 4 && base < 8)
+        rex |= 0x40;
+    if (rex)
+        b1(0x40 | rex);
+    if (op & O_0F)
+        b1(0x0f);
+    b1(op);
+}
+
+/* register direct; for a /digit instruction reg is the digit */
+static void op_rr(u32 op, int w, u32 reg, u32 rm)
+{
+    op_prefix(op, w, reg, NOREG, rm);
+    b1(0xc0 | (reg & 7) << 3 | (rm & 7));
+}
+
+/* immbytes: how many bytes of immediate follow the operand */
+static void op_mem(u32 op, int w, u32 reg, const EA *ea, u32 immbytes)
+{
+    u32 r = (reg & 7) << 3, mod;
+    if (ea->fs)
+        b1(0x64);
+    if (ea->sym != NOSLOT) {
+        op_prefix(op, w, reg, NOREG, NOREG);
+        b1(r | 5);
+        obj_add_reloc(obj, arm64_text_sec, (u32)text->len, R_X64_PC32, ea->sym, ea->disp - 4 - (i64)immbytes);
+        b4(0);
+        return;
+    }
+    op_prefix(op, w, reg, ea->idx, ea->base);
+    if (ea->base == NOREG) {
+        b1(r | 4);
+        b1(0x25);
+        b4((u32)ea->disp);
+        return;
+    }
+    mod = ea->force32 ? 2 : ea->disp == 0 && (ea->base & 7) != 5 ? 0 : ea->disp >= -128 && ea->disp <= 127 ? 1 : 2;
+    if (ea->idx != NOREG || (ea->base & 7) == 4) {
+        b1(mod << 6 | r | 4);
+        b1(ea->scale << 6 | (ea->idx == NOREG ? 4 : ea->idx & 7) << 3 | (ea->base & 7));
+    } else {
+        b1(mod << 6 | r | (ea->base & 7));
+    }
+    if (mod == 1)
+        b1((u32)ea->disp);
+    else if (mod == 2)
+        b4((u32)ea->disp);
+}
+
+static void ea_base(EA *ea, u32 base, i64 disp)
+{
+    ea->base = base;
+    ea->idx = NOREG;
+    ea->scale = 0;
+    ea->disp = disp;
+    ea->sym = NOSLOT;
+    ea->force32 = ea->fs = 0;
+}
+
+static void ea_spill(EA *ea, u32 loc)
+{
+    ea_base(ea, RBP, -(i64)(spill_base + 8 * (loc - SPILL0 + 1)));
+}
+
+static u32 loc_of(u32 r)
+{
+    return r == NOREG || r < VREG0 ? r : mf.loc[r - VREG0];
+}
+
+static int is_spill(u32 l)
+{
+    return l != NOREG && l >= SPILL0;
+}
+
+/* whole registers */
+static void mov_rr(u32 d, u32 s)
+{
+    if (d == s)
+        return;
+    if (d >= XMM0)
+        op_rr(O_0F | 0x28, 0, d, s); /* movaps */
+    else
+        op_rr(0x89, 1, s, d);
+}
+
+static void load_reg(u32 d, const EA *ea)
+{
+    if (d >= XMM0)
+        op_mem(O_F2 | O_0F | 0x10, 0, d, ea, 0); /* movsd */
+    else
+        op_mem(0x8b, 1, d, ea, 0);
+}
+
+static void store_reg(u32 s, const EA *ea)
+{
+    if (s >= XMM0)
+        op_mem(O_F2 | O_0F | 0x11, 0, s, ea, 0);
+    else
+        op_mem(0x89, 1, s, ea, 0);
+}
+
+/* The register that holds r: its own, or the scratch register after a load from its spill slot. */
+static u32 use(u32 r, u32 scratch)
+{
+    u32 l = loc_of(r);
+    EA ea;
+    if (!is_spill(l))
+        return l;
+    ea_spill(&ea, l);
+    load_reg(scratch, &ea);
+    return scratch;
+}
+
+/* The register to compute r in, and what follows the computation. */
+static u32 dst(u32 r, u32 scratch)
+{
+    u32 l = loc_of(r);
+    return l == NOREG || is_spill(l) ? scratch : l;
+}
+
+static void fin(u32 r, u32 reg)
+{
+    u32 l = loc_of(r);
+    EA ea;
+    if (is_spill(l)) {
+        ea_spill(&ea, l);
+        store_reg(reg, &ea);
+    }
+}
+
+/* op reg, r/m where the second operand is the location l */
+static void op_loc(u32 op, int w, u32 reg, u32 l)
+{
+    EA ea;
+    if (is_spill(l)) {
+        ea_spill(&ea, l);
+        op_mem(op, w, reg, &ea, 0);
+    } else {
+        op_rr(op, w, reg, l);
+    }
+}
+
+/* dr = the value at location l, all of it */
+static void mov_loc(u32 dr, u32 l)
+{
+    EA ea;
+    if (is_spill(l)) {
+        ea_spill(&ea, l);
+        load_reg(dr, &ea);
+    } else {
+        mov_rr(dr, l);
+    }
+}
+
+static void mov_ri(u32 d, u64 v, int w)
+{
+    if (!w)
+        v &= 0xffffffffUL;
+    if (v == 0) {
+        op_rr(0x31, 0, d, d); /* xor: the flags are never live where a constant is made */
+    } else if (v <= 0xffffffffUL) {
+        op_prefix(0xb8 | (d & 7), 0, NOREG, NOREG, d);
+        b4((u32)v);
+    } else if ((i64)v >= -0x7fffffffL - 1 && (i64)v < 0) {
+        op_rr(0xc7, 1, 0, d);
+        b4((u32)v);
+    } else {
+        op_prefix(0xb8 | (d & 7), 1, NOREG, NOREG, d);
+        b4((u32)v);
+        b4((u32)(v >> 32));
+    }
+}
+
+/* op r/m, imm with the 8-bit form where it fits; alu is the /digit */
+static void alu_ri(u32 alu, int w, u32 d, i64 imm)
+{
+    if (imm >= -128 && imm <= 127) {
+        op_rr(0x83, w, alu, d);
+        b1((u32)imm);
+    } else {
+        op_rr(0x81, w, alu, d);
+        b4((u32)imm);
+    }
+}
+
+static void add_fixup(u32 target, int kind)
+{
+    if (nfixups == capfixups) {
+        capfixups = capfixups ? capfixups * 2 : 256;
+        fixups = (Fixup *)xrealloc(fixups, capfixups * sizeof(Fixup));
+    }
+    fixups[nfixups].off = (u32)text->len;
+    fixups[nfixups].target = target;
+    fixups[nfixups].kind = (u8)kind;
+    fixups[nfixups].state = 0;
+    nfixups++;
+    b4(0);
+}
+
+/* short forward jumps inside one instruction's code */
+static u32 jf_at[4], jf_n;
+
+static void jf(u32 opcode)
+{
+    b1(opcode);
+    jf_at[jf_n++] = (u32)text->len;
+    b1(0);
+}
+
+/* jump ahead if cc holds */
+static void jf_cc(int cc)
+{
+    if (cc == CC_FNE) {
+        jf(0x70 | CC_NE);
+        jf(0x70 | CC_P);
+    } else if (cc == CC_FEQ) {
+        b1(0x70 | CC_P); /* over the next jump */
+        b1(2);
+        jf(0x70 | CC_E);
+    } else {
+        jf(0x70 | (u32)cc);
+    }
+}
+
+static void jf_here(void)
+{
+    while (jf_n) {
+        u32 at = jf_at[--jf_n];
+        text->p[at] = (u8)(text->len - at - 1);
+    }
+}
+
+static void prologue(void)
+{
+    u32 k, n = 0;
+    EA ea;
+    if (!has_frame)
+        return;
+    b1(0x55);              /* push rbp */
+    op_rr(0x89, 1, RSP, RBP); /* mov rbp, rsp */
+    if (frame_size)
+        alu_ri(5, 1, RSP, frame_size);
+    for (k = 0; k < 16; k++)
+        if (saved_regs >> k & 1) {
+            ea_base(&ea, RBP, -(i64)(8 * ++n));
+            store_reg(k, &ea);
+        }
+}
+
+static void epilogue(void)
+{
+    u32 k, n = 0;
+    EA ea;
+    if (has_frame) {
+        for (k = 0; k < 16; k++)
+            if (saved_regs >> k & 1) {
+                ea_base(&ea, RBP, -(i64)(8 * ++n));
+                load_reg(k, &ea);
+            }
+        b1(0xc9); /* leave */
+    }
+    b1(0xc3);
+}
+
+/* The memory operand of a load or store whose base and index are s1 and s2 of the instruction given
+   (already in registers b and x, or NOREG). */
+static void mem_ea(const MIns *i, u32 b, u32 x, i64 disp, EA *ea)
+{
+    ea_base(ea, b, disp);
+    ea->idx = x;
+    ea->scale = XF_SCALE(i->flags);
+    if (i->flags & XF_SLOT) {
+        ea->base = RBP;
+        if (i->sym == ARGSLOT)
+            ea->disp += 16;
+        else
+            ea->disp += f->slots[i->sym].off;
+    } else if (i->flags & XF_SYM) {
+        ea->base = NOREG;
+        ea->sym = i->sym;
+    }
+}
+
+/* d = a op b for a two-address instruction "op r, r/m"; sub: it is a subtraction, else the operands commute */
+static void bin_int(MIns *i, u32 opc, int sub)
+{
+    u32 dl = loc_of(i->d), al = loc_of(i->s0), bl = loc_of(i->s1), dr = dst(i->d, SCR0);
+    if (bl == dr && al != dr) {
+        if (sub) {
+            op_rr(0xf7, i->w, 3, dr); /* neg, then add the other */
+            op_loc(0x03, i->w, dr, al);
+            fin(i->d, dr);
+            return;
+        }
+        bl = al;
+        al = dr;
+    }
+    if (al != dr)
+        mov_loc(dr, al);
+    op_loc(opc, i->w, dr, bl);
+    (void)dl;
+    fin(i->d, dr);
+}
+
+static void bin_fp(MIns *i, u32 opc, int commut)
+{
+    u32 al = loc_of(i->s0), bl = loc_of(i->s1), dr = dst(i->d, FSCR0);
+    u32 op = (i->w ? O_F2 : O_F3) | O_0F | opc;
+    if (bl == dr && al != dr) {
+        if (commut) {
+            bl = al;
+            al = dr;
+        } else {
+            mov_rr(FSCR1, bl);
+            bl = FSCR1;
+        }
+    }
+    if (al != dr)
+        mov_loc(dr, al);
+    op_loc(op, 0, dr, bl);
+    fin(i->d, dr);
+}
+
+/* The address ea, of a base and an index (the index in SCR0), goes to SCR1: SCR0 is free again. */
+static void ea_join(EA *ea)
+{
+    EA t;
+    ea_base(&t, ea->base, 0);
+    t.idx = ea->idx;
+    t.scale = ea->scale;
+    op_mem(0x8d, 1, SCR1, &t, 0);
+    ea->base = SCR1;
+    ea->idx = NOREG;
+    ea->scale = 0;
+}
+
+/* d = s0 op [s1 + s2 * scale + imm] for "op r, r/m" */
+static void bin_mem(MIns *i, u32 opc, int fp)
+{
+    u32 al = loc_of(i->s0), b, x, dr;
+    EA ea;
+    b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+    x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+    mem_ea(i, b, x, i->imm, &ea);
+    if (fp) {
+        dr = dst(i->d, FSCR0);
+        if (al != dr)
+            mov_loc(dr, al);
+        op_mem((i->w ? O_F2 : O_F3) | O_0F | opc, 0, dr, &ea, 0);
+        fin(i->d, dr);
+        return;
+    }
+    dr = dst(i->d, SCR0);
+    if (dr == SCR0 && x == SCR0)
+        ea_join(&ea);
+    if (al != dr && (dr == ea.base || dr == ea.idx)) {
+        /* the result's register is part of the address: the memory operand goes there first */
+        op_mem(0x8b, i->w, dr, &ea, 0);
+        if (opc == 0x2b) {
+            op_rr(0xf7, i->w, 3, dr); /* neg, then add the other */
+            opc = 0x03;
+        }
+        op_loc(opc, i->w, dr, al);
+        fin(i->d, dr);
+        return;
+    }
+    if (al != dr)
+        mov_loc(dr, al);
+    op_mem(opc, i->w, dr, &ea, 0);
+    fin(i->d, dr);
+}
+
+static void asm_emit(MIns *i);
+
+static void encode(MIns *i)
+{
+    u32 dr, a, b, x, n;
+    EA ea;
+    int w = i->w;
+
+    switch (i->op) {
+    case X_DEFREG:
+        return;
+    case X_MOV: {
+        u32 dl = loc_of(i->d), sl = loc_of(i->s0);
+        if (dl == NOREG || dl == sl)
+            return;
+        if (is_spill(dl) && is_spill(sl)) {
+            ea_spill(&ea, sl);
+            load_reg(SCR0, &ea);
+            ea_spill(&ea, dl);
+            store_reg(SCR0, &ea);
+        } else if (is_spill(dl)) {
+            ea_spill(&ea, dl);
+            store_reg(sl, &ea);
+        } else {
+            mov_loc(dl, sl);
+        }
+        return;
+    }
+    case X_MOVI:
+        dr = dst(i->d, SCR0);
+        mov_ri(dr, (u64)i->imm, w);
+        fin(i->d, dr);
+        return;
+    case X_FMOVI:
+        dr = dst(i->d, FSCR0);
+        if (i->imm == 0) {
+            op_rr(O_0F | 0x57, 0, dr, dr); /* xorps */
+        } else {
+            mov_ri(SCR0, (u64)i->imm, w);
+            op_rr(O_66 | O_0F | 0x6e, w, dr, SCR0); /* movd / movq */
+        }
+        fin(i->d, dr);
+        return;
+    case X_LEA:
+        dr = dst(i->d, SCR0);
+        ea_base(&ea, NOREG, i->imm);
+        ea.sym = i->sym;
+        op_mem(0x8d, 1, dr, &ea, 0);
+        fin(i->d, dr);
+        return;
+    case X_SLOTADDR:
+        dr = dst(i->d, SCR0);
+        ea_base(&ea, RBP, i->sym == ARGSLOT ? 16 + i->imm : f->slots[i->sym].off + i->imm);
+        op_mem(0x8d, 1, dr, &ea, 0);
+        fin(i->d, dr);
+        return;
+    case X_ADD: {
+        u32 al = loc_of(i->s0), bl = loc_of(i->s1);
+        dr = dst(i->d, SCR0);
+        if (!is_spill(al) && !is_spill(bl) && al != dr && bl != dr) {
+            ea_base(&ea, al, 0);
+            ea.idx = bl;
+            if ((bl & 7) == 4) { /* rsp cannot be an index */
+                ea.base = bl;
+                ea.idx = al;
+            }
+            op_mem(0x8d, w, dr, &ea, 0);
+            fin(i->d, dr);
+            return;
+        }
+        bin_int(i, 0x03, 0);
+        return;
+    }
+    case X_SUB: bin_int(i, 0x2b, 1); return;
+    case X_AND: bin_int(i, 0x23, 0); return;
+    case X_OR: bin_int(i, 0x0b, 0); return;
+    case X_XOR: bin_int(i, 0x33, 0); return;
+    case X_IMUL: bin_int(i, O_0F | 0xaf, 0); return;
+    case X_ADDI: {
+        u32 al = loc_of(i->s0);
+        dr = dst(i->d, SCR0);
+        if (!is_spill(al) && al != dr) {
+            ea_base(&ea, al, i->imm);
+            op_mem(0x8d, w, dr, &ea, 0);
+        } else {
+            if (al != dr)
+                mov_loc(dr, al);
+            if (i->imm)
+                alu_ri(0, w, dr, i->imm);
+        }
+        fin(i->d, dr);
+        return;
+    }
+    case X_ANDI:
+    case X_ORI:
+    case X_XORI:
+        dr = dst(i->d, SCR0);
+        mov_loc(dr, loc_of(i->s0));
+        alu_ri(i->op == X_ANDI ? 4 : i->op == X_ORI ? 1 : 6, w, dr, i->imm);
+        fin(i->d, dr);
+        return;
+    case X_IMULI:
+        dr = dst(i->d, SCR0);
+        if (i->imm >= -128 && i->imm <= 127) {
+            op_loc(0x6b, w, dr, loc_of(i->s0));
+            b1((u32)i->imm);
+        } else {
+            op_loc(0x69, w, dr, loc_of(i->s0));
+            b4((u32)i->imm);
+        }
+        fin(i->d, dr);
+        return;
+    case X_SHL:
+    case X_SHR:
+    case X_SAR:
+    case X_SHLI:
+    case X_SHRI:
+    case X_SARI:
+    case X_RORI: {
+        static const u8 digit[] = { 4, 5, 7, 4, 5, 7, 1 };
+        int byimm = i->op >= X_SHLI;
+        dr = dst(i->d, SCR0);
+        if (dr == RCX && !byimm)
+            dr = SCR0; /* the count is there */
+        mov_loc(dr, loc_of(i->s0));
+        if (!byimm) {
+            op_rr(0xd3, w, digit[i->op - X_SHL], dr);
+        } else if (i->imm) {
+            op_rr(0xc1, w, digit[i->op - X_SHL], dr);
+            b1((u32)i->imm);
+        }
+        if (loc_of(i->d) == RCX && !byimm)
+            mov_rr(RCX, dr);
+        else
+            fin(i->d, dr);
+        return;
+    }
+    case X_NEG:
+    case X_NOT:
+        dr = dst(i->d, SCR0);
+        mov_loc(dr, loc_of(i->s0));
+        op_rr(0xf7, w, i->op == X_NEG ? 3 : 2, dr);
+        fin(i->d, dr);
+        return;
+    case X_BSWAP:
+        dr = dst(i->d, SCR0);
+        mov_loc(dr, loc_of(i->s0));
+        op_prefix(O_0F | 0xc8 | (dr & 7), w, NOREG, NOREG, dr);
+        fin(i->d, dr);
+        return;
+    case X_BSF:
+        dr = dst(i->d, SCR0);
+        op_loc(O_0F | 0xbc, w, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_CLZ:
+        dr = dst(i->d, SCR0);
+        op_loc(O_0F | 0xbd, w, dr, loc_of(i->s0)); /* bsr: the index of the highest bit */
+        alu_ri(6, 0, dr, w ? 63 : 31);
+        fin(i->d, dr);
+        return;
+    case X_CQO:
+        if (w)
+            b1(0x48);
+        b1(0x99);
+        return;
+    case X_IDIV: op_loc(0xf7, w, 7, loc_of(i->s0)); return;
+    case X_DIV: op_loc(0xf7, w, 6, loc_of(i->s0)); return;
+    case X_MULH: op_loc(0xf7, 1, 4, loc_of(i->s0)); return;
+    case X_IMULH: op_loc(0xf7, 1, 5, loc_of(i->s0)); return;
+    case X_MOVSX8:
+    case X_MOVZX8:
+        dr = dst(i->d, SCR0);
+        op_loc(O_0F | O_B8M | (i->op == X_MOVSX8 ? 0xbe : 0xb6), i->op == X_MOVSX8 && w, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_MOVSX16:
+    case X_MOVZX16:
+        dr = dst(i->d, SCR0);
+        op_loc(O_0F | (i->op == X_MOVSX16 ? 0xbf : 0xb7), i->op == X_MOVSX16 && w, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_MOVSXD:
+        dr = dst(i->d, SCR0);
+        op_loc(0x63, 1, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_MOVZXD:
+        dr = dst(i->d, SCR0);
+        op_loc(0x8b, 0, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_CMP:
+        a = use(i->s0, SCR0);
+        op_loc(0x3b, w, a, loc_of(i->s1));
+        return;
+    case X_CMPI: {
+        u32 al = loc_of(i->s0);
+        int small = i->imm >= -128 && i->imm <= 127;
+        if (is_spill(al)) {
+            ea_spill(&ea, al);
+            op_mem(small ? 0x83 : 0x81, w, 7, &ea, small ? 1 : 4);
+        } else {
+            op_rr(small ? 0x83 : 0x81, w, 7, al);
+        }
+        if (small)
+            b1((u32)i->imm);
+        else
+            b4((u32)i->imm);
+        return;
+    }
+    case X_TESTI: {
+        u32 al = loc_of(i->s0);
+        int wide = w && i->imm < 0; /* else the upper half adds nothing */
+        if (is_spill(al)) {
+            ea_spill(&ea, al);
+            op_mem(0xf7, wide, 0, &ea, 4);
+        } else {
+            op_rr(0xf7, wide, 0, al);
+        }
+        b4((u32)i->imm);
+        return;
+    }
+    case X_TEST:
+        a = use(i->s0, SCR0);
+        b = i->s1 == i->s0 ? a : use(i->s1, SCR1);
+        op_rr(0x85, w, b, a);
+        return;
+    case X_FCMP:
+        a = use(i->s0, FSCR0);
+        op_loc((w ? O_66 : 0) | O_0F | 0x2e, 0, a, loc_of(i->s1)); /* ucomiss / ucomisd */
+        return;
+    case X_SETCC:
+        dr = dst(i->d, SCR0);
+        if (i->cc >= CC_FEQ) {
+            op_rr(O_0F | O_B8M | 0x90 | (i->cc == CC_FEQ ? CC_NP : CC_P), 0, 0, SCR1);
+            op_rr(O_0F | O_B8M | 0x90 | (i->cc == CC_FEQ ? CC_E : CC_NE), 0, 0, dr);
+            op_rr(O_B8R | O_B8M | (i->cc == CC_FEQ ? 0x20 : 0x08), 0, SCR1, dr); /* and / or */
+        } else {
+            op_rr(O_0F | O_B8M | 0x90 | i->cc, 0, 0, dr);
+        }
+        op_rr(O_0F | O_B8M | 0xb6, 0, dr, dr);
+        fin(i->d, dr);
+        return;
+    case X_CMOV: {
+        /* d = cc ? s0 : s1 */
+        u32 tl = loc_of(i->s0), el = loc_of(i->s1);
+        int cc = i->cc;
+        dr = dst(i->d, SCR0);
+        if (cc == CC_FEQ) { /* as "not equal" with the sides exchanged */
+            u32 t = tl;
+            tl = el;
+            el = t;
+            cc = CC_FNE;
+        }
+        if (cc == CC_FNE) {
+            if (tl == dr) {
+                if (el != dr) {
+                    jf_cc(CC_FNE);
+                    mov_loc(dr, el);
+                    jf_here();
+                }
+            } else {
+                if (el != dr)
+                    mov_loc(dr, el);
+                op_loc(O_0F | 0x40 | CC_NE, w, dr, tl);
+                op_loc(O_0F | 0x40 | CC_P, w, dr, tl);
+            }
+        } else if (tl == dr) {
+            if (el != dr)
+                op_loc(O_0F | 0x40 | (u32)(cc ^ 1), w, dr, el);
+        } else {
+            if (el != dr)
+                mov_loc(dr, el);
+            op_loc(O_0F | 0x40 | (u32)cc, w, dr, tl);
+        }
+        fin(i->d, dr);
+        return;
+    }
+    case X_FSEL: {
+        u32 tl = loc_of(i->s0), el = loc_of(i->s1);
+        dr = dst(i->d, FSCR0);
+        if (tl == dr) {
+            if (el != dr) {
+                jf_cc(i->cc);
+                mov_loc(dr, el);
+                jf_here();
+            }
+        } else {
+            if (el != dr)
+                mov_loc(dr, el);
+            jf_cc(i->cc ^ 1);
+            mov_loc(dr, tl);
+            jf_here();
+        }
+        fin(i->d, dr);
+        return;
+    }
+    case X_LOAD: {
+        static const u32 ops[] = { O_0F | 0xbe, O_0F | 0xb6, O_0F | 0xbf, O_0F | 0xb7, 0x8b, 0x8b, 0x8b, 0x8b, 0x63 };
+        int fp = i->d >= VREG0 ? mf.vclass[i->d - VREG0] : i->d >= XMM0;
+        a = i->s0 == NOREG ? NOREG : use(i->s0, SCR0);
+        x = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        mem_ea(i, a, x, i->imm, &ea);
+        dr = dst(i->d, fp ? FSCR0 : SCR0);
+        if (fp)
+            op_mem((mem_bytes[i->cc] == 8 ? O_F2 : O_F3) | O_0F | 0x10, 0, dr, &ea, 0);
+        else
+            op_mem(ops[i->cc], i->cc == M_64 || i->cc == M_F64 || i->cc == LOAD_SIGNED32, dr, &ea, 0);
+        fin(i->d, dr);
+        return;
+    }
+    case X_STORE: {
+        u32 vl = loc_of(i->s0);
+        int fp = i->s0 >= VREG0 ? mf.vclass[i->s0 - VREG0] : i->s0 >= XMM0;
+        b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+        mem_ea(i, b, x, i->imm, &ea);
+        if (x == SCR0 && is_spill(vl) && !fp) {
+            /* three spilled operands, two registers: the address is put together first */
+            EA t;
+            ea_base(&t, b, 0);
+            t.idx = x;
+            t.scale = ea.scale;
+            op_mem(0x8d, 1, SCR1, &t, 0);
+            ea.base = SCR1;
+            ea.idx = NOREG;
+        }
+        a = use(i->s0, fp ? FSCR0 : SCR0);
+        n = mem_bytes[i->cc];
+        if (fp)
+            op_mem((n == 8 ? O_F2 : O_F3) | O_0F | 0x11, 0, a, &ea, 0);
+        else if (n == 1)
+            op_mem(O_B8R | 0x88, 0, a, &ea, 0);
+        else
+            op_mem((n == 2 ? O_66 : 0) | 0x89, n == 8, a, &ea, 0);
+        return;
+    }
+    case X_STOREI: {
+        i64 val = i->imm >> 32;
+        b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+        mem_ea(i, b, x, (i32)(u32)i->imm, &ea);
+        n = mem_bytes[i->cc];
+        if (n == 1) {
+            op_mem(0xc6, 0, 0, &ea, 1);
+            b1((u32)val);
+        } else if (n == 2) {
+            op_mem(O_66 | 0xc7, 0, 0, &ea, 2);
+            b1((u32)val);
+            b1((u32)val >> 8);
+        } else {
+            op_mem(0xc7, n == 8, 0, &ea, 4);
+            b4((u32)val);
+        }
+        return;
+    }
+    case X_ADDM: bin_mem(i, 0x03, 0); return;
+    case X_SUBM: bin_mem(i, 0x2b, 0); return;
+    case X_ANDM: bin_mem(i, 0x23, 0); return;
+    case X_ORM: bin_mem(i, 0x0b, 0); return;
+    case X_XORM: bin_mem(i, 0x33, 0); return;
+    case X_IMULM: bin_mem(i, O_0F | 0xaf, 0); return;
+    case X_FADDM: bin_mem(i, 0x58, 1); return;
+    case X_FMULM: bin_mem(i, 0x59, 1); return;
+    case X_FSUBM: bin_mem(i, 0x5c, 1); return;
+    case X_FDIVM: bin_mem(i, 0x5e, 1); return;
+    case X_CMPM:
+        b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+        mem_ea(i, b, x, i->imm, &ea);
+        if (x == SCR0 && is_spill(loc_of(i->s0)))
+            ea_join(&ea);
+        a = use(i->s0, SCR0);
+        op_mem(i->cc ? 0x39 : 0x3b, w, a, &ea, 0);
+        return;
+    case X_RMW:
+        b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+        mem_ea(i, b, x, i->imm, &ea);
+        if (x == SCR0 && is_spill(loc_of(i->s0)))
+            ea_join(&ea);
+        a = use(i->s0, SCR0);
+        if (mem_bytes[i->cc] == 1)
+            op_mem(O_B8R | (i->w << 3), 0, a, &ea, 0);
+        else
+            op_mem(i->w << 3 | 1, i->cc == M_64, a, &ea, 0);
+        return;
+    case X_RMWI: {
+        i64 val = i->imm >> 32;
+        b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+        mem_ea(i, b, x, (i32)(u32)i->imm, &ea);
+        if (mem_bytes[i->cc] == 1) {
+            op_mem(0x80, 0, i->w, &ea, 1);
+            b1((u32)val);
+        } else if (val >= -128 && val <= 127) {
+            op_mem(0x83, i->cc == M_64, i->w, &ea, 1);
+            b1((u32)val);
+        } else {
+            op_mem(0x81, i->cc == M_64, i->w, &ea, 4);
+            b4((u32)val);
+        }
+        return;
+    }
+    case X_CMPMI: {
+        i64 val = i->imm >> 32;
+        b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
+        x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
+        mem_ea(i, b, x, (i32)(u32)i->imm, &ea);
+        if (mem_bytes[i->cc] == 1) {
+            op_mem(0x80, 0, 7, &ea, 1);
+            b1((u32)val);
+        } else if (val >= -128 && val <= 127) {
+            op_mem(0x83, w, 7, &ea, 1);
+            b1((u32)val);
+        } else {
+            op_mem(0x81, w, 7, &ea, 4);
+            b4((u32)val);
+        }
+        return;
+    }
+    case X_FADD: bin_fp(i, 0x58, 1); return;
+    case X_FMUL: bin_fp(i, 0x59, 1); return;
+    case X_FSUB: bin_fp(i, 0x5c, 0); return;
+    case X_FDIV: bin_fp(i, 0x5e, 0); return;
+    case X_FNEG: {
+        u32 sl = loc_of(i->s0);
+        dr = dst(i->d, FSCR0);
+        if (is_spill(sl))
+            mov_loc(SCR0, sl);
+        else
+            op_rr(O_66 | O_0F | 0x7e, w, sl, SCR0); /* movd / movq to the general register */
+        op_rr(O_0F | 0xba, w, 7, SCR0);           /* btc: the sign changes */
+        b1(w ? 63 : 31);
+        op_rr(O_66 | O_0F | 0x6e, w, dr, SCR0);
+        fin(i->d, dr);
+        return;
+    }
+    case X_SITOF:
+        dr = dst(i->d, FSCR0);
+        op_loc((w ? O_F2 : O_F3) | O_0F | 0x2a, i->cc, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_UITOF:
+        dr = dst(i->d, FSCR0);
+        if (!i->cc) {
+            op_loc(0x8b, 0, SCR0, loc_of(i->s0)); /* the upper half cleared */
+            op_rr((w ? O_F2 : O_F3) | O_0F | 0x2a, 1, dr, SCR0);
+        } else {
+            /* a value with the top bit set is halved, keeping the lowest bit for the rounding, and doubled after */
+            mov_loc(SCR0, loc_of(i->s0));
+            op_rr(0x85, 1, SCR0, SCR0);
+            jf(0x70 | CC_S);
+            op_rr((w ? O_F2 : O_F3) | O_0F | 0x2a, 1, dr, SCR0);
+            b1(0xeb); /* jmp over the rest */
+            n = (u32)text->len;
+            b1(0);
+            jf_here();
+            mov_rr(SCR1, SCR0);
+            op_rr(0xd1, 1, 5, SCR1); /* shr 1 */
+            alu_ri(4, 0, SCR0, 1);
+            op_rr(0x0b, 1, SCR1, SCR0);
+            op_rr((w ? O_F2 : O_F3) | O_0F | 0x2a, 1, dr, SCR1);
+            op_rr((w ? O_F2 : O_F3) | O_0F | 0x58, 0, dr, dr);
+            text->p[n] = (u8)(text->len - n - 1);
+        }
+        fin(i->d, dr);
+        return;
+    case X_FTOSI:
+        dr = dst(i->d, SCR0);
+        op_loc((i->cc ? O_F2 : O_F3) | O_0F | 0x2c, w, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_FTOUI: {
+        u32 pre = (i->cc ? O_F2 : O_F3) | O_0F;
+        dr = dst(i->d, SCR0);
+        if (!w) {
+            op_loc(pre | 0x2c, 1, dr, loc_of(i->s0));
+            op_rr(0x8b, 0, dr, dr);
+        } else {
+            /* from 2^63 up: convert what is above 2^63 and put the top bit back */
+            a = use(i->s0, FSCR0);
+            mov_ri(SCR0, i->cc ? 0x43e0000000000000UL : 0x5f000000UL, i->cc);
+            op_rr(O_66 | O_0F | 0x6e, i->cc, FSCR1, SCR0);
+            op_rr((i->cc ? O_66 : 0) | O_0F | 0x2e, 0, a, FSCR1);
+            jf(0x70 | CC_AE);
+            op_rr(pre | 0x2c, 1, dr, a);
+            b1(0xeb);
+            n = (u32)text->len;
+            b1(0);
+            jf_here();
+            mov_rr(FSCR0, a);
+            op_rr(pre | 0x5c, 0, FSCR0, FSCR1);
+            op_rr(pre | 0x2c, 1, dr, FSCR0);
+            op_rr(O_0F | 0xba, 1, 7, dr); /* btc 63 */
+            b1(63);
+            text->p[n] = (u8)(text->len - n - 1);
+        }
+        fin(i->d, dr);
+        return;
+    }
+    case X_FCVT:
+        dr = dst(i->d, FSCR0);
+        op_loc((w ? O_F3 : O_F2) | O_0F | 0x5a, 0, dr, loc_of(i->s0));
+        fin(i->d, dr);
+        return;
+    case X_JMP:
+        b1(0xe9);
+        add_fixup((u32)i->imm, FK_JMP);
+        return;
+    case X_JCC:
+        if (i->cc == CC_FNE) {
+            b1(0x0f);
+            b1(0x80 | CC_NE);
+            add_fixup((u32)i->imm, FK_JCC_PAIR);
+            b1(0x0f);
+            b1(0x80 | CC_P);
+            add_fixup((u32)i->imm, FK_JCC_PAIR);
+        } else if (i->cc == CC_FEQ) {
+            b1(0x70 | CC_P);
+            b1(6);
+            b1(0x0f);
+            b1(0x80 | CC_E);
+            add_fixup((u32)i->imm, FK_JCC_JP);
+        } else {
+            b1(0x0f);
+            b1(0x80 | i->cc);
+            add_fixup((u32)i->imm, FK_JCC);
+        }
+        return;
+    case X_CALL:
+        b1(0xe8);
+        obj_add_reloc(obj, arm64_text_sec, (u32)text->len, R_X64_PLT32, i->sym, -4);
+        b4(0);
+        return;
+    case X_CALLR:
+        op_loc(0xff, 0, 2, loc_of(i->s0));
+        return;
+    case X_RET:
+        epilogue();
+        return;
+    case X_ALLOCA:
+        if (i->imm == 1) {
+            dr = dst(i->d, SCR0);
+            mov_rr(dr, RSP);
+            fin(i->d, dr);
+        } else if (i->imm == 2) {
+            mov_loc(RSP, loc_of(i->s0));
+        } else {
+            dr = dst(i->d, SCR0);
+            mov_loc(SCR0, loc_of(i->s0));
+            alu_ri(0, 1, SCR0, 15);
+            alu_ri(4, 1, SCR0, -16);
+            op_rr(0x2b, 1, RSP, SCR0);
+            ea_base(&ea, RSP, (i64)align_up(outargs, 16));
+            op_mem(0x8d, 1, dr, &ea, 0);
+            fin(i->d, dr);
+        }
+        return;
+    case X_FRAMEADDR:
+        dr = dst(i->d, SCR0);
+        if (i->imm == 0) {
+            mov_rr(dr, RBP);
+        } else if (i->imm == 1) {
+            ea_base(&ea, RBP, 8);
+            load_reg(dr, &ea);
+        } else if (i->imm == 3) {
+            mov_rr(dr, RSP);
+        } else {
+            op_prefix(0x8d, 1, dr, NOREG, NOREG); /* lea dr, [rip - 7]: this instruction */
+            b1((dr & 7) << 3 | 5);
+            b4(0xfffffff9U);
+        }
+        fin(i->d, dr);
+        return;
+    case X_TLS:
+        /* the thread pointer is at fs:0; the thread's copy of the object lies a fixed way below it */
+        dr = dst(i->d, SCR0);
+        ea_base(&ea, NOREG, 0);
+        ea.fs = 1;
+        op_mem(0x8b, 1, dr, &ea, 0);
+        ea_base(&ea, dr, 0);
+        ea.force32 = 1;
+        op_mem(0x8d, 1, dr, &ea, 0);
+        obj_add_reloc(obj, arm64_text_sec, (u32)text->len - 4, R_X64_TPOFF32, i->sym, i->imm);
+        fin(i->d, dr);
+        return;
+    case X_ATOMIC: {
+        u32 code = (u32)i->imm, kind = code & 255, lg = code >> 8 & 3;
+        u32 pre = lg == 1 ? O_66 : 0, bop = lg == 0 ? O_B8R : 0;
+        int w8 = lg == 3;
+        ea_base(&ea, RDI, 0);
+        switch (kind) {
+        case ATOM_XCHG:
+            op_mem(pre | bop | (lg == 0 ? 0x86 : 0x87), w8, RSI, &ea, 0);
+            mov_rr(RAX, RSI);
+            break;
+        case ATOM_SUB:
+            op_rr(0xf7, 1, 3, RSI);
+            /* fall through */
+        case ATOM_ADD:
+            b1(0xf0);
+            op_mem(pre | bop | O_0F | (lg == 0 ? 0xc0 : 0xc1), w8, RSI, &ea, 0); /* lock xadd */
+            mov_rr(RAX, RSI);
+            break;
+        case ATOM_CAS:
+            b1(0xf0);
+            op_mem(pre | bop | O_0F | (lg == 0 ? 0xb0 : 0xb1), w8, RDX, &ea, 0); /* lock cmpxchg */
+            break;
+        default: {
+            u32 top;
+            op_mem(lg == 0 ? O_0F | 0xb6 : lg == 1 ? O_0F | 0xb7 : 0x8b, w8, RAX, &ea, 0);
+            top = (u32)text->len;
+            mov_rr(SCR0, RAX);
+            op_rr(kind == ATOM_OR ? 0x0b : kind == ATOM_XOR ? 0x33 : 0x23, 1, SCR0, RSI);
+            if (kind == ATOM_NAND)
+                op_rr(0xf7, 1, 2, SCR0);
+            b1(0xf0);
+            op_mem(pre | bop | O_0F | (lg == 0 ? 0xb0 : 0xb1), w8, SCR0, &ea, 0);
+            b1(0x70 | CC_NE);
+            b1(top - (u32)text->len - 1);
+        }
+        }
+        /* the old value, zero-extended from its size */
+        if (lg == 0)
+            op_rr(O_0F | O_B8M | 0xb6, 0, RAX, RAX);
+        else if (lg == 1)
+            op_rr(O_0F | 0xb7, 0, RAX, RAX);
+        else if (lg == 2)
+            op_rr(0x8b, 0, RAX, RAX);
+        return;
+    }
+    case X_MFENCE:
+        b1(0x0f);
+        b1(0xae);
+        b1(0xf0);
+        return;
+    case X_UD2:
+        b1(0x0f);
+        b1(0x0b);
+        return;
+    case X_VASAVE: {
+        i64 base = f->slots[i->sym].off;
+        for (n = 0; n < 6; n++) {
+            ea_base(&ea, RBP, base + 8 * (i64)n);
+            store_reg(arg_gr[n], &ea);
+        }
+        op_rr(O_B8R | O_B8M | 0x84, 0, RAX, RAX); /* test al, al: were any xmm registers used? */
+        jf(0x70 | CC_E);
+        for (n = 0; n < 8; n++) {
+            ea_base(&ea, RBP, base + 48 + 16 * (i64)n);
+            op_mem(O_0F | 0x29, 0, XMM0 + n, &ea, 0); /* movaps */
+        }
+        jf_here();
+        return;
+    }
+    case X_ASM:
+        asm_emit(i);
+        return;
+    }
+    die("internal: x86-64 encoding: op %d", i->op);
+}
+
+/* The register of each operand of an inline assembly statement. Nothing
+   is shared, so an output may be written before the inputs are read. */
+static void asm_assign(const AsmStmt *st, u8 *regs)
+{
+    static const u8 pool[] = { RDI, RSI, R8, R9, RCX, RDX, RAX, RBX, R12, R13, R14, R15 };
+    u64 taken = st->clobbers;
+    u32 k, pi = 0;
+    for (k = 0; k < st->nops; k++)
+        if (st->ops[k].reg >= 0)
+            taken |= (u64)1 << st->ops[k].reg;
+    for (k = 0; k < st->nops; k++) {
+        const AsmOp *o = &st->ops[k];
+        regs[k] = 0xff;
+        if (o->kind == 'i' || o->tied >= 0)
+            continue;
+        if (o->reg >= 0) {
+            regs[k] = (u8)o->reg;
+            continue;
+        }
+        while (pi < sizeof pool && (taken >> pool[pi] & 1))
+            pi++;
+        if (pi == sizeof pool)
+            die("%s: inline assembly has too many operands", f->name);
+        regs[k] = pool[pi++];
+    }
+    for (k = 0; k < st->nops; k++)
+        if (st->ops[k].kind != 'i' && st->ops[k].tied >= 0)
+            regs[k] = st->ops[k].reg >= 0 ? (u8)st->ops[k].reg : regs[st->ops[k].tied];
+}
+
+static void sel_asm(u32 v)
+{
+    Ins *i = &f->ins[v];
+    const AsmStmt *st = &asm_stmts[f->ins[i->c].a];
+    u8 regs[32];
+    u32 k, arg = 0, o;
+    u64 pmask = 0, defs = st->clobbers;
+    MIns *m;
+
+    if (st->dev) {
+        /* device code in a function made for both sides: the host's copy cannot do it */
+        emit(X_UD2, 0, NOREG, NOREG, NOREG);
+        for (o = 1; o < f->nins; o++)
+            if (f->ins[o].op == OP_ASMOUT && f->ins[o].blk && f->ins[o].a == v && uses[o]) {
+                int fl = f->ins[o].ty == IT_F32 || f->ins[o].ty == IT_F64;
+                m = emit(fl ? X_FMOVI : X_MOVI, f->ins[o].ty == IT_I64 || f->ins[o].ty == IT_F64, VREG0 + o, NOREG, NOREG);
+                m->imm = 0;
+            }
+        return;
+    }
+    asm_assign(st, regs);
+    for (k = 0; k < st->nops; k++) {
+        const AsmOp *op = &st->ops[k];
+        if (op->kind == 'm' || (op->kind == 'r' && op->out != 1)) {
+            move_to(regs[k], f->xargs[i->a + arg++]);
+            pmask |= (u64)1 << regs[k];
+        }
+        if (op->kind == 'r' && op->out)
+            defs |= (u64)1 << regs[k];
+    }
+    m = emit(X_ASM, 0, NOREG, NOREG, NOREG);
+    m->imm = f->ins[i->c].a;
+    m->pmask = pmask;
+    has_calls = 1; /* it may push or call: a frame, and the stack aligned */
+    asm_saved |= defs;
+    for (k = 0; k < 48; k++)
+        if ((defs >> k & 1) && ((target.allocatable[0] | target.allocatable[1]) >> k & 1))
+            emit(X_DEFREG, 1, k, NOREG, NOREG);
+    if (!alink) {
+        alink = (u32 *)xmalloc(f->nins * sizeof(u32));
+        memset(alink, 0, f->nins * sizeof(u32));
+        for (o = 1; o < f->nins; o++)
+            if (f->ins[o].op == OP_ASMOUT && f->ins[o].blk) {
+                alink[o] = alink[f->ins[o].a];
+                alink[f->ins[o].a] = o;
+            }
+    }
+    for (o = alink[v]; o; o = alink[o])
+        if (uses[o])
+            emit(X_MOV, 1, VREG0 + o, regs[f->ins[o].b], NOREG);
+}
+
+/* the name of general register r as an operand of `size` bytes (0: the high byte of a, b, c, d) */
+static void asm_regname(char *to, u32 r, u32 size)
+{
+    static const char *const low[8] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di" };
+    if (r >= 8)
+        sprintf(to, "%%r%u%s", r, size == 8 ? "" : size == 4 ? "d" : size == 2 ? "w" : "b");
+    else if (size == 0 && r < 4)
+        sprintf(to, "%%%ch", low[r][0]);
+    else if (size <= 1 && r < 4)
+        sprintf(to, "%%%cl", low[r][0]);
+    else if (size <= 1)
+        sprintf(to, "%%%sl", low[r]);
+    else
+        sprintf(to, "%%%s%s", size == 8 ? "r" : size == 4 ? "e" : "", low[r]);
+}
+
+/* Puts the operands into the text of an inline assembly statement and assembles it here. */
+static void asm_emit(MIns *i)
+{
+    const AsmStmt *st = &asm_stmts[i->imm];
+    u8 regs[32];
+    Buf b;
+    const char *t, *file;
+    char tmp[24];
+    u32 line, col, k;
+
+    asm_assign(st, regs);
+    memset(&b, 0, sizeof b);
+    loc_decode(st->loc, &file, &line, &col);
+    for (t = st->tmpl; *t; t++) {
+        int mod = 0;
+        const AsmOp *op;
+        if (*t != '%' || *++t == '%') {
+            buf_u8(&b, (u8)*t);
+            continue;
+        }
+        if (((*t | 32) >= 'a' && (*t | 32) <= 'z') && (t[1] == '[' || (t[1] >= '0' && t[1] <= '9')))
+            mod = *t++;
+        if (*t == '[') {
+            const char *e = strchr(t, ']');
+            u32 name = e ? intern(t + 1, (size_t)(e - t - 1)) : 0;
+            for (k = 0; k < st->nops; k++)
+                if (st->ops[k].name == name && name)
+                    break;
+            t = e ? e : t;
+        } else if (*t >= '0' && *t <= '9') {
+            k = (u32)(*t - '0');
+            if (t[1] >= '0' && t[1] <= '9')
+                k = k * 10 + (u32)(*++t - '0');
+        } else {
+            k = st->nops;
+        }
+        if (k >= st->nops)
+            die("%s:%u: error: bad operand reference in inline assembly", file, line);
+        op = &st->ops[k];
+        if (op->kind == 'i') {
+            /* %c0 and %P0: the bare number or name */
+            if (mod != 'c' && mod != 'P' && mod != 'p')
+                buf_u8(&b, '$');
+            buf_put(&b, op->text, strlen(op->text));
+        } else if (op->kind == 'm' || mod == 'a') {
+            asm_regname(tmp + 1, regs[k], 8);
+            tmp[0] = '(';
+            strcat(tmp, ")");
+            buf_put(&b, tmp, strlen(tmp));
+        } else {
+            u32 size = mod == 'b' ? 1 : mod == 'h' ? 0 : mod == 'w' ? 2 : mod == 'k' ? 4 : mod == 'q' ? 8 : op->cls;
+            asm_regname(tmp, regs[k], size);
+            buf_put(&b, tmp, strlen(tmp));
+        }
+    }
+    if (opt_asm_text) {
+        /* -S: the text is what was asked for */
+        buf_put(opt_asm_text, b.p, b.len);
+        buf_u8(opt_asm_text, '\n');
+    } else {
+        gas_text((char *)b.p, b.len, arm64_text_sec, file, line, 0);
+    }
+    buf_free(&b);
+    text = &obj->sec[arm64_text_sec]; /* new sections may have moved the table */
+}
+
+static u32 fx_start(const Fixup *fx)
+{
+    return fx->off - (fx->kind == FK_JMP ? 1 : 2);
+}
+
+static u32 fx_long(const Fixup *fx)
+{
+    return fx->kind == FK_JMP ? 5 : 6;
+}
+
+static u32 fx_len(const Fixup *fx)
+{
+    return fx->state == 2 ? 0 : fx->state == 1 ? 2 : fx_long(fx);
+}
+
+/* The jumps between blocks were all written in their long forms. Here "jcc A; jmp B; A:" becomes
+   "jncc B" (when the two are in one block), jumps to the next instruction go, and the rest become short where the distance allows; the
+   code moves together and the relocations made since first_rel move with it. (Not with inline assembly
+   in the function: the assembler keeps places in its text.) */
+static void relax(u32 *blk_off, u32 first_rel, int fixed)
+{
+    u32 k, bi, removed = 0, src, dst, *cut, *nb;
+    int changed;
+
+    if (fixed) {
+        for (k = 0; k < nfixups; k++)
+            put_u32le(text->p + fixups[k].off, blk_off[fixups[k].target] - (fixups[k].off + 4));
+        return;
+    }
+    for (k = 0, bi = 0; k + 1 < nfixups; k++) {
+        Fixup *a = &fixups[k], *b = &fixups[k + 1];
+        while (bi < mf.nblk && blk_off[bi] < b->off - 1)
+            bi++;
+        if (bi < mf.nblk && blk_off[bi] == b->off - 1)
+            continue; /* the second jump starts a block: others come to it */
+        if (a->kind == FK_JCC && b->kind == FK_JMP && a->off + 5 == b->off && blk_off[a->target] == b->off + 4) {
+            text->p[a->off - 1] ^= 1;
+            a->target = b->target;
+            b->state = 2;
+        }
+    }
+    cut = (u32 *)xmalloc((nfixups + 1) * sizeof(u32)); /* bytes taken out before each jump */
+    nb = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));  /* where the blocks start now */
+    do {
+        changed = 0;
+        removed = 0;
+        bi = 0;
+        for (k = 0; k <= nfixups; k++) {
+            u32 st = k < nfixups ? fx_start(&fixups[k]) : 0xffffffffU;
+            while (bi < mf.nblk && blk_off[bi] <= st) {
+                nb[bi] = blk_off[bi] - removed;
+                bi++;
+            }
+            cut[k] = removed;
+            if (k < nfixups)
+                removed += fx_long(&fixups[k]) - fx_len(&fixups[k]);
+        }
+        for (k = 0; k < nfixups; k++) {
+            Fixup *fx = &fixups[k];
+            u32 at = fx_start(fx) - cut[k];
+            i64 d;
+            if (fx->state == 2)
+                continue;
+            d = (i64)nb[fx->target] - (i64)(at + 2);
+            if (nb[fx->target] > at)
+                d -= fx_len(fx) - 2; /* what follows comes nearer when this gets short */
+            if (fx->kind != FK_JCC_JP && nb[fx->target] == at + fx_len(fx)) {
+                fx->state = 2;
+                changed = 1;
+            } else if (fx->state == 0 && d >= -128 && d <= 127) {
+                fx->state = 1;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    src = dst = nfixups ? fx_start(&fixups[0]) : (u32)text->len;
+    for (k = 0; k < nfixups; k++) {
+        Fixup *fx = &fixups[k];
+        u32 st = fx_start(fx), op = text->p[fx->off - 1];
+        memmove(text->p + dst, text->p + src, st - src);
+        dst += st - src;
+        src = st + fx_long(fx);
+        if (fx->state == 1) {
+            text->p[dst] = (u8)(fx->kind == FK_JMP ? 0xeb : 0x70 | (op & 15));
+            text->p[dst + 1] = (u8)(nb[fx->target] - (dst + 2));
+            if (fx->kind == FK_JCC_JP)
+                text->p[dst - 1] = 2;
+            dst += 2;
+        } else if (fx->state == 0) {
+            if (fx->kind != FK_JMP)
+                text->p[dst++] = 0x0f;
+            text->p[dst++] = (u8)op;
+            put_u32le(text->p + dst, nb[fx->target] - (dst + 4));
+            dst += 4;
+        }
+    }
+    memmove(text->p + dst, text->p + src, text->len - src);
+    text->len -= src - dst;
+    for (k = first_rel, bi = 0; k < obj->nrel[arm64_text_sec]; k++) {
+        ObjReloc *r = &obj->rel[arm64_text_sec][k];
+        while (bi < nfixups && fx_start(&fixups[bi]) < r->off)
+            bi++;
+        r->off -= cut[bi];
+    }
+    free(cut);
+    free(nb);
+}
+
+void x64_gen(Func *fn, Obj *o)
+{
+    u32 k, n, off, start, nsaved, first_rel;
+    u32 *blk_off;
+    int has_asm = 0;
+
+    opt_finish(fn);
+    f = fn;
+    obj = o;
+    fn_serial++;
+    prepare();
+    select_all();
+    ra_run(&mf, &target);
+
+    /* The frame, from rbp downwards: saved registers, spills, slots; the
+       outgoing arguments are at its bottom, where rsp points. */
+    saved_regs = (mf.used | (asm_saved & target.allocatable[0])) & ~target.caller_saved & 0xffff;
+    nsaved = 0;
+    for (k = 0; k < 16; k++)
+        nsaved += (u32)(saved_regs >> k & 1);
+    spill_base = 8 * nsaved;
+    off = spill_base + 8 * mf.nspill;
+    for (k = 0; k < f->nslots; k++) {
+        Slot *s = &f->slots[k];
+        u32 al = s->align ? s->align : 1;
+        if (!s->size)
+            continue;
+        if (al > 16)
+            al = 16;
+        off = (u32)align_up(off + s->size, al);
+        s->off = -(i32)off;
+    }
+    has_frame = off || outargs || has_calls || uses_args || uses_fp || uses_alloca;
+    frame_size = (u32)align_up(off + outargs, 16);
+
+    text = &o->sec[arm64_text_sec];
+    while (text->len & 15)
+        b1(0x90);
+    if (o->align[arm64_text_sec] < 16)
+        o->align[arm64_text_sec] = 16;
+    start = (u32)text->len;
+    o->syms[f->sym].sec = (u16)arm64_text_sec;
+    o->syms[f->sym].kind = 1;
+    o->syms[f->sym].value = start;
+
+    first_rel = o->nrel[arm64_text_sec];
+    prologue();
+    blk_off = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));
+    nfixups = 0;
+    for (k = 0; k < mf.nblk; k++) {
+        MBlock *mb = &mf.blk[k];
+        blk_off[k] = (u32)text->len;
+        for (n = mb->first; n < mb->first + mb->n; n++) {
+            if (mf.ins[n].op == X_ASM)
+                has_asm = 1;
+            encode(&mf.ins[n]);
+            text = &o->sec[arm64_text_sec];
+        }
+    }
+    relax(blk_off, first_rel, has_asm);
+    o->syms[f->sym].size = text->len - start;
+    free(blk_off);
+    free(layout);
+    free(blk_index);
+    free(uses);
+    free(fused);
+    free(cache_reg);
+    free(cache_blk);
+}

@@ -1,0 +1,195 @@
+a 10
+a 10
+b 2
+c 1
+c 1
+b 2
+a 10
+a 10
+c 1
+b 2
+a 10
+a 10
+a 10
+b 2
+c 1
+2 a 10
+1 b 2
+1 c 1
+2
+10
+1
+10
+b
+a
+c
+a
+a-c
+0123
+b 2
+a 10
+b 2
+a 10
+c 1
+a 10
+c 1
+a 10
+4
+18 f1
+B 2
+A 10
+C 1
+A 10
+b 2a 10c 1a 10
+a b c
+a
+b
+ho
+ABC
+z
+z
+/x/y
+.
+/
+a
+331687
+bc
+3
+1
+5
+0
+rc=1
+1 2 3
+1 2
+3 4
+5
+a
+b c
+d
+<x>
+<y>
+f572d396fae9206628714fb2ce00f72e94f2258f  -
+da39a3ee5e6b4b0d3255bfef95601890afd80709  -
+3b08588579fb16179a25e10951c67cae94c058af  f1
+0000000 141 142 143 012 001 377
+0000006
+ 61 62
+0000000   a   b   c   d   e   f   g   h   i   j   k   l   m   n   o   p
+0000020   q   r   s   t   u   v   w   x   y   z
+0000032
+find: d: No such file or directory
+find: d: No such file or directory
+find: d: No such file or directory
+same
+differ
+4a5
+> x
+rc=1
+cp: d: No such file or directory
+find: d2: No such file or directory
+rc=1
+f1
+f2
+d
+ls: d: No such file or directory
+f1
+f3
+moved
+found
+2
+b 2
+c 1
+2:a 10
+4:a 10
+3
+b 2
+c 1
+ci
+4
+f1:a 10
+f1
+2
+10
+c 1
+a 10
+c 1
+aXc
+bbb
+aba
+b
+b
+a
+c
+a
+b
+c
+a!
+b!
+c
+x
+> world hello
+a
+b
+a[b]c
+path\/to
+x
+appended
+inserted
+x
+b
+a+b
+2
+3
+2
+xyz
+2
+A b c
+a
+b
+c
+v=k
+a-b
+a_b
+lib-y += a.o
+one
+one
+two
+bac
+a
+b
+012
+-lx -ly
+b
+a
+b
+a b
+2
+a 
+cdef
+FF
+400
+F
+3
+1
+9
+-rw-------
+-rwx--x--x
+-rw-------
+diff: t1: No such file or directory
+4c4
+< d
+---
+> D
+7d6
+< g
+@@ -1,8 +1,7 @@
+ a
+ b
+ c
+-d
++D
+ e
+ f
+-g
+ h
+exit 0

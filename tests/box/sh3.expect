@@ -1,0 +1,33 @@
+3
+1
+0 end
+1
+0
+1
+a b c 3
+prea b  cpost prea b cpost
+*
+/usr
+a b c
+unset null
+ null set
+bar
+baz
+[]
+nested
+quoted inner
+x
+rc=0
+out
+fd3
+b
+if=0
+m1
+m2
+m3
+m4
+m5
+m6
+9 6 1 1 -1
+../../../../tests/box/sh3.sh: line 29: arithmetic syntax error: "i++ "
+exit 2

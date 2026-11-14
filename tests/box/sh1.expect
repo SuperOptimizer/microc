@@ -1,0 +1,54 @@
+hello world
+1 a b $x 1a b 1z
+default set assigned assigned
+libfoo.so.1 /usr/local/lib usr/local/lib/libfoo.so.1 /usr/local/lib/libfoo 26
+3 a b c d a b c d
+[a]
+[b c]
+[d]
+<a><b c><d>
+b c
+yes
+i=1
+i=2
+i=3
+0
+c
+f:q:2
+rc=3
+sub two bq
+a
+b
+and
+or
+not
+7 9 3 3 16 10 16
+heredoc 1 cs
+  $x "q"
+raw $x
+tabbed
+b
+sub=4
+a	b c
+d
+k=5     r|l    |007 ff
+q=x
+q=y
+q=z
+x:y:z x:y
+12
+dir
+nofile
+cmp
+ab bc abcqr
+$ " \ $ \ \
+n=2
+1x
+2x
+a  b c
+ev abc
+z=1
+one|two three
+two three one
+end
+exit 0

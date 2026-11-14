@@ -1,0 +1,11 @@
+# build output (stages, tests, cross toolchains, external trees fetched for testing)
+/build/
+# kernel and busybox trees and their builds; the configs are kept
+/linux/*
+!/linux/mini.config
+!/linux/pp.ok
+!/linux/pp.cok
+# other projects' sources, fetched for comparison and testing
+/third_party/
+/.claude/
+.DS_Store

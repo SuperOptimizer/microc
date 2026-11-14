@@ -1,0 +1,158 @@
+// made by gen.py: ldmatrix of 8 x 8 matrices of 16-bit elements that cp.async brought into shared memory
+//! run x4 1 1 1 32 1 1 0 128
+//! run x4t 1 1 1 32 1 1 0 128
+//! run x2 1 1 1 32 1 1 0 64
+//! run x1t 1 1 1 32 1 1 0 32
+//! run x1 1 1 1 32 1 1 0 32
+//! run x4p 1 1 1 32 1 1 0 128
+.version 8.5
+.target sm_86
+.address_size 64
+
+.global .align 16 .u16 src[256] = {0x1234, 0x1c19, 0x25fe, 0x2fe3, 0x39c8, 0x43ad, 0x4d92, 0x5777, 0x615c, 0x6b41, 0x7526, 0x7f0b, 0x88f0, 0x92d5, 0x9cba, 0xa69f, 0xb084, 0xba69, 0xc44e, 0xce33, 0xd818, 0xe1fd, 0xebe2, 0xf5c7, 0xffac, 0x991, 0x1376, 0x1d5b, 0x2740, 0x3125, 0x3b0a, 0x44ef, 0x4ed4, 0x58b9, 0x629e, 0x6c83, 0x7668, 0x804d, 0x8a32, 0x9417, 0x9dfc, 0xa7e1, 0xb1c6, 0xbbab, 0xc590, 0xcf75, 0xd95a, 0xe33f, 0xed24, 0xf709, 0xee, 0xad3, 0x14b8, 0x1e9d, 0x2882, 0x3267, 0x3c4c, 0x4631, 0x5016, 0x59fb, 0x63e0, 0x6dc5, 0x77aa, 0x818f, 0x8b74, 0x9559, 0x9f3e, 0xa923, 0xb308, 0xbced, 0xc6d2, 0xd0b7, 0xda9c, 0xe481, 0xee66, 0xf84b, 0x230, 0xc15, 0x15fa, 0x1fdf, 0x29c4, 0x33a9, 0x3d8e, 0x4773, 0x5158, 0x5b3d, 0x6522, 0x6f07, 0x78ec, 0x82d1, 0x8cb6, 0x969b, 0xa080, 0xaa65, 0xb44a, 0xbe2f, 0xc814, 0xd1f9, 0xdbde, 0xe5c3, 0xefa8, 0xf98d, 0x372, 0xd57, 0x173c, 0x2121, 0x2b06, 0x34eb, 0x3ed0, 0x48b5, 0x529a, 0x5c7f, 0x6664, 0x7049, 0x7a2e, 0x8413, 0x8df8, 0x97dd, 0xa1c2, 0xaba7, 0xb58c, 0xbf71, 0xc956, 0xd33b, 0xdd20, 0xe705, 0xf0ea, 0xfacf, 0x4b4, 0xe99, 0x187e, 0x2263, 0x2c48, 0x362d, 0x4012, 0x49f7, 0x53dc, 0x5dc1, 0x67a6, 0x718b, 0x7b70, 0x8555, 0x8f3a, 0x991f, 0xa304, 0xace9, 0xb6ce, 0xc0b3, 0xca98, 0xd47d, 0xde62, 0xe847, 0xf22c, 0xfc11, 0x5f6, 0xfdb, 0x19c0, 0x23a5, 0x2d8a, 0x376f, 0x4154, 0x4b39, 0x551e, 0x5f03, 0x68e8, 0x72cd, 0x7cb2, 0x8697, 0x907c, 0x9a61, 0xa446, 0xae2b, 0xb810, 0xc1f5, 0xcbda, 0xd5bf, 0xdfa4, 0xe989, 0xf36e, 0xfd53, 0x738, 0x111d, 0x1b02, 0x24e7, 0x2ecc, 0x38b1, 0x4296, 0x4c7b, 0x5660, 0x6045, 0x6a2a, 0x740f, 0x7df4, 0x87d9, 0x91be, 0x9ba3, 0xa588, 0xaf6d, 0xb952, 0xc337, 0xcd1c, 0xd701, 0xe0e6, 0xeacb, 0xf4b0, 0xfe95, 0x87a, 0x125f, 0x1c44, 0x2629, 0x300e, 0x39f3, 0x43d8, 0x4dbd, 0x57a2, 0x6187, 0x6b6c, 0x7551, 0x7f36, 0x891b, 0x9300, 0x9ce5, 0xa6ca, 0xb0af, 0xba94, 0xc479, 0xce5e, 0xd843, 0xe228, 0xec0d, 0xf5f2, 0xffd7, 0x9bc, 0x13a1, 0x1d86, 0x276b, 0x3150, 0x3b35, 0x451a, 0x4eff, 0x58e4, 0x62c9, 0x6cae, 0x7693, 0x8078, 0x8a5d, 0x9442, 0x9e27, 0xa80c, 0xb1f1, 0xbbd6, 0xc5bb, 0xcfa0, 0xd985, 0xe36a, 0xed4f};
+.shared .align 16 .b16 mat[256];
+
+.visible .entry x4(.param .u64 out)
+{
+    .reg .b32 %me, %r<4>, %sa, %n;
+    .reg .b64 %ro, %off, %s, %g, %sg;
+    ld.param.u64 %ro, [out];
+    mov.u32 %me, %tid.x;
+    mul.wide.u32 %off, %me, 16;
+    mov.u64 %s, mat;
+    add.u64 %s, %s, %off;
+    mov.u64 %g, src;
+    add.u64 %g, %g, %off;
+    cp.async.cg.shared.global.L2::128B [%s], [%g], 16;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r0, %r1, %r2, %r3}, [%s];
+    mul.wide.u32 %off, %me, 16;
+    add.u64 %ro, %ro, %off;
+    st.global.u32 [%ro+0], %r0;
+    st.global.u32 [%ro+4], %r1;
+    st.global.u32 [%ro+8], %r2;
+    st.global.u32 [%ro+12], %r3;
+    ret;
+}
+
+.visible .entry x4t(.param .u64 out)
+{
+    .reg .b32 %me, %r<4>, %sa, %n;
+    .reg .b64 %ro, %off, %s, %g, %sg;
+    ld.param.u64 %ro, [out];
+    mov.u32 %me, %tid.x;
+    mul.wide.u32 %off, %me, 16;
+    mov.u64 %s, mat;
+    add.u64 %s, %s, %off;
+    mov.u64 %g, src;
+    add.u64 %g, %g, %off;
+    cp.async.cg.shared.global.L2::128B [%s], [%g], 16;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    cvt.u32.u64 %sa, %s;
+    ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r0, %r1, %r2, %r3}, [%sa];
+    mul.wide.u32 %off, %me, 16;
+    add.u64 %ro, %ro, %off;
+    st.global.u32 [%ro+0], %r0;
+    st.global.u32 [%ro+4], %r1;
+    st.global.u32 [%ro+8], %r2;
+    st.global.u32 [%ro+12], %r3;
+    ret;
+}
+
+.visible .entry x2(.param .u64 out)
+{
+    .reg .b32 %me, %r<4>, %sa, %n;
+    .reg .b64 %ro, %off, %s, %g, %sg;
+    ld.param.u64 %ro, [out];
+    mov.u32 %me, %tid.x;
+    mul.wide.u32 %off, %me, 16;
+    mov.u64 %s, mat;
+    add.u64 %s, %s, %off;
+    mov.u64 %g, src;
+    add.u64 %g, %g, %off;
+    cp.async.cg.shared.global.L2::128B [%s], [%g], 16;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    cvt.u32.u64 %sa, %s;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r0, %r1}, [%sa];
+    mul.wide.u32 %off, %me, 8;
+    add.u64 %ro, %ro, %off;
+    st.global.u32 [%ro+0], %r0;
+    st.global.u32 [%ro+4], %r1;
+    ret;
+}
+
+.visible .entry x1t(.param .u64 out)
+{
+    .reg .b32 %me, %r<4>, %sa, %n;
+    .reg .b64 %ro, %off, %s, %g, %sg;
+    ld.param.u64 %ro, [out];
+    mov.u32 %me, %tid.x;
+    mul.wide.u32 %off, %me, 16;
+    mov.u64 %s, mat;
+    add.u64 %s, %s, %off;
+    mov.u64 %g, src;
+    add.u64 %g, %g, %off;
+    cp.async.cg.shared.global.L2::128B [%s], [%g], 16;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%r0}, [%s];
+    mul.wide.u32 %off, %me, 4;
+    add.u64 %ro, %ro, %off;
+    st.global.u32 [%ro+0], %r0;
+    ret;
+}
+
+.visible .entry x1(.param .u64 out)
+{
+    .reg .b32 %me, %r<4>, %sa, %n;
+    .reg .b64 %ro, %off, %s, %g, %sg;
+    ld.param.u64 %ro, [out];
+    mov.u32 %me, %tid.x;
+    mul.wide.u32 %off, %me, 16;
+    mov.u64 %s, mat;
+    add.u64 %s, %s, %off;
+    mov.u64 %g, src;
+    add.u64 %g, %g, %off;
+    cp.async.cg.shared.global.L2::128B [%s], [%g], 16;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r0}, [%s];
+    mul.wide.u32 %off, %me, 4;
+    add.u64 %ro, %ro, %off;
+    st.global.u32 [%ro+0], %r0;
+    ret;
+}
+
+.visible .entry x4p(.param .u64 out)
+{
+    .reg .b32 %me, %r<4>, %sa, %n;
+    .reg .b64 %ro, %off, %s, %g, %sg;
+    ld.param.u64 %ro, [out];
+    mov.u32 %me, %tid.x;
+    mul.wide.u32 %off, %me, 16;
+    mov.u64 %s, mat;
+    add.u64 %s, %s, %off;
+    mov.u64 %g, src;
+    add.u64 %g, %g, %off;
+    mov.u32 %n, 10;
+    cp.async.ca.shared.global [%s], [%g], 16, %n;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r0, %r1, %r2, %r3}, [%s];
+    mul.wide.u32 %off, %me, 16;
+    add.u64 %ro, %ro, %off;
+    st.global.u32 [%ro+0], %r0;
+    st.global.u32 [%ro+4], %r1;
+    st.global.u32 [%ro+8], %r2;
+    st.global.u32 [%ro+12], %r3;
+    ret;
+}

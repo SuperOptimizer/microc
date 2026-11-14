@@ -1,0 +1,12 @@
+//! run k 1 1 1 1 1 1 0 1
+.version 8.5
+.target sm_86
+.address_size 64
+
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r1;
+    add.u32 %r1, %r2, 1;
+    bra $Lnone;
+    ret;
+}

@@ -1,0 +1,6 @@
+pairs: bad 0, input kept 1, sum 3439616458020828749
+bits 32..40: bad 0, sum 3439616456624081829
+descending: bad 0, sum 1710457188342835480
+u32 pairs: values 31321662301
+exclusive: last 14747, mix 2471734
+inclusive: last 14750, mix 2472484

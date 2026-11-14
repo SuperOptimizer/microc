@@ -1,0 +1,10 @@
+rwlock: table 1500, errors 0, readers together yes
+semaphore: at most 2 inside, value 2, count 12000
+barrier: serial 3, errors 0
+trywait 0 -1 1
+errorcheck: 0 1 0 1
+recursive: 0 0 0 0 0 0 1
+trylock and timedlock on a held mutex: 1, then 0
+processors: several, as the mask says
+signal mask: 1 0
+yield 0

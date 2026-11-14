@@ -1,0 +1,53 @@
+// Many blocks, which the runtime spreads over host threads where it has them: atomic updates of cells every
+// block shares, and shared memory that must stay each block's own.
+//! run par 16 8 1 32 1 1 0 8
+.version 8.5
+.target sm_86
+.address_size 64
+
+.shared .align 4 .b32 sh[32];
+
+.visible .entry par(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p1;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ctaid.y;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r2, 16, %r1;       // the block's number, 0..127
+    mad.lo.u32 %r5, %r4, 32, %r3;       // the thread's number, 0..4095
+    // word 0: 200 increments from every thread
+    mov.u32 %r6, 0;
+$L1:
+    atom.global.add.u32 %r7, [%rd1], 1;
+    add.u32 %r6, %r6, 1;
+    setp.lt.u32 %p1, %r6, 200;
+    @%p1 bra $L1;
+    // word 1: the largest of x*1000 + y*100 + tid
+    mul.lo.u32 %r7, %r1, 1000;
+    mad.lo.u32 %r7, %r2, 100, %r7;
+    add.u32 %r7, %r7, %r3;
+    atom.global.max.u32 %r8, [%rd1+4], %r7;
+    // words 2 and 3: the 64-bit sum of the thread numbers
+    cvt.u64.u32 %rd2, %r5;
+    atom.global.add.u64 %rd3, [%rd1+8], %rd2;
+    // word 4: threads that read their own block's number from the neighbour's shared cell
+    mov.u64 %rd4, sh;
+    mul.wide.u32 %rd5, %r3, 4;
+    add.u64 %rd5, %rd4, %rd5;
+    st.shared.u32 [%rd5], %r4;
+    bar.sync 0;
+    add.u32 %r9, %r3, 1;
+    and.b32 %r9, %r9, 31;
+    mul.wide.u32 %rd6, %r9, 4;
+    add.u64 %rd6, %rd4, %rd6;
+    ld.shared.u32 %r10, [%rd6];
+    setp.eq.u32 %p1, %r10, %r4;
+    selp.u32 %r11, 1, 0, %p1;
+    atom.global.add.u32 %r12, [%rd1+16], %r11;
+    // word 5: exclusive or of all thread numbers (0 for 0..4095)
+    atom.global.xor.b32 %r12, [%rd1+20], %r5;
+    ret;
+}

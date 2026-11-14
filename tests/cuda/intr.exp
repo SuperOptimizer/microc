@@ -1,0 +1,104 @@
+fmaxf                  663f1b57
+fminf                  75b0ffa3
+fabsf                  6efe47bc
+fmaf                   d8a42e68
+sqrtf                  6493842c
+__fmul_rn              60edac20
+__fadd_rn              68f321c9
+__fsub_rn              08846fbd
+__fdiv_rn              8948be3c
+__fmaf_rn              d8a42e68
+__fsqrt_rn             348c74fe
+mul_add                d8a42e68
+div                    8948be3c
+floorf                 72f82fef
+ceilf                  60563fc7
+rintf                  ad17dd6f
+truncf                 490bcd07
+roundf                 d3775d6f
+__float2int_rn         3fe788b2
+__float2int_rz         95f7fc32
+__float2uint_rn        e85929b2
+lrintf                 c7e3407f
+lroundf                50d1f52b
+cast_int               0896d355
+cast_long              6f35f486
+int_to_float           36d78ac6
+ldexpf                 7684eab9
+frexpf                 006c2768
+copysignf              6efe47bc
+ilogbf                 599c7326
+isinf_isnan            baf1ab27
+__float2half_rn        18df0e5b
+__float2half           9773939f
+__half2float           6353e5c5
+__floats2half2_rn      a9c30e5b
+__float2half2_rn       817832ab
+__half22float2         d5c625c5
+__low2float            ba4d25c5
+__hfma2                dd16e8d7
+__float2bfloat16       036ee14a
+__float2bfloat16_rn    60d918a0
+__bfloat162float       372a05c5
+__floats2bfloat162_rn  9621e14a
+__bfloat1622float2     636305c5
+__funnelshift_r        4768fd69
+__funnelshift_l        8d687747
+__byte_perm            183b621b
+__popc                 b33ca840
+__popcll               d89ebc01
+__ffs                  b2185cf5
+__clz                  ac4af447
+__brev                 cce702ec
+__mulhi                5f21d1f7
+__umulhi               985f9085
+min_max                0019c034
+__double2ll_rn         53086d3c
+__dmul_rn              e37adae3
+__dadd_rn              5712ed8c
+__ddiv_rn              db3d214c
+fma                    27f6a176
+sqrt_floor             8b4c3aab
+expf                   near
+__expf                 near
+exp2f                  near
+logf                   near
+__logf                 near
+log2f                  near
+log1pf                 near
+powf                   near
+atan2f                 near
+erff                   near
+rsqrtf                 near
+hypotf                 near
+tanhf                  near
+sinf                   near
+cosf                   near
+cospif                 near
+exp                    near
+log                    near
+sincosf sin            near
+sincosf cos            near
+sincospif sin          near
+sincospif cos          near
+warp  0 22463ec5
+warp  1 7719caf2
+warp  2 40806d7b
+warp  3 2d795787
+warp  4 f1fa0f15
+warp  5 bf309b83
+warp  6 d4244959
+warp  7 b9a40745
+warp  8 12a1daa5
+warp  9 d29eb755
+warp 10 a9a3ec45
+warp 11 27dd7045
+warp 12 91a96dc5
+warp 13 42091dc9
+warp 14 a096ef45
+warp 15 a7b537c5
+int  71071 71214 71357 71500 71643 71786 70929 -166833 -166167 -166500 994 998 999 996 1000 -500 -497 -495 -493 -491 1 1 77
+unsigned  a001e654 a001e74e a001e848 a001e942 1fffffff 1fffffff 1fffffff 80000000 80000000 713a9f80 ffe22d6b
+float  1500 1492 1484 1492 1500
+double  83416.5 83083.5 83250
+long  f3a700000000 f42400000000 3e7000003e7

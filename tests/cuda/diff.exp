@@ -1,0 +1,16 @@
+int32: 0 of 512 differ
+int64: 0 of 512 differ
+small: 0 of 512 differ
+f32: 0 of 512 differ
+f64: 0 of 512 differ
+nan: 0 of 512 differ
+half: 0 of 512 differ
+flow: 0 of 512 differ
+struct: 0 of 512 differ
+array: 0 of 512 differ
+math: 0 of 512 differ
+bits: 0 of 512 differ
+mix: 0 of 512 differ
+atoms: 512 16128 256 16128 99952 ffffffff (max should be 99952)
+warp: 0 of 416 differ
+all agree

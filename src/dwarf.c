@@ -24,6 +24,7 @@ typedef struct DwFile {
 typedef struct DwRow {
     u32 off, file, line, col;
     u32 inst; /* the inlined call it is part of (1 + DwInl), 0 if none */
+    u32 sloc; /* where in the function's own source it is (for inlined code: the outermost call), for its blocks */
 } DwRow;
 
 /* An inlined call: the function called, and where the call was (itself perhaps in another inlined call). Code
@@ -42,6 +43,7 @@ typedef struct DwUse {
     u32 inst;   /* 1 + DwInl */
     u32 parent; /* the inlined call it is inside, 0 for the function itself */
     u32 rng;    /* offset of its list in .debug_rnglists */
+    u32 scope;  /* (parent 0) the block it is written in: 1 + DwScope, 0 the function */
 } DwUse;
 
 static DwUse *uses;
@@ -64,7 +66,18 @@ typedef struct DwVar {
     i32 fboff;
     u32 lr;         /* 1 + its first place (DwPlace), most recent first */
     u32 next;       /* 1 + the next variable of the same function */
+    u32 scope;      /* the block it is declared in: 1 + DwScope, 0 the function's outermost */
 } DwVar;
+
+/* A block of a function's body ({ ... }, a for statement): the source from start to end. Its code is the rows whose
+   sloc is in it (source ranges nest, so a block's code is part of its parent's); a DW_TAG_lexical_block is written
+   for it when a variable is declared in it or in a block inside it, so that shadowed names resolve. */
+typedef struct DwScope {
+    u32 fsym, parent; /* 1 + the enclosing block, 0 the function */
+    u32 start, end;
+    u32 rng;          /* offset of its list in .debug_rnglists */
+    u8 want, emit;
+} DwScope;
 
 typedef struct DwPlace {
     u32 start, end; /* offsets in the function */
@@ -84,6 +97,7 @@ static u32 nfns, capfns;
 static u32 *floc; /* per object symbol: the location of its definition */
 static Type **fret; /* ... its result type */
 static u32 *vhead, *vtail; /* ... 1 + its first and last variable */
+static u32 *sfirst, *send; /* ... its blocks are among DwScope sfirst .. send - 1 */
 static u32 nfloc;
 static DwVar *vars;
 static u32 nvars, capvars;
@@ -96,6 +110,8 @@ static DwVloc *vlocs;
 static u32 nvlocs, capvlocs;
 static u32 *ihash, capihash, *vhash, capvhash; /* memo: (callee, call) -> inlined call; (loc, call) -> location */
 static char *cwd;
+static DwScope *scps;
+static u32 nscps, capscps, cur_scp;
 
 static void *grow(void *p, u32 *cap, u32 need, size_t size)
 {
@@ -110,7 +126,7 @@ static void *grow(void *p, u32 *cap, u32 need, size_t size)
    rows use (some readers do not take file 0 in rows). */
 void dwarf_reset(const char *path)
 {
-    nfiles = nrows = ncfis = nfns = nvars = nplaces = ninls = nvlocs = 0;
+    nfiles = nrows = ncfis = nfns = nvars = nplaces = ninls = nvlocs = nscps = cur_scp = 0;
     if (capihash)
         memset(ihash, 0, capihash * sizeof(u32));
     if (capvhash)
@@ -122,6 +138,8 @@ void dwarf_reset(const char *path)
         memset(fret, 0, nfloc * sizeof(Type *));
         memset(vhead, 0, nfloc * sizeof(u32));
         memset(vtail, 0, nfloc * sizeof(u32));
+        memset(sfirst, 0, nfloc * sizeof(u32));
+        memset(send, 0, nfloc * sizeof(u32));
     }
     files = (DwFile *)grow(files, &capfiles, 2, sizeof(DwFile));
     files[0].name = path;
@@ -139,10 +157,14 @@ static void sym_room(u32 sym)
         fret = (Type **)xrealloc(fret, n * sizeof(Type *));
         vhead = (u32 *)xrealloc(vhead, n * sizeof(u32));
         vtail = (u32 *)xrealloc(vtail, n * sizeof(u32));
+        sfirst = (u32 *)xrealloc(sfirst, n * sizeof(u32));
+        send = (u32 *)xrealloc(send, n * sizeof(u32));
         memset(floc + nfloc, 0, (n - nfloc) * sizeof(u32));
         memset(fret + nfloc, 0, (n - nfloc) * sizeof(Type *));
         memset(vhead + nfloc, 0, (n - nfloc) * sizeof(u32));
         memset(vtail + nfloc, 0, (n - nfloc) * sizeof(u32));
+        memset(sfirst + nfloc, 0, (n - nfloc) * sizeof(u32));
+        memset(send + nfloc, 0, (n - nfloc) * sizeof(u32));
         nfloc = n;
     }
 }
@@ -153,6 +175,37 @@ void dwarf_func_loc(u32 sym, u32 loc, Type *ret)
     floc[sym] = loc;
     fret[sym] = ret;
     vhead[sym] = vtail[sym] = 0; /* (a definition read again: what it declares now) */
+    sfirst[sym] = send[sym] = nscps;
+    cur_scp = 0;
+}
+
+/* a block of fsym's body starts at loc (inside the block open now, if it is fsym's) */
+void dwarf_scope_open(u32 fsym, u32 loc)
+{
+    DwScope *c;
+    sym_room(fsym);
+    if (cur_scp && scps[cur_scp - 1].fsym != fsym)
+        cur_scp = 0;
+    if (send[fsym] <= sfirst[fsym])
+        sfirst[fsym] = nscps;
+    scps = (DwScope *)grow(scps, &capscps, nscps + 1, sizeof(DwScope));
+    c = &scps[nscps];
+    memset(c, 0, sizeof *c);
+    c->fsym = fsym;
+    c->parent = cur_scp;
+    c->start = loc;
+    c->end = 0xffffffffU;
+    cur_scp = ++nscps;
+    send[fsym] = nscps;
+}
+
+/* the block open now ends before loc */
+void dwarf_scope_close(u32 loc)
+{
+    if (!cur_scp)
+        return;
+    scps[cur_scp - 1].end = loc > scps[cur_scp - 1].start ? loc : scps[cur_scp - 1].start + 1;
+    cur_scp = scps[cur_scp - 1].parent;
 }
 
 void dwarf_var(u32 fsym, u32 name, Type *ty, u32 slot, int param, int byref, u32 loc)
@@ -170,6 +223,7 @@ void dwarf_var(u32 fsym, u32 name, Type *ty, u32 slot, int param, int byref, u32
     v->param = (u8)param;
     v->byref = (u8)(byref || (ty && ty->vslot)); /* (a variable length array: the slot holds its address) */
     dwarf_where(loc, &v->file, &v->line, &col);
+    v->scope = cur_scp && scps[cur_scp - 1].fsym == fsym ? cur_scp : 0;
     if (vtail[fsym])
         vars[vtail[fsym] - 1].next = nvars + 1;
     else
@@ -357,7 +411,7 @@ u32 dwarf_line_of(u32 loc)
 void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const DwCfi *cf, u32 ncf, u32 prologue_end)
 {
     DwFn *fn;
-    u32 k, l = dwarf_get_func_loc(sym);
+    u32 k, i, l = dwarf_get_func_loc(sym);
     fns = (DwFn *)grow(fns, &capfns, nfns + 1, sizeof(DwFn));
     fn = &fns[nfns++];
     fn->sym = sym;
@@ -375,14 +429,16 @@ void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const 
             continue;
         r.off = off[k];
         dwarf_where(loc[k], &r.file, &r.line, &r.col);
-        real_loc(loc[k], &r.inst);
+        r.sloc = real_loc(loc[k], &r.inst);
+        for (i = r.inst; i;)
+            r.sloc = real_loc(inls[i - 1].call_loc, &i);
         if (nrows > fn->row0) {
             DwRow *p = &rows[nrows - 1];
             if (p->off == r.off) { /* the code between went away (a jump to the next instruction) */
                 *p = r;
                 continue;
             }
-            if (p->file == r.file && p->line == r.line && p->col == r.col && p->inst == r.inst)
+            if (p->file == r.file && p->line == r.line && p->col == r.col && p->inst == r.inst && p->sloc == r.sloc)
                 continue;
         }
         rows = (DwRow *)grow(rows, &caprows, nrows + 1, sizeof(DwRow));
@@ -454,6 +510,30 @@ static Buf *sec(int k)
     return &O->sec[k];
 }
 
+/* The place of function sym, as a symbol for relocations: an anonymous local at its section and offset (the
+   section's symbol in the ELF file, as GCC writes it). Not the function's own symbol: a weak function that
+   another object overrides would take the frame descriptions and the debug information along to that one's
+   code, and ld rejects the .eh_frame ("error in X.o(.eh_frame); no .eh_frame_hdr table will be created"). */
+static u32 *csym, ncsym;
+
+static u32 code_sym(u32 sym)
+{
+    ObjSym *s;
+    if (sym >= ncsym) {
+        u32 n = sym + 64;
+        csym = (u32 *)xrealloc(csym, n * sizeof(u32));
+        memset(csym + ncsym, 0, (n - ncsym) * sizeof(u32));
+        ncsym = n;
+    }
+    if (csym[sym])
+        return csym[sym] - 1;
+    s = &O->syms[sym];
+    if (!s->global && !s->weak && s->name)
+        return sym; /* (a local function: its own symbol stays put) */
+    csym[sym] = obj_add_sym(O, 0, s->sec, s->value, 0) + 1;
+    return csym[sym] - 1;
+}
+
 static void reloc_here(int k, int type, u32 sym, i64 addend, u32 size)
 {
     obj_add_reloc(O, k, (u32)sec(k)->len, type, sym, addend);
@@ -509,7 +589,7 @@ static void line_program(void)
         buf_u8(b, 0);
         buf_uleb(b, 9);
         buf_u8(b, 2); /* DW_LNE_set_address */
-        reloc_here(s_line, R_ABS64, fn->sym, 0, 8);
+        reloc_here(s_line, R_ABS64, code_sym(fn->sym), 0, 8);
         b = sec(s_line);
         for (r = fn->row0; r < fn->row0 + fn->nrows; r++) {
             DwRow *w = &rows[r];
@@ -560,14 +640,14 @@ enum {
     AB_CU = 1, AB_FN, AB_FN_EXT, AB_PARAM, AB_PARAM_LIST, AB_VAR, AB_VAR_LIST, AB_PARAM_NONE, AB_VAR_NONE,
     AB_BASE, AB_PTR, AB_REF, AB_STRUCT, AB_STRUCT_ANON, AB_UNION, AB_UNION_ANON, AB_STRUCT_DECL, AB_UNION_DECL,
     AB_MEMBER, AB_MEMBER_BITS, AB_MEMBER_ANON, AB_ARRAY, AB_SUBRANGE, AB_SUBRANGE_OPEN, AB_FNTYPE, AB_VOID,
-    AB_INLINED, AB_ABSTRACT
+    AB_INLINED, AB_ABSTRACT, AB_BLOCK
 };
 
 enum {
     DW_TAG_array_type = 0x01, DW_TAG_formal_parameter = 0x05, DW_TAG_member = 0x0d, DW_TAG_pointer_type = 0x0f,
     DW_TAG_reference_type = 0x10, DW_TAG_structure_type = 0x13, DW_TAG_subroutine_type = 0x15,
     DW_TAG_union_type = 0x17, DW_TAG_subrange_type = 0x21, DW_TAG_base_type = 0x24, DW_TAG_variable = 0x34,
-    DW_TAG_unspecified_type = 0x3b, DW_TAG_inlined_subroutine = 0x1d,
+    DW_TAG_unspecified_type = 0x3b, DW_TAG_inlined_subroutine = 0x1d, DW_TAG_lexical_block = 0x0b,
     DW_AT_inline = 0x20, DW_AT_abstract_origin = 0x31, DW_AT_call_column = 0x57, DW_AT_call_file = 0x58,
     DW_AT_call_line = 0x59,
     DW_AT_location = 0x02, DW_AT_byte_size = 0x0b, DW_AT_bit_size = 0x0d, DW_AT_prototyped = 0x27,
@@ -625,6 +705,7 @@ static void abbrevs(void)
                                   DW_FORM_udata, DW_AT_call_column, DW_FORM_udata, DW_AT_ranges, DW_FORM_sec_offset, 0};
     static const u32 abstract[] = {DW_AT_name, DW_FORM_string, DW_AT_decl_file, DW_FORM_udata, DW_AT_decl_line,
                                    DW_FORM_udata, DW_AT_inline, DW_FORM_data1, 0};
+    static const u32 block[] = {DW_AT_ranges, DW_FORM_sec_offset, 0};
     Buf *b = sec(s_abbrev);
     abbrev(b, AB_CU, DW_TAG_compile_unit, 1, cu);
     abbrev(b, AB_FN, DW_TAG_subprogram, 1, fn);
@@ -654,6 +735,7 @@ static void abbrevs(void)
     abbrev(b, AB_VOID, DW_TAG_unspecified_type, 0, named);
     abbrev(b, AB_INLINED, DW_TAG_inlined_subroutine, 1, inlined);
     abbrev(b, AB_ABSTRACT, DW_TAG_subprogram, 0, abstract);
+    abbrev(b, AB_BLOCK, DW_TAG_lexical_block, 1, block);
     buf_u8(b, 0);
 }
 
@@ -885,8 +967,8 @@ static void type_die(u32 id)
 
 static u32 loclists_at(DwVar *v); /* where the variable's list of places is */
 
-/* the inlined calls in function fn that are directly inside parent (0: the function itself) */
-static void inlined_dies(u32 fn, u32 parent)
+/* the inlined calls in function fn that are directly inside parent (0: the function itself, in its block sc) */
+static void inlined_dies(u32 fn, u32 parent, u32 sc)
 {
     u32 i;
     for (i = 0; i < nuses; i++) {
@@ -894,7 +976,7 @@ static void inlined_dies(u32 fn, u32 parent)
         DwType key;
         u32 id, file, line, col, real, dummy;
         Buf *b;
-        if (u->fn != fn || u->parent != parent)
+        if (u->fn != fn || u->parent != parent || (!parent && u->scope != sc))
             continue;
         memset(&key, 0, sizeof key);
         key.kind = 0xfe;
@@ -910,7 +992,7 @@ static void inlined_dies(u32 fn, u32 parent)
         buf_uleb(b, line);
         buf_uleb(b, col);
         reloc_here(s_info, R_ABS32, y_rng, u->rng, 4);
-        inlined_dies(fn, u->inst);
+        inlined_dies(fn, u->inst, 0);
         buf_u8(sec(s_info), 0);
     }
 }
@@ -997,7 +1079,7 @@ static void inline_ranges(void)
             Buf *b = sec(s_rng);
             uses[i].rng = (u32)b->len;
             buf_u8(b, 5); /* DW_RLE_base_address: the function */
-            reloc_here(s_rng, R_ABS64, fn->sym, 0, 8);
+            reloc_here(s_rng, R_ABS64, code_sym(fn->sym), 0, 8);
             b = sec(s_rng);
             for (j = 0; j < nr; j++)
                 if (ru[j] == i && re[j] > rs[j]) {
@@ -1015,6 +1097,84 @@ static void inline_ranges(void)
     free(ru);
 }
 
+/* ---- blocks ---- */
+
+static u32 scope_target(u32 sc) /* the block written that has block sc (1 + DwScope; 0 the function) */
+{
+    while (sc && !scps[sc - 1].emit)
+        sc = scps[sc - 1].parent;
+    return sc;
+}
+
+static u32 scope_at(u32 fsym, u32 loc) /* ... that has the code at loc (the innermost block with it is the latest) */
+{
+    u32 j;
+    for (j = send[fsym]; j > sfirst[fsym]; j--) {
+        DwScope *c = &scps[j - 1];
+        if (c->fsym == fsym && c->start <= loc && loc < c->end)
+            return scope_target(j);
+    }
+    return 0;
+}
+
+/* Which blocks are written (those with a variable in them or in a block inside them, and with code), and their
+   ranges: the rows whose source is in the block. The inlined calls made in the function go into the innermost
+   block written that has the call, so that no two DIEs side by side share code. */
+static void block_ranges(void)
+{
+    u32 k, j, r, v, i;
+    for (k = 0; k < nfns; k++) {
+        DwFn *fn = &fns[k];
+        u32 a, e, fsym = fn->sym;
+        if (fsym >= nfloc)
+            continue;
+        a = sfirst[fsym];
+        e = send[fsym];
+        for (j = a; j < e; j++)
+            scps[j].want = scps[j].emit = 0;
+        for (v = vhead[fsym]; v; v = vars[v - 1].next)
+            if (vars[v - 1].scope)
+                scps[vars[v - 1].scope - 1].want = 1;
+        for (j = e; j > a; j--)
+            if (scps[j - 1].want && scps[j - 1].parent)
+                scps[scps[j - 1].parent - 1].want = 1;
+        for (j = a; j < e; j++) {
+            DwScope *c = &scps[j];
+            Buf *b;
+            u32 s0 = 0, in, open = 0;
+            if (!c->want || c->fsym != fsym || (c->parent && !scps[c->parent - 1].emit))
+                continue;
+            b = sec(s_rng);
+            c->rng = (u32)b->len;
+            buf_u8(b, 5); /* DW_RLE_base_address: the function */
+            reloc_here(s_rng, R_ABS64, code_sym(fsym), 0, 8);
+            b = sec(s_rng);
+            for (r = fn->row0; r <= fn->row0 + fn->nrows; r++) {
+                u32 at = r < fn->row0 + fn->nrows ? rows[r].off : fn->size;
+                in = r < fn->row0 + fn->nrows && rows[r].sloc >= c->start && rows[r].sloc < c->end;
+                if (in && !open) {
+                    s0 = at;
+                    open = 1;
+                } else if (!in && open) {
+                    if (at > s0) {
+                        buf_u8(b, 4); /* DW_RLE_offset_pair */
+                        buf_uleb(b, s0);
+                        buf_uleb(b, at);
+                        c->emit = 1;
+                    }
+                    open = 0;
+                }
+            }
+            buf_u8(b, 0);
+        }
+        for (i = 0; i < nuses; i++)
+            if (uses[i].fn == k && !uses[i].parent) {
+                u32 dummy, call = real_loc(inls[uses[i].inst - 1].call_loc, &dummy);
+                uses[i].scope = scope_at(fsym, call);
+            }
+    }
+}
+
 static void ranges(void)
 {
     Buf *b = sec(s_rng);
@@ -1027,14 +1187,36 @@ static void ranges(void)
     buf_u32(b, 0); /* offset entry count */
     for (k = 0; k < nfns; k++) {
         buf_u8(sec(s_rng), 7); /* DW_RLE_start_length */
-        reloc_here(s_rng, R_ABS64, fns[k].sym, 0, 8);
+        reloc_here(s_rng, R_ABS64, code_sym(fns[k].sym), 0, 8);
         buf_uleb(sec(s_rng), fns[k].size);
     }
     b = sec(s_rng);
     buf_u8(b, 0); /* DW_RLE_end_of_list */
     inline_ranges();
+    block_ranges();
     b = sec(s_rng);
     put32(b, len_at, (u32)(b->len - len_at - 4));
+}
+
+/* the variables, inlined calls and blocks of function k directly in its block sc (0: the function) */
+static void scope_dies(u32 k, u32 sc)
+{
+    u32 v, j, fsym = fns[k].sym;
+    if (fsym >= nfloc) {
+        inlined_dies(k, 0, sc);
+        return;
+    }
+    for (v = vhead[fsym]; v; v = vars[v - 1].next)
+        if (scope_target(vars[v - 1].scope) == sc)
+            var_die(&vars[v - 1]);
+    inlined_dies(k, 0, sc);
+    for (j = sfirst[fsym]; j < send[fsym]; j++)
+        if (scps[j].emit && scps[j].fsym == fsym && scope_target(scps[j].parent) == sc) {
+            buf_uleb(sec(s_info), AB_BLOCK);
+            reloc_here(s_info, R_ABS32, y_rng, scps[j].rng, 4);
+            scope_dies(k, j + 1);
+            buf_u8(sec(s_info), 0);
+        }
 }
 
 static void info(const char *path)
@@ -1062,21 +1244,19 @@ static void info(const char *path)
     for (k = 0; k < nfns; k++) {
         DwFn *fn = &fns[k];
         ObjSym *s = &O->syms[fn->sym];
-        u32 v, ret = type_id(fn->sym < nfloc ? fret[fn->sym] : 0);
+        u32 ret = type_id(fn->sym < nfloc ? fret[fn->sym] : 0);
         b = sec(s_info);
         buf_uleb(b, s->global || s->weak ? AB_FN_EXT : AB_FN);
         str(b, s->name ? intern_str(s->name) : "?");
         buf_uleb(b, fn->file);
         buf_uleb(b, fn->line);
         tref(ret);
-        reloc_here(s_info, R_ABS64, fn->sym, 0, 8);
+        reloc_here(s_info, R_ABS64, code_sym(fn->sym), 0, 8);
         b = sec(s_info);
         buf_u64(b, fn->size);
         buf_uleb(b, 1);
         buf_u8(b, 0x9c); /* DW_OP_call_frame_cfa */
-        for (v = fn->sym < nfloc ? vhead[fn->sym] : 0; v; v = vars[v - 1].next)
-            var_die(&vars[v - 1]);
-        inlined_dies(k, 0);
+        scope_dies(k, 0);
         buf_u8(sec(s_info), 0);
     }
     /* the types, and the references to them */
@@ -1125,7 +1305,7 @@ static void loclists(void)
             b = sec(s_loc);
             loc_off[v - 1] = (u32)b->len + 1;
             buf_u8(b, 6); /* DW_LLE_base_address: the function */
-            reloc_here(s_loc, R_ABS64, fsym, 0, 8);
+            reloc_here(s_loc, R_ABS64, code_sym(fsym), 0, 8);
             b = sec(s_loc);
             for (i = 0; i < n; i++) {
                 DwPlace *q = &places[ord[i]];
@@ -1202,7 +1382,7 @@ static void eh_frame(void)
         len_at = b->len;
         buf_u32(b, 0);
         buf_u32(b, (u32)(b->len - cie_at)); /* back to the CIE */
-        reloc_here(s_eh, R_X64_PC32, fn->sym, 0, 4);
+        reloc_here(s_eh, R_X64_PC32, code_sym(fn->sym), 0, 4);
         b = sec(s_eh);
         buf_u32(b, fn->size);
         buf_uleb(b, 0); /* no augmentation data */
@@ -1238,6 +1418,9 @@ void dwarf_finish(Obj *o)
     if (!nfns || opt_arch != ARCH_X64)
         return;
     O = o;
+    free(csym);
+    csym = 0;
+    ncsym = 0;
     if (!cwd)
         cwd = os_getcwd();
     s_line = obj_section(o, intern_cstr(".debug_line"), 0);

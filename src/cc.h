@@ -54,6 +54,7 @@ struct Type {
     u8 guard;       /* C++: a lock guard: made from a mutex, which it releases at the end of its scope */
     u8 transparent; /* a union with __attribute__((transparent_union)): as a parameter it takes any of its members */
     u32 lname;      /* C++: an unnamed record's name in symbols: that of its first typedef */
+    void *ctm, *cti; /* C++: a class template's instance: the template and the instance (Itanium names: name I args E) */
 };
 
 extern Type *ty_void, *ty_char, *ty_schar, *ty_uchar, *ty_short, *ty_ushort, *ty_int, *ty_uint, *ty_long,

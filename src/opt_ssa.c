@@ -512,11 +512,11 @@ static void place_add(u32 s, i32 off, int mem)
             }
             if (!mem_float(q->mem) && !mem_float(mem))
                 return;
-            if (!opt_dev_fn) {
+            if (!opt_dev_fn && opt_arch != ARCH_X64) {
                 slot_fail(s);
                 return;
             }
-            q->mem = (u8)mem_int(size); /* its bits */
+            q->mem = (u8)mem_int(size); /* its bits (x86-64: movd / movq between the register files) */
             split_changed = 1;
             return;
         }

@@ -192,9 +192,10 @@ void ra_run(MFunc *m, const MTarget *t)
     u32 pend[64];
     u64 pendm; /* which entries of pend are set */
     u32 *bucket, *bnext, npos;
-    u32 *weight; /* per interval: uses and definitions, weighted by loop depth */
+    u64 *weight; /* per interval: uses and definitions, weighted by loop depth */
     u8 *depth, *xcall; /* xcall: the interval is live across a call */
     u32 *same;         /* a register that shares the interval of another: which (itself if none) */
+    u32 *avoid;        /* MF_NOTS1: the register whose place this one had better not take (NOREG if none) */
     u32 *copies, ncopy; /* register-to-register copies still to look at: instruction, depth in the top two bits */
     int changed, dp;
 
@@ -348,17 +349,25 @@ void ra_run(MFunc *m, const MTarget *t)
     /* Live ranges, call positions, hints, and the ranges where physical
        registers are occupied. Everything is walked backwards, so lists are
        built from the end. "live" marks registers live at the current point. */
-    weight = NEW(u32, nv);
+    weight = NEW(u64, nv);
     depth = NEW(u8, m->nblk);
     memset(stamp, 0, nv * sizeof(u32)); /* from here: stamp[v] == b + 1 when v is live in block b */
     memset(depth, 0, m->nblk);
-    /* a branch back to an earlier block closes a loop over the blocks between */
-    for (b = 0; b < m->nblk; b++) {
-        MBlock *mb = &m->blk[b];
-        for (k = 0; k < mb->nsucc; k++)
-            if (mb->succ[k] <= b)
-                for (i = mb->succ[k]; i <= b; i++)
-                    if (depth[i] < 3)
+    /* a branch back to an earlier block closes a loop over the blocks between; one loop however many branches
+       go back to its head (a continue is a second one), and up to six deep (3-D voxel code: z y x and a window c b a) */
+    {
+        u32 *latch = NEW(u32, m->nblk);
+        memset(latch, 0xff, m->nblk * sizeof(u32));
+        for (b = 0; b < m->nblk; b++) {
+            MBlock *mb = &m->blk[b];
+            for (k = 0; k < mb->nsucc; k++)
+                if (mb->succ[k] <= b && (latch[mb->succ[k]] == NOREG || latch[mb->succ[k]] < b))
+                    latch[mb->succ[k]] = b;
+        }
+        for (b = 0; b < m->nblk; b++)
+            if (latch[b] != NOREG)
+                for (i = b; i <= latch[b]; i++)
+                    if (depth[i] < 6)
                         depth[i]++;
     }
     /* with a profile, what counts is how often each block really ran */
@@ -367,9 +376,11 @@ void ra_run(MFunc *m, const MTarget *t)
         for (b = 0; b < m->nblk; b++)
             if (m->blk[b].freq > maxfreq)
                 maxfreq = m->blk[b].freq;
+    avoid = NEW(u32, nv);
     for (v = 0; v < nv; v++) {
         hint[v] = NOREG;
         weight[v] = 0;
+        avoid[v] = NOREG;
     }
     for (b = m->nblk; b-- > 0;) {
         MBlock *mb = &m->blk[b];
@@ -394,6 +405,8 @@ void ra_run(MFunc *m, const MTarget *t)
                 if (in2->d >= VREG0) {
                     v = in2->d - VREG0;
                     weight[v] += bw;
+                    if ((in2->flags & MF_NOTS1) && in2->s1 != NOREG && in2->s1 >= VREG0 && in2->s1 != in2->s0)
+                        avoid[v] = in2->s1 - VREG0;
                     if (stamp[v] == b + 1) {
                         rg_start[head[v]] = wr; /* the range begins at this definition */
                         stamp[v] = 0;
@@ -414,6 +427,13 @@ void ra_run(MFunc *m, const MTarget *t)
                     pm &= pm - 1;
                     range_add(&fixed[k], wr, pend[k]);
                 }
+            }
+            if ((in2->flags & MF_TIED) && in2->d != NOREG && in2->d >= VREG0 && hint[in2->d - VREG0] == NOREG) {
+                /* two-address: an operand that dies here leaves its register to the result (stamp: live below) */
+                if (in2->s0 != NOREG && in2->s0 >= VREG0 && stamp[in2->s0 - VREG0] != b + 1)
+                    hint[in2->d - VREG0] = in2->s0;
+                else if ((in2->flags & MF_COMMUT) && in2->s1 != NOREG && in2->s1 >= VREG0 && stamp[in2->s1 - VREG0] != b + 1)
+                    hint[in2->d - VREG0] = in2->s1;
             }
             s[0] = in2->s0;
             s[1] = in2->s1;
@@ -500,7 +520,7 @@ void ra_run(MFunc *m, const MTarget *t)
             for (i = mb->first; i < mb->first + mb->n; i++) {
                 MIns *in = &m->ins[i];
                 if (in->op == t->move_op && in->d != NOREG && in->d >= VREG0 && in->s0 != NOREG && in->s0 >= VREG0)
-                    copies[ncopy++] = i | (u32)depth[b] << 30;
+                    copies[ncopy++] = i | (u32)(depth[b] < 3 ? depth[b] : 3) << 30;
             }
         }
         for (k = 0; k < ncopy; k++) {
@@ -560,7 +580,7 @@ void ra_run(MFunc *m, const MTarget *t)
     /* class bit 1 without bit 4: a vector with no spill slot to go to (x64.c's legacy SSE code) */
     for (v = 0; v < nv; v++)
         if ((m->vclass[v] & 0x12) == 2)
-            weight[v] = 0xffffff;
+            weight[v] = (u64)1 << 40;
     for (i = 0; i < norder; i++) {
         u32 cur = order[i], s = rg_start[head[cur]], n;
         int cls = m->vclass[cur] & 1, crosses = xcall[cur], reg = -1;
@@ -610,6 +630,27 @@ void ra_run(MFunc *m, const MTarget *t)
                 h = m->loc[h - VREG0];
             if (h < 64 && (cand >> h & 1) && !fixed_conflict(h, head[cur]))
                 reg = (int)h;
+        }
+        if (reg < 0 && avoid[cur] != NOREG) {
+            /* first without the register of the right operand of a two-address subtraction or division */
+            u32 a = avoid[cur];
+            while (same[a] != a)
+                a = same[a];
+            if (m->loc[a] < 64 && (cand >> m->loc[a] & 1) && (cand & ~((u64)1 << m->loc[a]))) {
+                u64 c = cand & ~((u64)1 << m->loc[a]), c2 = c & t->caller_saved;
+                int pass;
+                for (pass = 0; pass < 2 && reg < 0; pass++) {
+                    while (c2) {
+                        int pr = lowest_bit(c2);
+                        c2 &= c2 - 1;
+                        if (!fixed_conflict((u32)pr, head[cur])) {
+                            reg = pr;
+                            break;
+                        }
+                    }
+                    c2 = c & ~t->caller_saved;
+                }
+            }
         }
         if (reg < 0) {
             u64 c = cand & t->caller_saved;

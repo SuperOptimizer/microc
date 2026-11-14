@@ -21,7 +21,7 @@ if [ "$3" = x86_64 ]; then
         mkdir -p $2/glibc/lib $2/glibc/obj
         for f in f16 int128; do $MCC --target=x86_64-linux-gnu -mglibc $GS -c libc/src/$f.c -o $2/glibc/obj/$f.o; done
         rm -f $2/glibc/lib/libmcc.a
-        $MCC ar $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o 2>/dev/null ||
+        $MCC elf ar rcs $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o 2>/dev/null ||
             ${AR:-llvm-ar} rcs $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o
     fi
 fi

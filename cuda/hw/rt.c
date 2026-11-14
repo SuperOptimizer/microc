@@ -802,3 +802,14 @@ cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t a, cudaEvent_t b)
     ENTER();
     return ret(hw.EventElapsedTime(ms, a, b));
 }
+
+/* The profiler's capture range (nsys --capture-range=cudaProfilerApi): the driver's cuProfilerStart / Stop when it has them. */
+static cudaError_t profiler_call(const char *name)
+{
+    int (*f)(void);
+    ENTER();
+    f = (int (*)(void))hw_entry(name);
+    return f ? ret(f()) : cudaSuccess;
+}
+cudaError_t cudaProfilerStart(void) { return profiler_call("cuProfilerStart"); }
+cudaError_t cudaProfilerStop(void) { return profiler_call("cuProfilerStop"); }

@@ -4478,6 +4478,47 @@ static int cx_try(Expr *e, Sym *f, Expr *av, u32 n)
     return 1;
 }
 
+/* A function type with a parameter that is a lambda that captures: its instances are only ever read in place. */
+static int lam_param(Type *fty)
+{
+    u32 k;
+    for (k = 0; fty && fty->kind == TY_FUNC && k < fty->nparams; k++)
+        if (LAM(fty->params[k]) && LAM(fty->params[k])->captures)
+            return 1;
+    return 0;
+}
+
+/* A function template called with a lambda that captures: its instance is read in place of the call, so that the
+   lambda, read again where the template calls it, still sees the locals it captured (a function of its own would not). */
+static int lam_try(Expr *e, Sym *f, Expr *av, u32 n)
+{
+    u32 k;
+    int any = 0;
+    Hide saved = hide;
+    Hide none;
+    Token *body;
+    u32 nbody;
+    if (!f->itm || f->cls || !f->itm->has_body || f->iti->spec || n != f->ty->nparams || f->ty->variadic)
+        return 0;
+    for (k = 0; k < n; k++)
+        if (LAM(av[k].ty) && LAM(av[k].ty)->captures)
+            any = 1;
+    if (!any)
+        return 0;
+    body = f->itm->toks + f->itm->nhead;
+    nbody = f->itm->ntoks - f->itm->nhead;
+    memset(&none, 0, sizeof none);
+    hide = f->itm->hide;
+    hide_push(0, level);
+    push_scope();
+    bind_targs(f->itm, &f->iti->args, f->iti->args.n);
+    inline_run(e, f->ty, 0, 0, body, nbody, f->ty->base->kind == TY_REF ? 0 : unqual(f->ty->base), av, n, 0);
+    pop_scope();
+    hide = saved;
+    (void)none;
+    return 1;
+}
+
 static void launch_config(u32 loc);
 static Sym *ctor_set(Type *t);
 static void ctor_call(Expr *e, Sym *set, Expr *av, u32 n, u32 loc);
@@ -4597,6 +4638,8 @@ fcall:
             n = parse_args(av, 64);
             f = overload_pick(s, has_given ? &given : 0, av, n, loc);
             if (!lc.on && cx_try(e, f, av, n))
+                return 1;
+            if (!lc.on && lam_try(e, f, av, n))
                 return 1;
             launch = lc;
         }
@@ -10000,7 +10043,7 @@ static void cxx_flush(void)
             replay(p->lam->body, p->lam->nbody);
             def_extern_inline = 0;
             func_def(p->fn, fty, tok.loc);
-        } else if (!p->ti->spec && !p->ti->ext && !p->fn->defined) {
+        } else if (!p->ti->spec && !p->ti->ext && !p->fn->defined && !lam_param(p->fn->ty)) {
             Hide saved = hide;
             hide = p->t->hide;
             push_scope();

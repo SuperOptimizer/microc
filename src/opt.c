@@ -474,10 +474,8 @@ static void gvn(void)
                 nmem = 0;
                 continue;
             case OP_XI:
-                if (i->flags & XI_EFFECT) {
+                if (i->flags & XI_EFFECT)
                     nmem = 0;
-                    kills++;
-                }
                 continue;
             case OP_SELECT: {
                 u64 cv;

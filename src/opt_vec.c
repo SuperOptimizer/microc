@@ -84,6 +84,59 @@ static u32 outside(u32 x)
     return linv_copy[k];
 }
 
+/* Is v used anywhere but by user? */
+static int used_but(u32 v, u32 user)
+{
+    u32 b, x, k, nops, *ops;
+    for (b = 1; b < f->nblk; b++) {
+        if (f->blk[b].arg == v && (f->blk[b].term == TERM_BR || f->blk[b].term == TERM_RET))
+            return 1;
+        for (k = 0; k < 2; k++)
+            for (x = k ? f->blk[b].first : f->blk[b].phis; x; x = f->ins[x].next) {
+                u32 j;
+                if (x == user)
+                    continue;
+                IR_OPS(f, &f->ins[x], ops, nops);
+                for (j = 0; j < nops; j++)
+                    if (ops[j] == v)
+                        return 1;
+            }
+    }
+    return 0;
+}
+
+/* The loop test t < a && t < b (if-converted to an and of the two), a and b fixed before the loop: t < min (a, b), the
+   minimum taken in the preheader P. Likewise for <=, and without sign. Exact; the scalar loop gains by it too. */
+static void two_bounds(u32 l, u32 P, u32 cond)
+{
+    u32 x, y, m, op, ty;
+    Ins *c = &f->ins[cond], *X, *Y;
+    if (c->op != OP_AND || c->blk != l || c->a == c->b)
+        return;
+    x = c->a;
+    y = c->b;
+    X = &f->ins[x];
+    Y = &f->ins[y];
+    op = X->op;
+    if (X->blk != l || Y->blk != l || Y->op != op || X->a != Y->a || (op != OP_SLT && op != OP_ULT && op != OP_SLE && op != OP_ULE))
+        return;
+    ty = f->ins[X->b].ty;
+    if (f->ins[X->b].blk == l || f->ins[Y->b].blk == l || f->ins[Y->b].ty != ty || f->ins[X->a].ty != ty || (ty != IT_I32 && ty != IT_I64))
+        return;
+    /* the smaller bound */
+    m = mk(P, op == OP_SLT || op == OP_SLE ? OP_SLT : OP_ULT, IT_I32, f->ins[x].b, f->ins[y].b);
+    m = mk(P, OP_SELECT, (int)ty, m, f->ins[x].b);
+    f->ins[m].c = f->ins[y].b;
+    c = &f->ins[cond];
+    c->op = (u8)op;
+    c->a = f->ins[x].a;
+    c->b = m;
+    if (!used_but(x, cond))
+        ir_remove(f, x);
+    if (!used_but(y, cond))
+        ir_remove(f, y);
+}
+
 static int iv_index(u32 x)
 {
     u32 k;
@@ -555,6 +608,8 @@ static int try_loop(u32 l, u32 n0)
         }
     }
     cond = f->blk[l].arg;
+    if (cond < n0)
+        two_bounds(l, P, cond);
     ci = &f->ins[cond];
     missv = cond;
     if (cond >= n0 || (ci->op != OP_SLT && ci->op != OP_ULT && ci->op != OP_NE && ci->op != OP_SGT && ci->op != OP_SLE &&

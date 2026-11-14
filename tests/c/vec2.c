@@ -142,6 +142,10 @@ static float fmx(const float *a, int n) { int i; float m = -1e30f; for (i = 0; i
 static double dmn(const double *a, int n) { int i; double m = 1e300; for (i = 0; i < n; i++) if (a[i] < m) m = a[i]; return m; }
 static float fsum2(const float *a, const float *b, int n) { int i; float s = 0.f; for (i = 0; i < n; i++) s += a[i] * b[i]; return s; }
 
+/* i <= n */
+static void taps(float *w, const float *e, float s, int r) { int k; for (k = 0; k <= 2 * r; k++) w[k] = e[k] / s; }
+static void ule(unsigned *d, const unsigned *a, unsigned lo, unsigned hi) { unsigned i; for (i = lo; i <= hi; i++) d[i] = a[i] * 5u + i; }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -204,6 +208,8 @@ int main(void)
         printf("   %lx %lx %lx %lx %lx\n", check(fc, sizeof fc), check(ub, sizeof ub), check(fb, sizeof fb), check(ib, sizeof ib),
                check(ia, sizeof ia) ^ check(ua, sizeof ua));
         for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 29) % 37) * 0.25f - 4.f; fb[i] = (float)(i % 3); da[i] = (double)((i * 13) % 31) * 0.5 - 7.0; }
+        taps(fc, fa, 4.f, n / 3); ule(qb, qa, 2, (unsigned)n / 2); ule(qa, qb, 5, (unsigned)n / 4);
+        printf("   %lx %lx %lx\n", check(fc, sizeof fc), check(qa, sizeof qa), check(qb, sizeof qb));
         printf("   %g %g %g\n", (double)fmx(fa, n), dmn(da, n), (double)fsum2(fa, fb, n));
         plane(fb, fa, 1, 20, (unsigned long)n / 3); plane(fc, fb, 0, 9, (unsigned long)n / 2); bplane(ua, ub, 3, n / 2); bplane(ub, ub, 1, n / 3);
         printf("   %lx %lx %lx %lx %lx\n", check(fb, sizeof fb), check(ia, sizeof ia), check(ib, sizeof ib), check(fc, sizeof fc),

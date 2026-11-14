@@ -519,7 +519,7 @@ static int try_loop(u32 l, u32 n0)
     u32 pa[MAX_PAIRS], pb[MAX_PAIRS], np = 0;
     u8 pka[MAX_PAIRS], pkb[MAX_PAIRS];
     u32 nvec = 0, maxsh = 0, full_only = 0, vf, init64, n64, count, ok, vcnt, ivv, ivv2, sh, offend;
-    int uns, c, cty, tnext, lsh, wide = 0;
+    int uns, le, c, cty, tnext, lsh, wide = 0;
     i64 st;
     Ins *ci;
 
@@ -553,8 +553,11 @@ static int try_loop(u32 l, u32 n0)
     }
     cond = f->blk[l].arg;
     ci = &f->ins[cond];
-    if (cond >= n0 || (ci->op != OP_SLT && ci->op != OP_ULT && ci->op != OP_NE && ci->op != OP_SGT) || ci->blk != l)
+    missv = cond;
+    if (cond >= n0 || (ci->op != OP_SLT && ci->op != OP_ULT && ci->op != OP_NE && ci->op != OP_SGT && ci->op != OP_SLE &&
+                       ci->op != OP_ULE) || ci->blk != l)
         MISS("a loop test that is not handled");
+    missv = 0;
     t = ci->a;
     n = ci->b;
     if (!INV(n) || INV(t))
@@ -997,8 +1000,9 @@ static int try_loop(u32 l, u32 n0)
     st = iv_step[c];
     cty = f->ins[t].ty;
     tnext = t == iv_next[c];
-    uns = ci->op == OP_ULT;
-    if (f->ins[n].ty != cty)
+    uns = ci->op == OP_ULT || ci->op == OP_ULE;
+    le = ci->op == OP_SLE || ci->op == OP_ULE; /* i <= n: counted as i < n + 1, which 64 bits hold */
+    if (f->ins[n].ty != cty || (le && (cty != IT_I32 || st != 1 || !tnext)))
         MISS("a loop test that is not handled");
     if (st == 1 && tnext && ci->op != OP_SGT) {
         /* for (i = a; i < n; i++), or i != n */
@@ -1036,6 +1040,8 @@ static int try_loop(u32 l, u32 n0)
     if (st == 1) {
         init64 = cty == IT_I32 ? mk(P, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, iv_init[c], 0) : iv_init[c];
         n64 = cty == IT_I32 ? mk(P, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, n, 0) : n;
+        if (le)
+            n64 = mk(P, OP_ADD, IT_I64, n64, C64(1));
         count = mk(P, OP_SUB, IT_I64, n64, init64);
         ok = mk(P, uns ? OP_ULT : OP_SLT, IT_I32, init64, n64);
     } else if (st == -1) {

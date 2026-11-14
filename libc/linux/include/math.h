@@ -8,7 +8,7 @@ typedef double double_t;
 #define HUGE_VALF ((float)(1e300 * 1e300))
 #define HUGE_VALL ((long double)(1e300 * 1e300))
 #define INFINITY ((float)(1e300 * 1e300))
-#define NAN (0.0f / 0.0f)
+#define NAN (__builtin_nanf(""))    /* the positive quiet NaN, as glibc's (0.0f / 0.0f is the negative one on x86-64) */
 
 #define FP_NAN 0
 #define FP_INFINITE 1

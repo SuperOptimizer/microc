@@ -910,7 +910,11 @@ static int cc_main(const char *argv0, int argc, char **argv)
         /* for now the system's compiler driver does the link */
         char **av = (char **)xmalloc((size_t)(nsys_objs + 2 * nlibdirs + nlibs + 20) * sizeof(char *));
         int n = 0, code;
-        av[n++] = (char *)"/usr/bin/cc";
+        {
+            /* MCC_CC: another driver for that, a full path (a machine with clang-22 and no cc) */
+            const char *lcc = getenv("MCC_CC");
+            av[n++] = (char *)(lcc && lcc[0] ? lcc : "/usr/bin/cc");
+        }
         av[n++] = (char *)"-no-pie";
         if (relocatable)
             av[n++] = (char *)"-r";

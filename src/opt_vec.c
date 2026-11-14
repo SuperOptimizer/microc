@@ -750,7 +750,7 @@ static int try_loop(u32 l, u32 n0)
 
     /* on x86-64: four sums side by side each, the counters' steps, two for the instructions made of several */
     if (opt_arch == ARCH_X64) {
-        u32 extra = 2;
+        u32 extra = 3;
         for (k = 0; k < nred; k++)
             extra += red_op[k] == OP_VSUM ? 0 : 4;
         for (k = 0; k < niv; k++)

@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_nounroll, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
 u32 ptx_maxntid;
@@ -415,6 +415,27 @@ static const char *maddr(u32 a)
         return base;
     s = obuf();
     sprintf(s, "%s+%ld", base, (long)off);
+    return s;
+}
+
+/* The address a of a load or a store when it is in the function's own frame: [%SPL+n], of the local state space
+   (ld.local, LDL), rather than the generic [%SP+n] (LD, which looks up the space of each address); 0 otherwise. */
+static const char *local_maddr(u32 a)
+{
+    Ins *i;
+    char *s;
+    i64 off = 0;
+    a = RV(a);
+    if (opt_nolocal || !remat)
+        return 0;
+    if (addr_sum(a, &off))
+        a = RV(PF->ins[a].a);
+    i = &PF->ins[a];
+    if (i->op != OP_SLOT && !(i->op == OP_ADDR && special_of(i->a) >= 0))
+        return 0;
+    off += (i64)(i->op == OP_SLOT ? slotoff[i->a] : special_off[special_of(i->a)]) + (i64)(i32)i->b;
+    s = obuf();
+    sprintf(s, "%%SPL+%ld", (long)off);
     return s;
 }
 
@@ -1033,14 +1054,16 @@ static const char *lc_addr(const char *a)
     return out;
 }
 
-/* (a pointer that is one of several is of global memory when the others are, or are null) */
-#define GL_OR_NULL(x) (gl_s[x] || (f->ins[x].op == OP_CONST && !f->ins[x].a && !f->ins[x].b))
+/* (a pointer that is one of several is of global memory when the others are, or are null: a null arm is
+   neutral, level 2) */
+#define GL_LEVEL(x) (f->ins[x].op == OP_CONST && !f->ins[x].a && !f->ins[x].b ? 2 : gl_s[x])
 static void gl_find(Func *f)
 {
-    u32 v, k;
+    u32 v, k, n, *p;
     int changed;
     /* first what is computed from a pointer parameter at all (the least such set: a number that is counted
-       up from 0 is not in it), then, among those, what is so computed whichever way it is reached */
+       up from 0 is not in it), then, among those, what is so computed whichever way it is reached;
+       2: also only read, through a "const T *__restrict__" parameter of the kernel (ld.global.nc, as nvcc) */
     memset(gl_s, 0, f->nins + 1);
     do {
         changed = 0;
@@ -1050,7 +1073,7 @@ static void gl_find(Func *f)
             if (gl_s[v] || !i->blk || i->ty != IT_I64)
                 continue;
             if (i->op == OP_PARAM)
-                is = i->mem == PARAM_GLOBAL;
+                is = i->mem == PARAM_GLOBAL || i->mem == PARAM_GLOBAL_NC;
             else if (i->op == OP_ADD)
                 is = gl_s[RV(i->a)] || gl_s[RV(i->b)];
             else if (i->op == OP_SUB)
@@ -1066,30 +1089,63 @@ static void gl_find(Func *f)
             }
         }
     } while (changed);
+    for (v = 1; v < f->nins; v++)
+        if (gl_s[v])
+            gl_s[v] = f->ins[v].op != OP_PARAM ? 2 : f->ins[v].mem == PARAM_GLOBAL_NC && !opt_nonc ? 2 : 1;
     do {
         changed = 0;
         for (v = 1; v < f->nins; v++) {
             Ins *i = &f->ins[v];
-            int ok = 1;
+            u8 to;
             if (!gl_s[v] || i->op == OP_PARAM)
                 continue;
             if (i->op == OP_ADD) {
-                ok = gl_s[RV(i->a)] != gl_s[RV(i->b)];
+                u8 x = gl_s[RV(i->a)], y = gl_s[RV(i->b)];
+                to = !x != !y ? (x ? x : y) : 0;
             } else if (i->op == OP_SUB) {
-                ok = gl_s[RV(i->a)] && !gl_s[RV(i->b)];
+                to = !gl_s[RV(i->b)] ? gl_s[RV(i->a)] : 0;
             } else if (i->op == OP_SELECT) {
-                ok = GL_OR_NULL(RV(i->b)) && GL_OR_NULL(RV(i->c));
+                u8 x = GL_LEVEL(RV(i->b)), y = GL_LEVEL(RV(i->c));
+                to = x < y ? x : y;
             } else {
+                to = 2;
                 for (k = 0; k < i->b; k++)
-                    if (!GL_OR_NULL(RV(f->xargs[i->a + k])))
-                        ok = 0;
+                    if (GL_LEVEL(RV(f->xargs[i->a + k])) < to)
+                        to = GL_LEVEL(RV(f->xargs[i->a + k]));
             }
-            if (!ok) {
-                gl_s[v] = 0;
+            if (to < gl_s[v]) {
+                gl_s[v] = to;
                 changed = 1;
             }
         }
     } while (changed);
+    /* written through after all (a cast takes the const away), or handed to what may write: plain global memory */
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        int w = 0;
+        if (!i->blk)
+            continue;
+        if (i->op == OP_STORE || i->op == OP_MEMZERO || i->op == OP_MEMCPY || i->op == OP_VSTORE) {
+            w = gl_s[RV(i->a)] == 2;
+        } else if (i->op == OP_CALL) {
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                if (gl_s[RV(p[k])] == 2)
+                    w = 1;
+            if (w && (i->flags & IF_ASM)) {
+                /* an assembly statement that only reads: a load, a copy into shared memory, a prefetch */
+                u64 idx;
+                const char *t = ir_is_const(f, i->c, &idx) ? asm_stmts[idx].tmpl : 0;
+                w = !t || strstr(t, "st.") || strstr(t, "atom") || strstr(t, "red.") || strstr(t, "sust") || strstr(t, "cp.reduce");
+            }
+        }
+        if (w) {
+            for (k = 1; k < f->nins; k++)
+                if (gl_s[k] == 2)
+                    gl_s[k] = 1;
+            return;
+        }
+    }
 }
 
 /* The template of an assembly statement, whose atomic operations on [%n] are told that the address is of
@@ -1187,7 +1243,34 @@ static void emit_asm(u32 v)
         if (nh > 11)
             die("ptx: %s: too many 16-bit assembly operands", fname);
     }
-    expand(gl_tmpl(st->tmpl, vals, st->nops), '%', "", ops, st->nops);
+    {
+        /* an atomic operation whose old value nothing reads is a reduction (red), as nvcc writes atomicAdd(p, v)
+           standing alone: the GPU need not send the value back (mcuda_device.h's "atom.OP %0, [%1], %2;") */
+        const char *t = st->tmpl, *e;
+        char red[96], shd[96];
+        int unread = st->nops == 3 && st->ops[0].out == 1 && !st->ops[1].out && !st->ops[2].out && !opt_nored;
+        for (w = 1; unread && w < PF->nins; w++)
+            if (PF->ins[w].op == OP_ASMOUT && PF->ins[w].blk && PF->ins[w].a == v && PF->ins[w].b == 0)
+                unread = 0;
+        if (unread && !strncmp(t, "atom.", 5) && (e = strstr(t, " %0, [%1], %2;")) != 0 && !e[14] && e - t < 64 &&
+            !memchr(t, ' ', (size_t)(e - t))) {
+            sprintf(red, "red.%.*s [%%1], %%2;", (int)(e - t - 5), t + 5);
+            t = red;
+        }
+        if (st->nops == 3 && !st->ops[1].out && vals[1] && sh_s && !opt_nored && strlen(t) < 80 &&
+            (!strncmp(t, "atom.", 5) || !strncmp(t, "red.", 4)) && strstr(t, "[%1]") && !strstr(t, "global.") &&
+            !strstr(t, "shared") && !strstr(t, "local.")) {
+            /* ... and one on shared memory is told so, with the 32-bit address (as nvcc's atom.shared / red.shared) */
+            const char *sa = sh_maddr(vals[1]);
+            if (sa) {
+                u32 n = t[0] == 'a' ? 5 : 4;
+                sprintf(shd, "%.*sshared.%s", (int)n, t, t + n);
+                ops[1] = sa;
+                t = shd;
+            }
+        }
+        expand(gl_tmpl(t, vals, st->nops), '%', "", ops, st->nops);
+    }
     for (k = 0; k < st->nops; k++)
         if (post[k])
             P("\tcvt.u32.u16 %s, %s;\n", post[k], ops[k]);
@@ -1284,17 +1367,41 @@ static void emit_call(u32 v)
 
 /* n bytes from src (0: zeros) to dst, in loads and stores no wider than al, which both addresses are known
    to be multiples of: a GPU faults on an access that is not aligned to its own width. */
+/* The base and the space ("local." or "global.", else "") of address a, for emit_copy: a place in the frame is
+   %SPL and its offset (*off), not the generic %SP. */
+static const char *copy_base(u32 a, char *buf, i64 *off, const char **space)
+{
+    Ins *i;
+    u32 r = RV(a);
+    *off = 0;
+    *space = "";
+    if (!opt_nolocal && remat) {
+        i64 o = 0;
+        if (addr_sum(r, &o))
+            r = RV(PF->ins[r].a);
+        i = &PF->ins[r];
+        if (i->op == OP_SLOT || (i->op == OP_ADDR && special_of(i->a) >= 0)) {
+            *off = o + (i64)(i->op == OP_SLOT ? slotoff[i->a] : special_off[special_of(i->a)]) + (i64)(i32)i->b;
+            *space = "local.";
+            strcpy(buf, "%SPL");
+            return buf;
+        }
+    }
+    if (gl_s && gl_s[RV(a)])
+        *space = "global.";
+    strcpy(buf, ropnd(a));
+    return buf;
+}
+
 static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
 {
-    const char *d, *s = 0, *t;
+    const char *d, *s = 0, *t, *dsp, *ssp = "";
     char dn[48], sn[48];
     u64 off = 0;
-    strcpy(dn, ropnd(dst));
-    d = dn;
-    if (src) {
-        strcpy(sn, ropnd(src));
-        s = sn;
-    }
+    i64 doff, soff = 0;
+    d = copy_base(dst, dn, &doff, &dsp);
+    if (src)
+        s = copy_base(src, sn, &soff, &ssp);
     if (n > 128) {
         /* too long to write out: a loop over the whole units, and the rest written out below */
         static u32 nloop;
@@ -1307,10 +1414,10 @@ static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
         t = temp(w == 8 ? 1 : 0);
         P("\tmov.u64 %s, 0;\nLM%u:\n", ix, nloop);
         if (s)
-            P("\tadd.u64 %s, %s, %s;\n\tld.%s %s, [%s];\n", ad, s, ix, ty, t, ad);
+            P("\tadd.u64 %s, %s, %s;\n\tld.%s%s %s, [%s%+ld];\n", ad, s, ix, ssp, ty, t, ad, (long)soff);
         else
             P("\t%s %s, 0;\n", w == 8 ? "mov.b64" : "mov.b32", t);
-        P("\tadd.u64 %s, %s, %s;\n\tst.%s [%s], %s;\n", ad, d, ix, ty, ad, t);
+        P("\tadd.u64 %s, %s, %s;\n\tst.%s%s [%s%+ld], %s;\n", ad, d, ix, dsp, ty, ad, (long)doff, t);
         P("\tadd.u64 %s, %s, %u;\n\tsetp.lt.u64 %%p0, %s, %lu;\n\t@%%p0 bra LM%u;\n", ix, ix, w, ix, (unsigned long)whole, nloop);
         nloop++;
         off = whole;
@@ -1320,10 +1427,10 @@ static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
         const char *ty = w == 8 ? "u64" : w == 4 ? "u32" : w == 2 ? "u16" : "u8";
         t = temp(w == 8 ? 1 : 0);
         if (s)
-            P("\tld.%s %s, [%s+%lu];\n", ty, t, s, (unsigned long)off);
+            P("\tld.%s%s %s, [%s%+ld];\n", ssp, ty, t, s, (long)(soff + (i64)off));
         else
             P("\t%s %s, 0;\n", w == 8 ? "mov.b64" : "mov.b32", t);
-        P("\tst.%s [%s+%lu], %s;\n", ty, d, (unsigned long)off, t);
+        P("\tst.%s%s [%s%+ld], %s;\n", dsp, ty, d, (long)(doff + (i64)off), t);
         off += w;
     }
 }
@@ -1588,13 +1695,18 @@ static void emit_ins(u32 v)
             P("\tld.shared.%s %s, [%s];\n", lt[i->mem], reg(v), a);
             return;
         }
+        if ((a = local_maddr(i->a)) != 0) {
+            P("\tld.local.%s %s, [%s];\n", lt[i->mem], reg(v), a);
+            return;
+        }
         a = maddr(i->a);
         if (lc_s && lc_s[RV(i->a)]) {
             a = lc_addr(a);
             P("\tld.local.%s %s, [%s];\n", lt[i->mem], reg(v), a);
             return;
         }
-        P("\tld.%s%s %s, [%s];\n", gl_s && gl_s[RV(i->a)] ? "global." : "", lt[i->mem], reg(v), a);
+        P("\tld.%s%s %s, [%s];\n", (i->flags & IF_NC) && !opt_nonc ? "global.nc." : gl_s && gl_s[RV(i->a)] ? gl_s[RV(i->a)] == 2 ? "global.nc." : "global." : "",
+          lt[i->mem], reg(v), a);
         return;
     }
     case OP_STORE: {
@@ -1602,6 +1714,11 @@ static void emit_ins(u32 v)
         if ((a = sh_maddr(i->a)) != 0) {
             b = ropnd(i->b);
             P("\tst.shared.%s [%s], %s;\n", stt[i->mem], a, b);
+            return;
+        }
+        if ((a = local_maddr(i->a)) != 0) {
+            b = ropnd(i->b);
+            P("\tst.local.%s [%s], %s;\n", stt[i->mem], a, b);
             return;
         }
         a = maddr(i->a);
@@ -2142,6 +2259,107 @@ static void round_once(void)
         opt_dce(f);
 }
 
+/* The way back of a loop, from block b to its head s, with moves for s's phis, the other way out t without:
+   whether the moves can be made before the branch, on both ways (the way back is then one conditional
+   branch, as nvcc writes it; with the moves in a block of their own after the branch out, ptxas peels a
+   copy of the loop: conv_bwd_w_s2_f8_k, 48 MMAs for 24). They can when no register they write is read on
+   the way out: not by anything that t reaches before s comes again, nor by what is computed again where
+   it is read (a comparison, a fused product, ...), nor through a value that shares the register. */
+static int moves_early(const u8 *live, u32 b, u32 s, u32 t)
+{
+    Func *f = PF;
+    Block *sb = &f->blk[s];
+    u32 k, v, n, *p, pi = 0, nb = f->nblk, *stack, sp = 0, w, x;
+    u8 *hit, *reach;
+    int ok = 1, more;
+    if (s > b || t == s || !sb->phis)
+        return 0;
+    for (k = 0; k < sb->npreds; k++)
+        if (sb->preds[k] == b)
+            pi = k;
+    hit = (u8 *)xmalloc(f->nins + 1);
+    memset(hit, 0, f->nins + 1);
+    /* the registers the moves write */
+    for (v = sb->phis; v; v = f->ins[v].next) {
+        u32 src = RV(f->xargs[f->ins[v].a + pi]);
+        if (!used[v] || src == v || !src)
+            continue;
+        if (regno[src] && regno[src] == regno[v] && f->ins[src].op != OP_CONST && cls_of(f->ins[src].ty) == cls_of(f->ins[v].ty))
+            continue;
+        hit[v] = 1;
+    }
+    for (w = 1; w < f->nins; w++)
+        if (f->ins[w].blk && regno[w] && !hit[w])
+            for (v = sb->phis; v; v = f->ins[v].next)
+                if (hit[v] && regno[w] == regno[v] && cls_of(f->ins[w].ty) == cls_of(f->ins[v].ty)) {
+                    hit[w] = 1;
+                    break;
+                }
+    /* what is computed again where it is read reads them there */
+    do {
+        more = 0;
+        for (w = 1; w < f->nins; w++) {
+            Ins *i = &f->ins[w];
+            if (hit[w] || !i->blk || i->op == OP_PHI ||
+                !(is_compare(i->op) || fused[w] || i->op == OP_SELECT || (sh_s && sh_t32[w] && sh_ext(w)) || xlate[w]))
+                continue;
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                if (hit[RV(p[k])]) {
+                    hit[w] = 1;
+                    more = 1;
+                    break;
+                }
+        }
+    } while (more);
+    /* the blocks t reaches before s */
+    reach = (u8 *)xmalloc(nb);
+    memset(reach, 0, nb);
+    stack = (u32 *)xmalloc(nb * sizeof(u32));
+    reach[t] = 1;
+    stack[sp++] = t;
+    while (sp) {
+        Block *bb = &f->blk[stack[--sp]];
+        n = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
+        for (k = 0; k < n; k++) {
+            x = bb->succ[k];
+            if (x != s && live[x] && !reach[x]) {
+                reach[x] = 1;
+                stack[sp++] = x;
+            }
+        }
+    }
+    for (x = 1; x < nb && ok; x++) {
+        Block *bb = &f->blk[x];
+        if (!live[x])
+            continue;
+        for (v = bb->phis; v && ok; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++) {
+                u32 from = bb->preds[k];
+                if (hit[RV(f->xargs[f->ins[v].a + k])] && (reach[from] || (from == b && x != s))) {
+                    ok = 0;
+                    break;
+                }
+            }
+        if (!reach[x])
+            continue;
+        for (v = bb->first; v && ok; v = f->ins[v].next) {
+            IR_OPS(f, &f->ins[v], p, n);
+            for (k = 0; k < n; k++)
+                if (hit[RV(p[k])])
+                    ok = 0;
+            if (f->ins[v].op == OP_CALL && hit[RV(f->ins[v].c)])
+                ok = 0;
+        }
+        if (bb->arg && hit[RV(bb->arg)])
+            ok = 0;
+    }
+    free(hit);
+    free(reach);
+    free(stack);
+    return ok;
+}
+
 /* The place among the PTX parameters of the function's parameter k. */
 static u32 param_index(Func *f, u32 k)
 {
@@ -2503,6 +2721,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
         for (next = b + 1; next < nb && !live[next]; next++)
             ;
         P("L%u:\n", b);
+        if (bb->nounroll)
+            P("\t.pragma \"nounroll\";\n");
         for (v = bb->first; v; v = f->ins[v].next) {
             if (opt_debug && f->ins[v].loc && f->ins[v].loc != last_loc) {
                 /* -g: the line of what follows, for the driver's compiler to put in its line table */
@@ -2537,6 +2757,16 @@ void ptx_gen(Func *f, Obj *o, int entry)
                 edge_moves(b, s1, s0 == s1 ? 1 : 0);
                 P("\tbra.uni L%u;\nL%u_t:\n", s1, b);
                 edge_moves(b, s0, 0);
+                if (s0 != next)
+                    P("\tbra.uni L%u;\n", s0);
+            } else if (m0 && !opt_nolatch && moves_early(live, b, s0, s1)) {
+                edge_moves(b, s0, 0);
+                P("\t@%%p0 bra L%u;\n", s0);
+                if (s1 != next)
+                    P("\tbra.uni L%u;\n", s1);
+            } else if (m1 && !opt_nolatch && moves_early(live, b, s1, s0)) {
+                edge_moves(b, s1, s0 == s1 ? 1 : 0);
+                P("\t@!%%p0 bra L%u;\n", s1);
                 if (s0 != next)
                     P("\tbra.uni L%u;\n", s0);
             } else if (m0) {

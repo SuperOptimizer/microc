@@ -2589,6 +2589,8 @@ static int ptr_word(Type *t, u64 off)
         return 0;
     if (t->canon)
         t = t->canon;
+    if (t->vkind)
+        return 0;
     for (fl = t->fields; fl; fl = fl->next)
         if (!fl->bitwidth && off >= fl->off && off < fl->off + type_size(fl->ty))
             return ptr_word(fl->ty, off - fl->off);
@@ -4176,6 +4178,27 @@ static int builtin(Expr *e)
         while (accept(T_COMMA))
             dead_expr(&x);
         expect(T_RPAREN);
+        return 1;
+    }
+    if (strcmp(b, "mcc_ldg") == 0) {
+        /* CUDA's __ldg(p): *p, from global memory that the kernel only reads (ld.global.nc) */
+        Type *t;
+        next();
+        expect(T_LPAREN);
+        assign_expr(e);
+        rvalue(e);
+        expect(T_RPAREN);
+        if (e->ty->kind != TY_PTR)
+            error_at(tok.loc, "__builtin_mcc_ldg wants a pointer");
+        t = e->ty->base;
+        if (cur_fn_dev && type_is_scalar(t) && t->kind != TY_FLOAT16 && t->kind != TY_BF16 && t->kind != TY_LDOUBLE && !(t->kind >= TY_INT128 && t->kind <= TY_UINT128)) {
+            u32 v = ir_load(F, type_ir(t), type_mem(t), e->v);
+            if (F->ins[v].op == OP_LOAD)
+                F->ins[v].flags |= IF_NC;
+            set_expr(e, unqual(t), v, 0);
+        } else {
+            set_expr(e, t, e->v, 1);
+        }
         return 1;
     }
     if (strcmp(b, "mcuda_device") == 0) {
@@ -7286,7 +7309,7 @@ enum { D_PTR, D_ARRAY, D_FUNC, D_REF };
 
 typedef struct DOp {
     u8 kind;
-    u8 quals;
+    u8 quals, restr;
     u8 complete, variadic, oldstyle;
     u64 len;
     Type **params;
@@ -7442,7 +7465,7 @@ static DOp *declarator_ops(u32 *name)
             else if (accept(KW(KW_ATOMIC)))
                 op->quals |= Q_ATOMIC;
             else if (accept(KW(KW_RESTRICT)))
-                ;
+                op->restr = 1;
             else if (tok.kind == KW(KW_ATTRIBUTE))
                 attributes(&dcl_attr); /* "void *__section(x) p": they are the variable's */
             else
@@ -7525,6 +7548,8 @@ static Type *declarator(Type *base, u32 *name)
             base = type_ptr(base);
             if (op->quals)
                 base = type_qual(base, op->quals);
+            if (op->restr && opt_cuda)
+                base = type_restrict(base);
             break;
         case D_REF:
             if (base->kind != TY_REF)
@@ -10073,6 +10098,7 @@ static void statement(void)
     case KW(KW_FOR): {
         /* the condition guards the loop and is tested again after each step */
         u32 ur = unroll_req > 1 && !opt_nounroll ? unroll_req : 0;
+        int once = unroll_req == 1; /* #pragma unroll 1 */
         /* device code: a short loop that counts to a constant is unrolled unasked, as nvcc does */
         int au = !ur && !unroll_req && cur_fn_dev && !opt_nounroll && !opt_size && !opt_noauto && au_n++ < opt_aumax;
         u32 for_loc = tok.loc;
@@ -10107,7 +10133,7 @@ static void statement(void)
                each, comes out as a constant that is true; the loop ends where it is a constant that is false.
                Where it is not known (or after ur times) what is left is an ordinary loop. */
             Token *ctk, *stk, *btk, semi;
-            u32 cn, sn, bn, copies = 0, c, cnt;
+            u32 cn, sn, bn, copies = 0, c, cnt, fac = 0, j;
             u64 cv = 0;
             int done = 0;
             grab_to(T_SEMI);
@@ -10173,6 +10199,38 @@ static void statement(void)
                 uv->cv = 0;
                 F->cur = keep;
             }
+            if (ur > 1 && ur < 65536 && !au && !opt_unrollpeel) {
+                /* #pragma unroll N, a loop that runs a known T > N times: T % N copies, then a loop whose body is N
+                   copies (as nvcc reads it), not N copies and then a loop of one */
+                i64 v = uval;
+                u32 k, keep = F->cur;
+                F->cur = ir_new_block(F); /* what reading the condition writes is never run */
+                for (k = 0; k <= 4096; k++) {
+                    v = unroll_fit(uv->ty, v);
+                    uv->cv = 1;
+                    uv->val = v;
+                    replay(ctk, cn);
+                    expr(&e);
+                    rvalue(&e);
+                    c = to_bool(&e);
+                    expect(T_SEMI);
+                    if (!ir_is_const(F, c, &cv))
+                        break;
+                    if (!cv) {
+                        if (k > ur) {
+                            fac = ur;
+                            ur = k % fac;
+                        }
+                        break;
+                    }
+                    unroll_quiet = 1;
+                    if (!unroll_step(uv, stk, sn, &v))
+                        k = 4096;
+                    unroll_quiet = 0;
+                }
+                uv->cv = 0;
+                F->cur = keep;
+            }
             end = ir_new_block(F);
             for (;;) {
                 /* the counter is a constant while the condition and the body are read (and has its value in memory) */
@@ -10222,13 +10280,25 @@ static void statement(void)
                 expect(T_SEMI);
                 F->cur = body;
                 F->blk[body].lhdr = 1;
-                break_blk = end;
-                break_level = level;
-                cont_blk = step;
-                cont_level = level;
-                replay(btk, bn);
-                statement();
-                ir_jmp(F, step);
+                F->blk[body].nounroll = fac != 0;
+                for (j = 0; j < (fac ? fac : 1); j++) {
+                    /* (fac copies: the condition holds between them, the loop running a multiple of fac times) */
+                    cnt = j + 1 < fac ? ir_new_block(F) : step;
+                    break_blk = end;
+                    break_level = level;
+                    cont_blk = cnt;
+                    cont_level = level;
+                    replay(btk, bn);
+                    statement();
+                    ir_jmp(F, cnt);
+                    if (cnt != step) {
+                        F->cur = cnt;
+                        replay(stk, sn);
+                        if (tok.kind != T_SEMI)
+                            expr(&e);
+                        expect(T_SEMI);
+                    }
+                }
             }
             F->cur = end;
             pop_scope();
@@ -10284,6 +10354,7 @@ static void statement(void)
         }
         F->cur = body;
         F->blk[body].lhdr = 1;
+        F->blk[body].nounroll = (u8)once;
         break_blk = end;
         break_level = level;
         cont_blk = step;
@@ -10846,7 +10917,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         } else {
             v = abi_extend(pt, ir_add_param(F, type_ir(pt)));
             if (cur_fn_kernel && pt->kind == TY_PTR && F->ins[v].op == OP_PARAM)
-                F->ins[v].mem = PARAM_GLOBAL;
+                F->ins[v].mem = pt->restr && (pt->base->quals & Q_CONST) ? PARAM_GLOBAL_NC : PARAM_GLOBAL;
             p->slot = ir_new_slot(F, type_size(pt), type_align(pt));
             store_val(pt, ir_slot_addr(F, p->slot, 0), v);
             if (type_is_float(pt))

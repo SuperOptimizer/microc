@@ -110,6 +110,19 @@ Type *type_qual(Type *t, int quals)
     return q;
 }
 
+/* t, a pointer, declared restrict (CUDA: a kernel's "const T *__restrict__" parameter is read through ld.global.nc) */
+Type *type_restrict(Type *t)
+{
+    Type *q;
+    if (t->restr)
+        return t;
+    q = (Type *)arena_alloc(ta, sizeof(Type));
+    *q = *t;
+    q->restr = 1;
+    q->ptr_to = 0;
+    return q;
+}
+
 Type *type_aligned(Type *t, u32 align)
 {
     Type *q;

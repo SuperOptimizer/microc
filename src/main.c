@@ -479,7 +479,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
 {
     const char *out_path = 0, *entry = 0, *prof_path = 0, *dep_path = 0;
     const char **undefs = (const char **)xmalloc((size_t)(argc + 1) * sizeof(char *));
-    int nostdlib = 0, nostdinc = 0, lang = 0, nundefs = 0, want_deps = 0;
+    int nostdlib = 0, nostdinc = 0, lang = 0, nundefs = 0, want_deps = 0, sysroot_said = 0;
     char *sys_include = home_path(argv0, "include"), *libc = home_path(argv0, "lib/libc.a");
     char *lx_include = home_path(argv0, "linux/include"), *lx_lib = home_path(argv0, "linux/lib");
     char *lx_ext_include = home_path(argv0, "linux/ext/include"), *lx_ext_lib = home_path(argv0, "linux/ext/lib");
@@ -511,11 +511,11 @@ static int cc_main(const char *argv0, int argc, char **argv)
 #endif
     for (i = 0; i < argc; i++) {
         if (strncmp(argv[i], "--sysroot=", 10) == 0)
-            sysroot = strcmp(argv[i] + 10, "/") ? argv[i] + 10 : "";
+            sysroot = strcmp(argv[i] + 10, "/") ? argv[i] + 10 : "", sysroot_said = 1;
         else if (strcmp(argv[i], "-mglibc") == 0)
-            sysroot = "";
+            sysroot = "", sysroot_said = 1;
         else if (strcmp(argv[i], "-mno-glibc") == 0)
-            sysroot = 0;
+            sysroot = 0, sysroot_said = 1;
     }
     for (i = 0; i < argc; i++) {
         const char *a = argv[i];
@@ -653,6 +653,16 @@ static int cc_main(const char *argv0, int argc, char **argv)
                 lx_lib = home_path(argv0, "linux-x64/lib");
                 lx_ext_include = home_path(argv0, "linux-x64/ext/include");
                 lx_ext_lib = home_path(argv0, "linux-x64/ext/lib");
+            } else if (strncmp(a + 9, "aarch64", 7) == 0 || strncmp(a + 9, "arm64", 5) == 0) {
+                /* (from an x86-64 Linux, which compiles for itself unless told otherwise: aarch64 and its C library,
+                   not this machine's GNU one) */
+                opt_arch = ARCH_ARM64;
+                lx_include = home_path(argv0, "linux/include");
+                lx_lib = home_path(argv0, "linux/lib");
+                lx_ext_include = home_path(argv0, "linux/ext/include");
+                lx_ext_lib = home_path(argv0, "linux/ext/lib");
+                if (!sysroot_said)
+                    sysroot = 0;
             }
         }
         else if (strncmp(a, "--sysroot=", 10) == 0)
@@ -898,7 +908,13 @@ static int cc_main(const char *argv0, int argc, char **argv)
         }
         opt_cuda = force_cuda || has_suffix(in, ".cu");
         opt_nounroll = getenv("MCC_NOUNROLL") != 0;
+        opt_nolocal = getenv("MCC_NOLOCAL") != 0; /* PTX: the frame through generic [%SP] */
+        opt_nored = getenv("MCC_NORED") != 0; /* PTX: atom for atomics whose old value is not read */
+        opt_nonc = getenv("MCC_NONC") != 0; /* PTX: no ld.global.nc through const restrict kernel pointers */
+        opt_nolatch = getenv("MCC_NOLATCH") != 0; /* PTX: a loop's moves after its branch out, in a block of their own */
+        opt_unrollpeel = getenv("MCC_UNROLLPEEL") != 0; /* #pragma unroll N: N copies, then a loop of one (before 11-14) */
         opt_nosplit = getenv("MCC_NOSPLIT") != 0;
+        opt_noparamfwd = getenv("MCC_NOPARAMFWD") != 0;
         opt_noauto = getenv("MCC_NOAUTO") != 0;
         opt_nolicm = getenv("MCC_NOLICM") != 0;
         opt_autolog = getenv("MCC_AUTOLOG") != 0;

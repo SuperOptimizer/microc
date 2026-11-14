@@ -149,12 +149,13 @@ static u32 nmem;
 
 static int is_pure(int op)
 {
-    return (op >= OP_ADD && op <= OP_ASMOUT) && op != OP_SDIV && op != OP_UDIV && op != OP_SREM && op != OP_UREM;
+    return ((op >= OP_ADD && op <= OP_ASMOUT) || op == OP_VSPLAT) && op != OP_SDIV && op != OP_UDIV && op != OP_SREM &&
+           op != OP_UREM;
 }
 
 static u32 mem_size(int mem)
 {
-    return mem <= M_8U ? 1 : mem <= M_16U ? 2 : mem == M_32 || mem == M_F32 ? 4 : 8;
+    return M_SIZE(mem);
 }
 
 /* Splits an address into a base value and a constant offset. */
@@ -469,7 +470,12 @@ static void gvn(void)
             case OP_CALL:
             case OP_MEMCPY:
             case OP_MEMZERO:
+            case OP_VSTORE:
                 nmem = 0;
+                continue;
+            case OP_XI:
+                if (i->flags & XI_EFFECT)
+                    nmem = 0;
                 continue;
             case OP_SELECT: {
                 u64 cv;
@@ -524,6 +530,8 @@ static void gvn(void)
                 continue;
             }
             }
+            if (i->op == OP_VSPLAT)
+                goto number;
             if (!(i->op >= OP_ADD && i->op <= OP_ASMOUT))
                 continue;
             n0 = f->nins;
@@ -554,7 +562,7 @@ static void gvn(void)
                     break;
                 }
                 if (oi->op == i->op && oi->ty == i->ty && oi->a == i->a && oi->b == i->b &&
-                    (i->op != OP_SELECT || oi->c == i->c)) {
+                    (i->op != OP_SELECT || oi->c == i->c) && oi->mem == i->mem) { /* (vectors: mem = lane kind) */
                     if (oi->blk && dominates(oi->blk, b))
                         ir_replace(f, v, o);
                     else
@@ -1569,7 +1577,8 @@ static int licm(void)
             }
             for (v = f->blk[b].first; v; v = f->ins[v].next) {
                 Ins *i = &f->ins[v];
-                if (i->op == OP_CALL || i->op == OP_MEMCPY || i->op == OP_MEMZERO) {
+                if (i->op == OP_CALL || i->op == OP_MEMCPY || i->op == OP_MEMZERO || i->op == OP_VSTORE ||
+                    (i->op == OP_XI && (i->flags & XI_EFFECT))) {
                     clobbers_all = 1;
                 } else if (i->op == OP_STORE) {
                     if (nstores == 16) {

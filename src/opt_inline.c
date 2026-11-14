@@ -27,6 +27,7 @@ typedef struct Body {
     u8 ret_ty;
     u8 has_sret;
     u8 variadic;
+    u8 avx;
     u8 always; /* always_inline */
     u32 copies;
     u32 size; /* instructions */
@@ -107,6 +108,7 @@ static Body *body_copy(Func *f)
     y->ret_ty = f->ret_ty;
     y->has_sret = f->has_sret;
     y->variadic = f->variadic;
+    y->avx = f->avx;
     y->copies = f->copies;
     return y;
 }
@@ -225,6 +227,7 @@ static void body_load(Func *f, Body *y, u32 sym)
     f->ret_ty = y->ret_ty;
     f->has_sret = y->has_sret;
     f->variadic = y->variadic;
+    f->avx = y->avx;
     f->copies = y->copies;
     f->sym = sym;
     ir_rehash(f);
@@ -418,6 +421,13 @@ static u32 inline_one(u32 b, u32 v)
                 f->ins[nv].mem = yi->mem;
                 f->ins[nv].loc = dwarf_inline_loc(inst, yi->loc);
                 ir_remove(f, nv); /* ir_call may have placed it in f->cur */
+            } else if (yi->op == OP_XI) {
+                u32 cur = f->cur;
+                f->cur = 0;
+                nv = ir_xi(f, yi->ty, yi->c, y->xargs + yi->a, yi->b);
+                f->cur = cur;
+                f->ins[nv].mem = yi->mem;
+                f->ins[nv].flags = yi->flags;
             } else {
                 nv = ir_raw(f, yi->op, yi->ty, yi->a, yi->b);
                 f->ins[nv].mem = yi->mem;

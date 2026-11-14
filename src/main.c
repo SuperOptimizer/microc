@@ -221,10 +221,6 @@ static int unsupported(const char *a)
 static int hosted;  /* --hosted: the POSIX flavour of the library on this machine */
 static int std_c99; /* -std names C99 or later: restrict is a keyword */
 static int force_cuda; /* -x cuda */
-/* x86-64 instruction set extensions asked for by name (-mavx2, ...): their macros, which select a program's SIMD paths through
-   <immintrin.h> (element by element for now: exact, not fast). -march=native is not such a request: it stays ignored. */
-static unsigned x86_ext;
-enum { XE_SSE41 = 1, XE_AVX = 2, XE_AVX2 = 4, XE_FMA = 8, XE_F16C = 16, XE_BMI2 = 32, XE_AVX512F = 64, XE_AVX512BW = 128 };
 const char *opt_ptx_out;
 char opt_cuda_target[24] = "sm_86"; /* CUDA: the .target of the PTX: the GPU of --cuda-arch */
 static int cuda_arch = 860; /* CUDA: the value of __CUDA_ARCH__; --cuda-arch=N or nvcc's -arch=sm_NN */
@@ -271,6 +267,93 @@ static void sys_temp(const char *out_path, Buf *obj)
     sprintf(path, "%s.mcc%d.o", out_path, nsys_temps++);
     os_write_file(path, obj->p, obj->len, 0);
     sys_obj(path);
+}
+
+/* x86-64 instruction set extensions the code may use (-mavx2, -march=...): what <immintrin.h> users test */
+enum { XF_SSE3 = 1, XF_SSSE3 = 2, XF_SSE41 = 4, XF_SSE42 = 8, XF_POPCNT = 16, XF_AVX = 32, XF_AVX2 = 64, XF_FMA = 128,
+       XF_F16C = 256, XF_BMI = 512, XF_BMI2 = 1024 };
+static u32 x86_feat;
+#define XF_V2 (XF_SSE3 | XF_SSSE3 | XF_SSE41 | XF_SSE42 | XF_POPCNT)
+#define XF_V3 (XF_V2 | XF_AVX | XF_AVX2 | XF_FMA | XF_F16C | XF_BMI | XF_BMI2)
+
+/* those of the processor mcc runs on (-march=native) */
+static u32 x86_native(void)
+{
+#if defined(__x86_64__)
+    unsigned a, b, c, d, r = 0;
+    __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(1), "2"(0));
+    if (c & 1)
+        r |= XF_SSE3;
+    if (c >> 9 & 1)
+        r |= XF_SSSE3;
+    if (c >> 19 & 1)
+        r |= XF_SSE41;
+    if (c >> 20 & 1)
+        r |= XF_SSE42;
+    if (c >> 23 & 1)
+        r |= XF_POPCNT;
+    if (c >> 28 & 1)
+        r |= XF_AVX;
+    if (c >> 12 & 1)
+        r |= XF_FMA;
+    if (c >> 29 & 1)
+        r |= XF_F16C;
+    __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(7), "2"(0));
+    if (b >> 3 & 1)
+        r |= XF_BMI;
+    if (b >> 5 & 1)
+        r |= XF_AVX2;
+    if (b >> 8 & 1)
+        r |= XF_BMI2;
+    (void)a;
+    (void)d;
+    return r;
+#else
+    return 0;
+#endif
+}
+
+/* -m and -march options that name extensions; 0 if a is not one */
+static int x86_option(const char *a)
+{
+    static const struct { const char *name; u32 bits; } ext[] = {
+        {"sse3", XF_SSE3}, {"ssse3", XF_SSSE3 | XF_SSE3}, {"sse4.1", XF_SSE41 | XF_SSSE3 | XF_SSE3},
+        {"sse4.2", XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3}, {"sse4", XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3},
+        {"popcnt", XF_POPCNT}, {"avx", XF_AVX | XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3},
+        {"avx2", XF_AVX2 | XF_AVX | XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3}, {"fma", XF_FMA | XF_AVX},
+        {"f16c", XF_F16C | XF_AVX}, {"bmi", XF_BMI}, {"bmi2", XF_BMI2}};
+    static const char *const v3[] = {"x86-64-v3", "x86-64-v4", "haswell", "broadwell", "skylake", "skylake-avx512",
+        "cascadelake", "icelake-client", "icelake-server", "tigerlake", "alderlake", "raptorlake", "meteorlake",
+        "sapphirerapids", "graniterapids", "znver1", "znver2", "znver3", "znver4", "znver5", 0};
+    u32 k;
+    if (strncmp(a, "-march=", 7) == 0 || strncmp(a, "-mtune=", 7) == 0) {
+        if (a[2] == 't')
+            return 1;
+        if (strcmp(a + 7, "native") == 0)
+            x86_feat = x86_native();
+        else if (strcmp(a + 7, "x86-64-v2") == 0 || strcmp(a + 7, "nehalem") == 0 || strcmp(a + 7, "westmere") == 0)
+            x86_feat = XF_V2;
+        else if (strcmp(a + 7, "x86-64") == 0)
+            x86_feat = 0;
+        else
+            for (k = 0; v3[k]; k++)
+                if (strcmp(a + 7, v3[k]) == 0)
+                    x86_feat = XF_V3;
+        return 1;
+    }
+    if (strncmp(a, "-m", 2) != 0)
+        return 0;
+    for (k = 0; k < sizeof ext / sizeof ext[0]; k++) {
+        if (strcmp(a + 2, ext[k].name) == 0) {
+            x86_feat |= ext[k].bits;
+            return 1;
+        }
+        if (strncmp(a + 2, "no-", 3) == 0 && strcmp(a + 5, ext[k].name) == 0) {
+            x86_feat &= ~ext[k].bits;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void target_macros(void)
@@ -325,43 +408,27 @@ static void target_macros(void)
     if (opt_arch == ARCH_X64) {
         static const char *const no[] = {"__aarch64__", "__AARCH64EL__", "__ARM_64BIT_STATE", "__ARM_ARCH",
             "__ARM_ARCH_ISA_A64", "__CHAR_UNSIGNED__", "__WCHAR_TYPE__", "__WCHAR_MAX__", "__WCHAR_MIN__", 0};
-        /* not __SSE2__ and its like: they promise <emmintrin.h>, and there are no vector types here */
         static const char *const yes[] = {"__x86_64__", "__x86_64", "__amd64__", "__amd64",
             "__SSE_MATH__", "__SSE2_MATH__", "__WCHAR_TYPE__=int", "__WCHAR_MAX__=0x7fffffff",
             "__WCHAR_MIN__=(-__WCHAR_MAX__-1)", 0};
+        static const struct { u32 bit; const char *name; } fm[] = {
+            {XF_SSE3, "__SSE3__"}, {XF_SSSE3, "__SSSE3__"}, {XF_SSE41, "__SSE4_1__"}, {XF_SSE42, "__SSE4_2__"},
+            {XF_POPCNT, "__POPCNT__"}, {XF_AVX, "__AVX__"}, {XF_AVX2, "__AVX2__"}, {XF_FMA, "__FMA__"},
+            {XF_F16C, "__F16C__"}, {XF_BMI, "__BMI__"}, {XF_BMI2, "__BMI2__"}};
         for (k = 0; no[k]; k++)
             pp_undef(no[k]);
         for (k = 0; yes[k]; k++)
             pp_define(yes[k]);
-        if (x86_ext) { /* the baseline the extensions build on */
-            pp_define("__MMX__");
-            pp_define("__SSE__");
-            pp_define("__SSE2__");
-            pp_define("__SSE3__");
-            pp_define("__SSSE3__");
-        }
-        if (x86_ext & XE_SSE41)
-            opt_x64_sse41 = 1; /* the vectoriser may use it */
-        if (x86_ext & XE_SSE41) {
-            pp_define("__SSE4_1__");
-            pp_define("__SSE4_2__");
-        }
-        if (x86_ext & XE_AVX)
-            pp_define("__AVX__");
-        if (x86_ext & XE_AVX2)
-            pp_define("__AVX2__");
-        if (x86_ext & XE_FMA)
-            pp_define("__FMA__");
-        if (x86_ext & XE_F16C)
-            pp_define("__F16C__");
-        if (x86_ext & XE_BMI2) {
-            pp_define("__BMI__");
-            pp_define("__BMI2__");
-        }
-        if (x86_ext & XE_AVX512F)
-            pp_define("__AVX512F__");
-        if (x86_ext & XE_AVX512BW)
-            pp_define("__AVX512BW__");
+        /* <immintrin.h> is mcc's own: SSE and SSE2 always, the rest as the options say */
+        pp_define("__MMX__");
+        pp_define("__SSE__");
+        pp_define("__SSE2__");
+        for (k = 0; k < (int)(sizeof fm / sizeof fm[0]); k++)
+            if (x86_feat & fm[k].bit)
+                pp_define(fm[k].name);
+        opt_avx = (x86_feat & XF_AVX) != 0;
+        opt_f16c = (x86_feat & XF_F16C) != 0;
+        opt_x64_sse41 = (x86_feat & XF_SSE41) != 0; /* the vectoriser may use it */
     }
     if (opt_size)
         pp_define("__OPTIMIZE_SIZE__");
@@ -477,10 +544,10 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-MD") == 0 || strcmp(a, "-MMD") == 0 || strcmp(a, "-Wp,-MMD") == 0 ||
                  strcmp(a, "-Wp,-MD") == 0)
             want_deps = 1;
+        else if (x86_option(a))
+            ; /* instruction set extensions: the macros that say so */
         else if (strcmp(a, "-MP") == 0 || strcmp(a, "-pthread") == 0)
             ; /* phony targets for the headers: make does not need them */
-        else if (strcmp(a, "-march=native") == 0)
-            opt_x64_sse41 = x64_cpu_has("sse4_1"); /* the vectoriser's instructions only: no feature macros (see x86_ext) */
         else if (strcmp(a, "-MF") == 0 && i + 1 < argc)
             dep_path = argv[++i];
         else if ((strcmp(a, "-MT") == 0 || strcmp(a, "-MQ") == 0) && i + 1 < argc)
@@ -634,24 +701,6 @@ static int cc_main(const char *argv0, int argc, char **argv)
             pp_system_dir(argv[++i]);
         else if (strcmp(a, "-include") == 0 && i + 1 < argc)
             pp_force_include(argv[++i]);
-        else if (strcmp(a, "-msse4.1") == 0 || strcmp(a, "-msse4.2") == 0)
-            x86_ext |= XE_SSE41;
-        else if (strcmp(a, "-mavx") == 0)
-            x86_ext |= XE_SSE41 | XE_AVX;
-        else if (strcmp(a, "-mavx2") == 0)
-            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2;
-        else if (strcmp(a, "-mfma") == 0)
-            x86_ext |= XE_FMA;
-        else if (strcmp(a, "-mf16c") == 0)
-            x86_ext |= XE_F16C;
-        else if (strcmp(a, "-mbmi2") == 0)
-            x86_ext |= XE_BMI2;
-        else if (strcmp(a, "-mavx512f") == 0)
-            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_AVX512F;
-        else if (strcmp(a, "-mavx512bw") == 0)
-            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_AVX512F | XE_AVX512BW;
-        else if (strcmp(a, "-march=x86-64-v3") == 0)
-            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_BMI2;
         else if (strncmp(a, "-g", 2) == 0 && strcmp(a, "-g0") != 0 && strncmp(a, "-gsplit", 7) != 0 &&
                  strncmp(a, "-gno-", 5) != 0)
             opt_debug = 1; /* -g, -g3, -ggdb, -gdwarf-5, -gline-tables-only ...: all the same here */

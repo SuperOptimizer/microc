@@ -6,10 +6,14 @@
 
 /* Value types. Narrow integers exist only in memory accesses. */
 enum { IT_VOID, IT_I32, IT_I64, IT_F32, IT_F64,
-       IT_V128 /* 128-bit vector; the lane kind is in Ins.mem (made by opt_vec.c only) */ };
+       IT_V128, /* 128-bit vector; the lane kind is in Ins.mem (opt_vec.c; x86-64 intrinsics and vector types) */
+       IT_V256  /* 256-bit vector (x86-64 AVX only) */ };
+#define IT_ISVEC(t) ((t) == IT_V128 || (t) == IT_V256)
 
 /* Memory access kinds for OP_LOAD / OP_STORE. */
-enum { M_8S, M_8U, M_16S, M_16U, M_32, M_64, M_F32, M_F64 };
+enum { M_8S, M_8U, M_16S, M_16U, M_32, M_64, M_F32, M_F64,
+       M_V128, M_V256 /* a whole vector (x86-64): the value is IT_V128 / IT_V256; may alias anything */ };
+#define M_SIZE(m) ((m) <= M_8U ? 1u : (m) <= M_16U ? 2u : (m) == M_32 || (m) == M_F32 ? 4u : (m) == M_V128 ? 16u : (m) == M_V256 ? 32u : 8u)
 
 enum {
     OP_NOP,
@@ -64,11 +68,14 @@ enum {
     OP_VGATHER, /* lanes of four bytes: lane k = the element (kind in flags) at a + (b's lane k, sign-extended) << c (a number);
                    x86-64 only (opt_vec.c, with SSE4.1) */
     OP_VMATH, /* lane by lane, b (a number, VM_*) of a: x86-64 only (opt_vec.c makes it from calls of sqrtf and the like) */
+    OP_XI,    /* x86-64 intrinsic: operands xargs[a .. a+b), c (a number) = its index in x86i_tab (x86i.h).
+                 Reads memory when the table says so (gathers); never writes it (stores are OP_STORE) */
     OP_COUNT
 };
 
 enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
 
+#define XI_EFFECT 1 /* OP_XI's flags: it has an effect besides its value (a fence, a prefetch): it stays where it is */
 #define PARAM_GLOBAL 1 /* OP_PARAM's mem: a kernel's pointer, the address of global memory */
 #define IF_SRET 1 /* OP_CALL: first argument is the struct return pointer */
 #define IF_ALLOCA 4 /* OP_CALL: the one argument is a byte count, the result that much new stack */
@@ -160,6 +167,7 @@ typedef struct Func {
     u8 ret_ty;
     u8 has_sret; /* parameter 0 is the struct return pointer; 1 + n: the caller wants the n bytes in x0 and x1 */
     u8 variadic;
+    u8 avx; /* x86-64: compiled for AVX (-mavx2 ..., or target("avx2")): 128-bit vector work in VEX encoding */
     const char *name;
     Arena arena; /* predecessor lists and other per-function data */
 } Func;
@@ -190,6 +198,7 @@ u32 ir_load(Func *f, int ty, int mem, u32 addr);
 void ir_store(Func *f, int mem, u32 addr, u32 val);
 u32 ir_call(Func *f, int ty, u32 callee, const u32 *args, u32 nargs, u32 nfixed, int flags);
 u32 ir_phi(Func *f, u32 blk, int ty); /* arguments filled in later */
+u32 ir_xi(Func *f, int ty, u32 id, const u32 *args, u32 nargs); /* OP_XI, appended to f->cur */
 u32 ir_resolve(Func *f, u32 v);       /* follow OP_COPY chains */
 u32 ir_fold_at(Func *f, u32 v);       /* simplify placed instruction v; returns its replacement or 0 */
 void ir_resolve_all(Func *f);         /* rewrite every operand through OP_COPY */

@@ -1253,7 +1253,9 @@ static void emit_asm(u32 v)
             if (PF->ins[w].op == OP_ASMOUT && PF->ins[w].blk && PF->ins[w].a == v && PF->ins[w].b == 0)
                 unread = 0;
         if (unread && !strncmp(t, "atom.", 5) && (e = strstr(t, " %0, [%1], %2;")) != 0 && !e[14] && e - t < 64 &&
-            !memchr(t, ' ', (size_t)(e - t))) {
+            !memchr(t, ' ', (size_t)(e - t)) && !strstr(t, ".exch") && !strstr(t, ".cas")) {
+            /* red has add / min / max / inc / dec / and / or / xor only: an unread atomicExch stays atom (ptxas: "Illegal
+               operation '.exch' for instruction 'red'", lp_f4wgrad_i0 / i4's gy_unsafe flag) */
             sprintf(red, "red.%.*s [%%1], %%2;", (int)(e - t - 5), t + 5);
             t = red;
         }

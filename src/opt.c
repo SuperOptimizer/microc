@@ -729,6 +729,12 @@ static int cheap_block(u32 b)
                 return 0;
             continue;
         }
+        /* -O3: a little more, so that the vectoriser finds the loop's choices as selects (clamps and the like) */
+        if (opt_level >= 3 && !opt_size) {
+            if (!(is_pure(op) || op == OP_SELECT) || op == OP_FDIV || op == OP_SDIV || op == OP_UDIV || op == OP_SREM || op == OP_UREM || ++n > 4)
+                return 0;
+            continue;
+        }
         if (!is_pure(op) || op == OP_MUL || (op >= OP_FADD && op <= OP_FDIV) || ++n > 2)
             return 0;
     }
@@ -1733,7 +1739,28 @@ static void slot_check(Func *fn, const char *when)
     }
 }
 
+static void run_passes(Func *fn);
+
+/* (what the passes make has no source location of its own: the line table carries on with the one before) */
 void opt_run(Func *fn)
+{
+    u32 saved = ir_loc;
+    ir_loc = 0;
+    run_passes(fn);
+    ir_loc = saved;
+}
+
+static void finish_passes(Func *fn);
+
+void opt_finish(Func *fn)
+{
+    u32 saved = ir_loc;
+    ir_loc = 0;
+    finish_passes(fn);
+    ir_loc = saved;
+}
+
+static void run_passes(Func *fn)
 {
     int round;
     f = fn;
@@ -1795,7 +1822,7 @@ void opt_run(Func *fn)
     }
     if (!(opt_dev_fn && !opt_dolicm) && !(opt_cuda && opt_nolicm) && licm())
         ir_resolve_all(f);
-    if (opt_level >= 3 && !opt_size && !opt_novec && opt_arch != ARCH_X64 && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
+    if (opt_level >= 3 && !opt_size && !opt_novec && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
         opt_dce(f);
         return; /* vector code stays out of the inliner: the scalar passes do not know it */
     }
@@ -1805,7 +1832,7 @@ void opt_run(Func *fn)
     inline_save(f);
 }
 
-void opt_finish(Func *fn)
+static void finish_passes(Func *fn)
 {
     /* what is still not known to be constant is taken not to be */
     u32 v, n = 0;

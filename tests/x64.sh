@@ -14,6 +14,8 @@ S=tests/${SUITE:-c}
 T=build/x64test
 R=${X64_DIR:-/root/x64}/t
 CC="$D/mcc --target=x86_64-linux-gnu"
+# mcc's own C library unless GLIBC says otherwise (an mcc built on a glibc machine defaults to glibc)
+[ -n "$GLIBC" ] || CC="$CC -mno-glibc"
 if [ -z "$X64_SSH" ]; then
     echo "tests/x64.sh: set X64_SSH (how to reach an x86-64 Linux machine, or \"local\")"; exit 1
 fi

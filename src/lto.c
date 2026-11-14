@@ -45,9 +45,12 @@ void lto_save(Func *f, Obj *o)
     stamp++;
     sym_slot(o, &syms, f->sym);
     memcpy(copy, f->ins, f->nins * sizeof(Ins));
-    for (v = 1; v < f->nins; v++)
+    for (v = 1; v < f->nins; v++) {
         if (copy[v].op == OP_ADDR)
             copy[v].a = sym_slot(o, &syms, copy[v].a);
+        copy[v].loc = 0; /* source locations mean nothing outside this compilation */
+        copy[v].var = 0;
+    }
     nsym = (u32)(syms.len / sizeof(u32));
     for (b = 1; b < f->nblk; b++)
         npreds += f->blk[b].npreds;
@@ -296,6 +299,7 @@ static void count_uses(void)
 static void emit_late(u32 n)
 {
     load(&fns[n]);
+    opt_obj = M;
     opt_run(F);
     arm64_gen(F, M);
     fns[n].state = 2;
@@ -308,6 +312,7 @@ static void compile(u32 n)
     /* a function with one call site is inlined there even when large, and
        then needs no code of its own */
     opt_inline_once = fn->ncalls == 1 && !fn->escapes;
+    opt_obj = M;
     opt_run(F);
     if (!fn->escapes && inline_saved(F->sym)) {
         /* every call may get inlined; code is generated later if one is not */

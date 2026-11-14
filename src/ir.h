@@ -61,8 +61,11 @@ enum {
     OP_VSUM,   /* the lanes of a combined into a scalar; flags: 0 sum, 1-4 as the next four, 5/6 sum of unsigned/signed lanes into a wider total */
     OP_VSMAX, OP_VSMIN, OP_VUMAX, OP_VUMIN, /* lane by lane */
     OP_VIOTA, /* 0, a, 2a, ... in the lanes; a is a number, not a value */
+    OP_VMATH, /* lane by lane, b (a number, VM_*) of a: x86-64 only (opt_vec.c makes it from calls of sqrtf and the like) */
     OP_COUNT
 };
+
+enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
 
 #define PARAM_GLOBAL 1 /* OP_PARAM's mem: a kernel's pointer, the address of global memory */
 #define IF_SRET 1 /* OP_CALL: first argument is the struct return pointer */
@@ -110,6 +113,8 @@ typedef struct Ins {
     u32 blk; /* 0: not placed */
     u32 prev, next;
     u32 aux; /* scratch for passes */
+    u32 loc; /* source location it was made for (-g: line tables), 0 if none */
+    u32 var; /* -g: 1 + the stack slot of the variable whose value this is (opt_promote), else 0 */
 } Ins;
 
 enum { TERM_NONE, TERM_JMP, TERM_BR, TERM_RET };
@@ -173,6 +178,7 @@ u32 ir_add_param(Func *f, int ty); /* returns the OP_PARAM value */
 int ir_is_const(Func *f, u32 v, u64 *val); /* integer constant */
 int ir_is_fconst(Func *f, u32 v, double *val);
 
+extern u32 ir_loc; /* the source location new instructions are given: the parser's token; 0 while optimising */
 u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b); /* create, do not place */
 void ir_append(Func *f, u32 blk, u32 v);
 void ir_insert_before(Func *f, u32 pos, u32 v);
@@ -226,6 +232,10 @@ extern int opt_inline_limit;
 extern int opt_level;
 extern int opt_fast_math;
 extern int opt_vec_report;
+extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */
+extern Obj *opt_obj;    /* opt_vec.c: the object the functions being optimised go to (for the names of what they call) */
+extern int opt_math_errno; /* x64.c: sqrt is a call, for errno (-fno-math-errno, -ffast-math: in line) */
+int x64_cpu_has(const char *flag); /* main.c: the machine mcc runs on has it (/proc/cpuinfo) */
 extern int opt_size; /* prefer smaller code where it costs speed */
 extern int opt_fp_contract; /* -ffp-contract=fast: a * b + c is rounded once (arm64.c: fmadd) */
 extern int opt_no_jump_tables; /* -fno-jump-tables: a switch stays a tree of comparisons (arm64.c) */

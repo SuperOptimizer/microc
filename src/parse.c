@@ -236,18 +236,47 @@ static int sv_pending, sv_has; /* the next statement is asked for its value; it 
 
 /* Loop conditions are parsed twice (once to guard the loop, once at its
    bottom), so their tokens are recorded and played back. */
+/* Recordings nest: a loop condition can call a lambda (or a function read in place) whose body has loops of its own,
+   and an initializer with an inferred type is recorded while it may do the same. rec / nrec / caprec are the
+   innermost recording; the enclosing ones wait in rec_outer and are given every token too. Each recording has an
+   id (rec_ids counts them); a token put back by replay() carries the last id given out (playgen), and is taken
+   again only by recordings that started after it was put back: those that were running had it already. */
 static Token *rec, *play;
 static u32 nrec, caprec, nplay, iplay, capplay;
-static u32 play_quiet; /* so many of the tokens to be replayed next were put there during a recording: not recorded */
+static u32 *playgen;
 static int recording;
+static u32 rec_id, rec_ids;
+typedef struct RecLevel {
+    Token *rec;
+    u32 nrec, caprec, id;
+} RecLevel;
+static RecLevel rec_outer[32];
+static u32 nrec_outer;
+
+static void rec_add(Token **b, u32 *n, u32 *cap, const Token *t)
+{
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *b = (Token *)xrealloc(*b, *cap * sizeof(Token));
+    }
+    (*b)[(*n)++] = *t;
+}
+
+/* The token t, put back when recording id gen was the last started (0: read from the source), to every recording
+   that does not have it yet. */
+static void rec_put_gen(const Token *t, u32 gen)
+{
+    u32 k;
+    if (rec_id > gen)
+        rec_add(&rec, &nrec, &caprec, t);
+    for (k = 0; k < nrec_outer; k++)
+        if (rec_outer[k].id > gen)
+            rec_add(&rec_outer[k].rec, &rec_outer[k].nrec, &rec_outer[k].caprec, t);
+}
 
 static void rec_put(const Token *t)
 {
-    if (nrec == caprec) {
-        caprec = caprec ? caprec * 2 : 64;
-        rec = (Token *)xrealloc(rec, caprec * sizeof(Token));
-    }
-    rec[nrec++] = *t;
+    rec_put_gen(t, 0);
 }
 
 static Token pushback;
@@ -274,11 +303,10 @@ static u32 attrq_n, attrq_i;
 static void fetch(Token *t)
 {
     if (iplay < nplay) {
-        *t = play[iplay++];
-        if (play_quiet)
-            play_quiet--;
-        else if (recording)
-            rec_put(t);
+        *t = play[iplay];
+        if (recording)
+            rec_put_gen(t, playgen[iplay]);
+        iplay++;
         return;
     }
     for (;;) {
@@ -394,6 +422,7 @@ static void next(void)
     } else {
         fetch(&tok);
     }
+    ir_loc = tok.loc; /* what is made now is for this place in the source (-g) */
 }
 
 static Token *peek(void)
@@ -408,10 +437,22 @@ static Token *peek(void)
 /* Starts recording at the current token. */
 static void rec_start(void)
 {
+    if (recording) {
+        if (nrec_outer == sizeof rec_outer / sizeof rec_outer[0])
+            error_at(tok.loc, "loops and inferred types nested too deeply");
+        rec_outer[nrec_outer].rec = rec;
+        rec_outer[nrec_outer].nrec = nrec;
+        rec_outer[nrec_outer].caprec = caprec;
+        rec_outer[nrec_outer++].id = rec_id;
+        rec = 0;
+        caprec = 0;
+    }
     nrec = 0;
-    rec_put(&tok);
+    rec_id = ++rec_ids;
+    /* the current token (and the one looked at) were read before: the enclosing recordings have them */
+    rec_add(&rec, &nrec, &caprec, &tok);
     if (has_ptok)
-        rec_put(&ptok);
+        rec_add(&rec, &nrec, &caprec, &ptok);
     recording = 1;
 }
 
@@ -419,28 +460,44 @@ static void rec_start(void)
 static Token *rec_stop(u32 n)
 {
     Token *t = (Token *)arena_alloc(&A, (n ? n : 1) * sizeof(Token));
-    recording = 0;
-    play_quiet = 0;
     memcpy(t, rec, n * sizeof(Token));
+    if (nrec_outer) {
+        free(rec);
+        nrec_outer--;
+        rec = rec_outer[nrec_outer].rec;
+        nrec = rec_outer[nrec_outer].nrec;
+        caprec = rec_outer[nrec_outer].caprec;
+        rec_id = rec_outer[nrec_outer].id;
+    } else {
+        recording = 0;
+        rec_id = 0;
+    }
     return t;
 }
 
 /* Makes the n tokens at t the next ones read; the current token follows them. */
 static void replay(const Token *t, u32 n)
 {
-    u32 rest = nplay - iplay, need = n + 2 + rest, k = 0;
+    u32 rest = nplay - iplay, need = n + 2 + rest, k = 0, j;
     Token *b = (Token *)xmalloc(need * sizeof(Token));
+    u32 *g = (u32 *)xmalloc((need ? need : 1) * sizeof(u32));
     memcpy(b, t, n * sizeof(Token));
     k = n;
     b[k++] = tok;
     if (has_ptok)
         b[k++] = ptok;
+    /* what is put back here is not new to the recordings running now (a second reading of a recording
+       will be given these again); recordings started later take it */
+    for (j = 0; j < k; j++)
+        g[j] = rec_ids;
     memcpy(b + k, play + iplay, rest * sizeof(Token));
+    if (rest)
+        memcpy(g + k, playgen + iplay, rest * sizeof(u32));
     k += rest;
-    if (recording)
-        play_quiet += k - rest; /* a second reading of the recording will be given these again */
     free(play);
+    free(playgen);
     play = b;
+    playgen = g;
     capplay = need;
     nplay = k;
     iplay = 0;
@@ -572,8 +629,13 @@ static Sym *new_sym(u32 name, int kind, Type *ty)
     return s;
 }
 
+static int binding_params; /* -g: the parameters of the function being defined are bound */
+static int inl_on(void);
+
 static Sym *bind(Sym *s)
 {
+    if (opt_debug && s->local && s->kind == SK_VAR && s->name && F == fn_func && !inl_on() && !s->cv)
+        dwarf_var(F->sym, s->name, s->ty, s->slot, binding_params, s->byref, tok.loc);
     names_reserve(s->name);
     s->level = level;
     s->shadow = idents[s->name];
@@ -2399,6 +2461,11 @@ static struct Inl {
     int cx;     /* evaluating a constexpr function: branches on constants are followed, not compiled */
     Expr val;
 } inl;
+
+static int inl_on(void)
+{
+    return inl.on;
+}
 
 static Sym *cv_lvalue; /* the constant whose address the expression being read takes */
 static Expr *call_pre; /* arguments read before the function was known, for the next call() */
@@ -4546,6 +4613,47 @@ static int cx_try(Expr *e, Sym *f, Expr *av, u32 n)
     return 1;
 }
 
+/* A function type with a parameter that is a lambda that captures: its instances are only ever read in place. */
+static int lam_param(Type *fty)
+{
+    u32 k;
+    for (k = 0; fty && fty->kind == TY_FUNC && k < fty->nparams; k++)
+        if (LAM(fty->params[k]) && LAM(fty->params[k])->captures)
+            return 1;
+    return 0;
+}
+
+/* A function template called with a lambda that captures: its instance is read in place of the call, so that the
+   lambda, read again where the template calls it, still sees the locals it captured (a function of its own would not). */
+static int lam_try(Expr *e, Sym *f, Expr *av, u32 n)
+{
+    u32 k;
+    int any = 0;
+    Hide saved = hide;
+    Hide none;
+    Token *body;
+    u32 nbody;
+    if (!f->itm || f->cls || !f->itm->has_body || f->iti->spec || n != f->ty->nparams || f->ty->variadic)
+        return 0;
+    for (k = 0; k < n; k++)
+        if (LAM(av[k].ty) && LAM(av[k].ty)->captures)
+            any = 1;
+    if (!any)
+        return 0;
+    body = f->itm->toks + f->itm->nhead;
+    nbody = f->itm->ntoks - f->itm->nhead;
+    memset(&none, 0, sizeof none);
+    hide = f->itm->hide;
+    hide_push(0, level);
+    push_scope();
+    bind_targs(f->itm, &f->iti->args, f->iti->args.n);
+    inline_run(e, f->ty, 0, 0, body, nbody, f->ty->base->kind == TY_REF ? 0 : unqual(f->ty->base), av, n, 0);
+    pop_scope();
+    hide = saved;
+    (void)none;
+    return 1;
+}
+
 static void launch_config(u32 loc);
 static Sym *ctor_set(Type *t);
 static void ctor_call(Expr *e, Sym *set, Expr *av, u32 n, u32 loc);
@@ -4665,6 +4773,8 @@ fcall:
             n = parse_args(av, 64);
             f = overload_pick(s, has_given ? &given : 0, av, n, loc);
             if (!lc.on && cx_try(e, f, av, n))
+                return 1;
+            if (!lc.on && lam_try(e, f, av, n))
                 return 1;
             launch = lc;
         }
@@ -9790,6 +9900,9 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     F->name = intern_str(s->name);
     cur_fn_name = F->name;
     F->sym = sym_obj(s);
+    if (opt_debug)
+        dwarf_func_loc(F->sym, loc, ty->base);
+    ir_loc = loc;
     cur_fn_dev = opt_cuda && (s->aflags & (AT_GLOBAL | AT_DEVICE)) != 0;
     cur_fn_kernel = cur_fn_dev && (s->aflags & AT_GLOBAL) != 0;
     opt_dev_parse = cur_fn_dev && ((s->aflags & AT_GLOBAL) || !(s->aflags & AT_HOST)); /* (not what is host code as well) */
@@ -9905,8 +10018,11 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             else
                 cur_named_gr++;
         }
-        if (p->name)
+        if (p->name) {
+            binding_params = 1;
             bind(p);
+            binding_params = 0;
+        }
     }
     expect(T_LBRACE);
     compound(0);
@@ -10069,7 +10185,7 @@ static void cxx_flush(void)
             replay(p->lam->body, p->lam->nbody);
             def_extern_inline = 0;
             func_def(p->fn, fty, tok.loc);
-        } else if (!p->ti->spec && !p->ti->ext && !p->fn->defined) {
+        } else if (!p->ti->spec && !p->ti->ext && !p->fn->defined && !lam_param(p->fn->ty)) {
             Hide saved = hide;
             hide = p->t->hide;
             push_scope();
@@ -10116,6 +10232,7 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     Sym *s;
     O = o;
     ptx_obj = o;
+    opt_obj = o;
     opt_dump_ir = dump_ir;
     nasm_stmts = 0; /* the texts and operand lists of the last file are not reclaimed */
     while (nheld) {
@@ -10130,6 +10247,8 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
         gas_begin(o);
     if (opt_prof_gen)
         prof_begin(o);
+    if (opt_debug)
+        dwarf_reset(path);
     arena_reset(&A);
     type_init(&A);
     if (names_cap) {
@@ -10145,6 +10264,9 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     has_ptok = 0;
     nplay = iplay = 0;
     recording = 0;
+    rec_id = 0;
+    while (nrec_outer)
+        free(rec_outer[--nrec_outer].rec);
     ndeferred = 0;
     if (nlazy)
         memset(lazy, 0, nlazy * sizeof(LazyFn));
@@ -10290,4 +10412,7 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     naliased = 0;
     if (opt_prof_gen)
         prof_end();
+    if (opt_debug && opt_target == TARGET_LINUX && !opt_dump_ir && !opt_syntax_only && !opt_lto)
+        dwarf_finish(O);
+    ir_loc = 0;
 }

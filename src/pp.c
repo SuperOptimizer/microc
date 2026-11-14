@@ -63,7 +63,7 @@ static const char **inc_dirs;
 static u32 ninc_dirs;
 static const char **sys_dirs, **forced; /* -isystem, searched after the -I directories; -include */
 static u32 nsys_dirs, nforced;
-static u32 counter, id_va_args, id_include_next, id_warning;
+static u32 counter, id_va_args, id_include_next, id_warning, id_embed;
 static const char *prefix_old, *prefix_new;
 int pp_asm; /* assembly is being preprocessed: quotes need not balance, '#' need not stringify */
 static Buf predef;
@@ -1090,10 +1090,36 @@ static void do_include(u32 loc, int next)
     }
     if (namelen == 0)
         error_at(loc, "empty file name in #include");
-    f = find_include(name, namelen, angled, next, &found);
+    f = find_include(name, namelen, angled, next == 1, &found);
     if (!f)
         error_at(loc, "cannot find include file '%.*s'", (int)namelen, name);
     buf_free(&b);
+    if (next == 2) {
+        /* C23 #embed "file" (no parameters): the file's bytes as a list of integer constants, read as a source of its own */
+        size_t len, k;
+        u8 *raw = os_read_file(f->name, &len);
+        Buf t;
+        char num[8], *ename;
+        if (!raw)
+            error_at(loc, "cannot read '%s' for #embed", f->name);
+        memset(&t, 0, sizeof t);
+        for (k = 0; k < len; k++) {
+            sprintf(num, k + 1 < len ? "%u," : "%u", (unsigned)raw[k]);
+            buf_put(&t, num, strlen(num));
+            if ((k & 31) == 31)
+                buf_u8(&t, '\n');
+        }
+        buf_u8(&t, '\n');
+        free(raw);
+        ename = (char *)xmalloc(strlen(f->name) + 9);
+        sprintf(ename, "<embed %s>", f->name);
+        f = src_buffer(ename, (const char *)t.p, t.len);
+        buf_free(&t);
+        push_inc(f, loc);
+        cur->dir = 0;
+        cur->sys = 1;
+        return;
+    }
     if (f->once == pp_unit || (f->guard && macro_get(f->guard)))
         return;
     {
@@ -1152,6 +1178,8 @@ static void directive(u32 loc)
         do_define(d.loc);
     } else if (d.v == id_include || d.v == id_include_next) {
         do_include(d.loc, d.v == id_include_next);
+    } else if (d.v == id_embed) {
+        do_include(d.loc, 2);
     } else if (d.v == id_ifdef || d.v == id_ifndef) {
         int def;
         if (!dir_tok(&t) || t.kind != T_IDENT)
@@ -1378,6 +1406,7 @@ void pp_init(void)
     id_va_args = intern_cstr("__VA_ARGS__");
     id_include_next = intern_cstr("include_next");
     id_warning = intern_cstr("warning");
+    id_embed = intern_cstr("embed");
     counter = 0;
     if (macros)
         memset(macros, 0, macros_cap * sizeof(Macro *));

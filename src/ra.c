@@ -22,6 +22,8 @@ static u32 nrg, caprg;
 static u32 *head;   /* first range of each interval, 0 = none */
 static u32 *cursor; /* first range not entirely before the current position */
 static u32 *iv_end;
+static u32 *dense_map; /* after ra_run: virtual register (less VREG0) as selected -> as allocated, or NOREG */
+static u32 dense_n;
 
 static void range_add(RangeList *l, u32 start, u32 end)
 {
@@ -157,6 +159,26 @@ static int fixed_conflict(u32 pr, u32 r)
     return 0;
 }
 
+/* Debug information, after ra_run: the number a virtual register (VREG0 + r as instruction selection made it)
+   was allocated under (an index of MFunc.loc), or NOREG if it is not used. */
+u32 ra_dense(u32 r)
+{
+    return r < dense_n && head ? dense_map[r] : NOREG;
+}
+
+/* ... and the positions where it is live (see the numbering above), earliest first; returns how many ranges
+   there are, of which the first max are stored. */
+u32 ra_ranges(u32 d, u32 *start, u32 *end, u32 max)
+{
+    u32 r, n = 0;
+    for (r = head ? head[d] : 0; r; r = rg_next[r], n++)
+        if (n < max) {
+            start[n] = rg_start[r];
+            end[n] = rg_end[r];
+        }
+    return n;
+}
+
 void ra_run(MFunc *m, const MTarget *t)
 {
     u32 nv = m->nvreg, words, b, i, k, v, maxfreq;
@@ -208,12 +230,16 @@ void ra_run(MFunc *m, const MTarget *t)
             DENSE(in->s2)
         }
 #undef DENSE
+        dense_map = map;
+        dense_n = nv;
         memcpy(m->vclass, cls, n);
         m->nvreg = nv = n;
     }
     m->loc = (u32 *)xrealloc(m->loc, (nv + 1) * sizeof(u32));
-    if (nv == 0)
+    if (nv == 0) {
+        head = 0;
         return;
+    }
 
 #define NEW(type, n) ((type *)arena_alloc_raw(&arena, (size_t)(n) * sizeof(type)))
     arena_reset(&arena);

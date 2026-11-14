@@ -27,6 +27,16 @@ enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, 
 #define XF_SCALE(f) ((f) >> 4 & 3) /* log2 of the index scale */
 #define XF_SCALE_SHIFT 4
 
+/* an opcode: the byte, then what goes before it */
+#define O_0F 0x100       /* the 0f escape */
+#define O_66 0x660000    /* a prefix */
+#define O_F2 0xf20000
+#define O_F3 0xf30000
+#define O_B8R 0x1000000  /* the reg field names a byte register */
+#define O_B8M 0x2000000  /* the r/m field names a byte register */
+#define O_38 0x4000000   /* 0f 38 (SSSE3, SSE4.1) */
+#define O_3A 0x8000000   /* 0f 3a */
+
 /* parameter kinds beyond the IT_* codes (Func.param_ty), set by the front end */
 #define PT_BLK 0x80  /* the parameter is a block on the stack that starts here; its value is the address */
 #define PT_PAD 0x40  /* eight more bytes of the block before */
@@ -62,7 +72,19 @@ enum {
     X_MFENCE, X_UD2,
     X_VASAVE,                /* variadic function: the argument registers go to slot sym */
     X_ASM,                   /* inline assembly: imm = index of the AsmStmt */
-    X_DEFREG                 /* no code: d is written by the instruction before */
+    X_DEFREG,                /* no code: d is written by the instruction before */
+    /* 128-bit vectors (SSE2, SSE4.1 where opt_x64_sse41 allows), from opt_vec.c. Vector registers are never spilled. */
+    X_VBIN,   /* d = s0 op s1: imm = the opcode (O_* bits), with an immediate byte imm >> 32 & 0xff if bit 40 is set; w: they commute */
+    X_VUN,    /* d = op s0 (op d, s0 [, imm8], d not read): imm as for X_VBIN */
+    X_VSHI,   /* d = s0 shifted: imm = the opcode, cc = its /digit, sym = the count */
+    X_VSEL,   /* d = s0 ? s1 : s2, bit by bit */
+    X_VPAIR,  /* d = the general registers s0 (low half) and s1 (high half) */
+    X_VSPLAT, /* d = the scalar s0 (w: in an xmm register) in every lane; cc = lane kind */
+    X_VSUM,   /* scalar d = the lanes of s0 combined; cc = lane kind, imm = OP_VSUM's flags */
+    X_VLD,    /* d = [s0 + s1]; w: four elements of the narrow kind cc there, widened to 32 bits */
+    X_VST,    /* [s1 + s2] = s0; w: its four 32-bit lanes narrowed to the kind cc */
+    X_VONES,  /* d = all ones (imm 1: all zeros) */
+    X_FUN     /* scalar d = a function of the scalar s0, done in line (sel_math): cc says how, imm the opcode */
 };
 
 /* conditions: the processor's own, then two that take two tests after a
@@ -112,6 +134,8 @@ static u32 va_slot;   /* variadic function: the register save area */
 static u32 *alink;    /* inline assembly call -> its first OP_ASMOUT -> the next; made when first needed */
 static u64 asm_saved; /* registers written by inline assembly */
 static u32 fn_serial;
+/* -g: the source location of each machine instruction, and of the IR instruction being selected */
+static u32 *mloc, capmloc, sel_loc;
 
 /* ---- machine IR construction ---- */
 
@@ -121,6 +145,13 @@ static MIns *emit(int op, int w, u32 d, u32 s0, u32 s1)
     if (mf.n == mf.cap) {
         mf.cap = mf.cap ? mf.cap * 2 : 1024;
         mf.ins = (MIns *)xrealloc(mf.ins, mf.cap * sizeof(MIns));
+    }
+    if (opt_debug) {
+        if (mf.n >= capmloc) {
+            capmloc = mf.cap;
+            mloc = (u32 *)xrealloc(mloc, capmloc * sizeof(u32));
+        }
+        mloc[mf.n] = sel_loc;
     }
     i = &mf.ins[mf.n++];
     i->op = (u16)op;
@@ -155,6 +186,12 @@ static int is_fp(int ty)
 static int is_w(int ty)
 {
     return ty == IT_I64 || ty == IT_F64;
+}
+
+/* register class: bit 0 = an xmm register, bit 1 = all 128 bits of it matter (ra.c never spills such a one) */
+static int cls_of(int ty)
+{
+    return ty == IT_V128 ? 3 : is_fp(ty);
 }
 
 static int fits32(i64 v)
@@ -218,7 +255,7 @@ static u32 reg_of(u32 v)
         return VREG0 + v;
     if (cache_blk[v] == cur_blk)
         return cache_reg[v];
-    r = new_vreg(is_fp(f->ins[v].ty));
+    r = new_vreg(cls_of(f->ins[v].ty));
     materialise(v, r);
     cache_blk[v] = cur_blk;
     cache_reg[v] = r;
@@ -672,6 +709,57 @@ static void sel_atomic(u32 v)
         emit(X_MOV, 1, d, RAX, NOREG);
 }
 
+int opt_math_errno = 1; /* sqrt of a negative number sets errno (as the C library's does): not done in line; -fno-math-errno */
+
+/* A call of one of the mathematical library's functions that one instruction does: in line. A function of that name
+   defined in this file is the program's own and is called. */
+static int sel_math(u32 v)
+{
+    static const struct { const char *name; u8 how; u8 sse41; u8 errno_; u32 op; u8 imm; } fns[] = {
+        { "sqrt", 0, 0, 1, O_F2 | O_0F | 0x51, 0 },
+        { "fabs", 1, 0, 0, 0, 0 },
+        { "floor", 0, 1, 0, O_66 | O_0F | O_3A | 0x0b, 9 },   /* roundsd: down, no inexact */
+        { "ceil", 0, 1, 0, O_66 | O_0F | O_3A | 0x0b, 10 },
+        { "trunc", 0, 1, 0, O_66 | O_0F | O_3A | 0x0b, 11 },
+        { "nearbyint", 0, 1, 0, O_66 | O_0F | O_3A | 0x0b, 12 }, /* the current rounding, no inexact */
+        { "rint", 0, 1, 0, O_66 | O_0F | O_3A | 0x0b, 4 },
+        { "lrint", 2, 0, 0, O_F2 | O_0F | 0x2d, 0 },          /* cvtsd2si: the current rounding */
+        { "llrint", 2, 0, 0, O_F2 | O_0F | 0x2d, 0 },
+        { 0, 0, 0, 0, 0, 0 }
+    };
+    Ins *i = &f->ins[v];
+    const char *nm;
+    u32 sym, x, k;
+    size_t bl;
+    int isf;
+    MIns *m;
+    if (f->ins[i->c].op != OP_ADDR || f->ins[i->c].b || i->b != 1 || (i->flags & (IF_SRET | IF_ASM | IF_ATOMIC | IF_ALLOCA)))
+        return 0;
+    sym = f->ins[i->c].a;
+    if (obj->syms[sym].sec != SEC_UNDEF && obj->syms[sym].sec != SEC_NONE)
+        return 0;
+    nm = intern_str(obj->syms[sym].name);
+    x = f->xargs[i->a];
+    bl = strlen(nm);
+    isf = bl > 1 && nm[bl - 1] == 'f';
+    if (f->ins[x].ty != (isf ? IT_F32 : IT_F64))
+        return 0;
+    for (k = 0; fns[k].name; k++)
+        if (strlen(fns[k].name) == bl - (size_t)isf && strncmp(nm, fns[k].name, bl - (size_t)isf) == 0)
+            break;
+    if (!fns[k].name || (fns[k].sse41 && !opt_x64_sse41) || (fns[k].errno_ && opt_math_errno))
+        return 0;
+    if (fns[k].how == 2 ? i->ty != IT_I64 && i->ty != IT_I32 : i->ty != f->ins[x].ty)
+        return 0;
+    m = emit(X_FUN, fns[k].how == 2 ? i->ty == IT_I64 : !isf, VREG0 + v, reg_of(x), NOREG);
+    m->cc = fns[k].how;
+    m->imm = (i64)fns[k].op | (i64)fns[k].imm << 32;
+    if (isf && fns[k].how != 1)
+        m->imm = (m->imm & ~(i64)0xff00ff) | (fns[k].how == 0 && fns[k].sse41 ? (O_66 | 0x0a) : (O_F3 | (fns[k].op & 0xff)));
+    m->sym = isf; /* the argument is single precision */
+    return 1;
+}
+
 static void sel_call(u32 v)
 {
     Ins *i = &f->ins[v];
@@ -695,6 +783,8 @@ static void sel_call(u32 v)
         sel_atomic(v);
         return;
     }
+    if (sel_math(v))
+        return;
     if (i->flags & IF_ALLOCA) {
         k = (u32)f->ins[i->c].a; /* 0: take stack, 1: the stack pointer, 2: set it */
         m = k == 2 ? emit(X_ALLOCA, 1, NOREG, reg_of(f->xargs[i->a]), NOREG)
@@ -788,6 +878,248 @@ static void sel_call(u32 v)
         emit(X_MOV, 1, VREG0 + v, is_fp(i->ty) ? XMM0 : RAX, NOREG);
 }
 
+/* ---- vectors (opt_vec.c's IT_V128 values) ---- */
+
+#define VP66 (O_66 | O_0F)
+#define VIMM(b) ((i64)1 << 40 | (i64)(u8)(b) << 32)
+
+static int lane_bytes(int k)
+{
+    return mem_bytes[k];
+}
+
+static u32 vbin(u32 d, i64 code, u32 a, u32 b, int commut)
+{
+    MIns *m = emit(X_VBIN, commut, d, a, b);
+    m->imm = code;
+    return d;
+}
+
+static u32 vtmp(void)
+{
+    return new_vreg(3);
+}
+
+/* a vector of two 64-bit constants */
+static u32 vconst(u32 d, u64 lo, u64 hi)
+{
+    u32 a, b;
+    MIns *m;
+    if (lo == hi && (lo == 0 || lo == ~(u64)0)) {
+        m = emit(X_VONES, 0, d, NOREG, NOREG);
+        m->imm = lo == 0;
+        return d;
+    }
+    a = new_vreg(0);
+    b = new_vreg(0);
+    m = emit(X_MOVI, 1, a, NOREG, NOREG);
+    m->imm = (i64)lo;
+    m = emit(X_MOVI, 1, b, NOREG, NOREG);
+    m->imm = (i64)hi;
+    emit(X_VPAIR, 0, d, a, b);
+    return d;
+}
+
+/* every lane of lane kind k with the constant c */
+static u32 vsplat_const(u32 d, int k, u64 c)
+{
+    int n = lane_bytes(k);
+    u64 x = n == 8 ? c : n == 4 ? (c & 0xffffffffU) * 0x100000001UL : n == 2 ? (c & 0xffff) * 0x0001000100010001UL : (c & 0xff) * 0x0101010101010101UL;
+    return vconst(d, x, x);
+}
+
+static u32 vnot(u32 d, u32 a)
+{
+    u32 t = vtmp();
+    emit(X_VONES, 0, t, NOREG, NOREG);
+    return vbin(d, VP66 | 0xef, a, t, 1); /* pxor */
+}
+
+/* the opcode of pmaxub and its like for lanes of n bytes */
+static i64 minmax_code(int op, int n)
+{
+    static const u32 codes[3][4] = {
+        /* smax smin umax umin */
+        { O_38 | 0x3c, O_38 | 0x38, 0xde, 0xda },        /* bytes */
+        { 0xee, 0xea, O_38 | 0x3e, O_38 | 0x3a },        /* words */
+        { O_38 | 0x3d, O_38 | 0x39, O_38 | 0x3f, O_38 | 0x3b }, /* dwords */
+    };
+    return VP66 | codes[n == 1 ? 0 : n == 2 ? 1 : 2][op - OP_VSMAX];
+}
+
+static void sel_vec(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u32 d = VREG0 + v, ra, rb;
+    int k = i->mem, n = lane_bytes(k), fl = k == M_F32 || k == M_F64, sh = n == 1 ? 0 : n == 2 ? 1 : n == 4 ? 2 : 3;
+    MIns *m;
+    switch (i->op) {
+    case OP_VLOAD:
+        m = emit(X_VLD, (i->flags & 0x80) != 0, d, reg_of(i->a), reg_of(i->b));
+        m->cc = i->flags & 0x7f;
+        return;
+    case OP_VSTORE:
+        m = emit(X_VST, (i->flags & 0x80) != 0, NOREG, reg_of(i->b), reg_of(i->a));
+        m->s2 = reg_of(i->c);
+        m->cc = i->flags & 0x7f;
+        return;
+    case OP_VSPLAT: {
+        u64 c;
+        if (ir_is_const(f, i->a, &c)) {
+            vsplat_const(d, k, c);
+            return;
+        }
+        if (f->ins[i->a].op == OP_FCONST) {
+            c = (u64)f->ins[i->a].a | (u64)f->ins[i->a].b << 32;
+            vsplat_const(d, k, k == M_F32 ? c & 0xffffffffU : c);
+            return;
+        }
+        m = emit(X_VSPLAT, is_fp(f->ins[i->a].ty), d, reg_of(i->a), NOREG);
+        m->cc = (u8)k;
+        return;
+    }
+    case OP_VIOTA: {
+        u64 st = (u64)(i64)(i32)i->a;
+        if (n == 8)
+            vconst(d, 0, st);
+        else
+            vconst(d, (st & 0xffffffffU) << 32, ((st * 2) & 0xffffffffU) | ((st * 3) & 0xffffffffU) << 32);
+        return;
+    }
+    case OP_VSUM:
+        m = emit(X_VSUM, 0, d, reg_of(i->a), NOREG);
+        m->cc = (u8)k;
+        m->imm = i->flags;
+        return;
+    case OP_SELECT:
+        m = emit(X_VSEL, 0, d, reg_of(i->a), reg_of(i->b));
+        m->s2 = reg_of(i->c);
+        return;
+    case OP_SHL: case OP_SHR: case OP_SAR: {
+        /* psllw pslld psllq, psrlw ..., psraw psrad: 66 0f 71..73 /6 /2 /4 */
+        m = emit(X_VSHI, 0, d, reg_of(i->a), NOREG);
+        m->imm = VP66 | (0x70 + sh);
+        m->cc = i->op == OP_SHL ? 6 : i->op == OP_SHR ? 2 : 4;
+        m->sym = f->ins[i->b].a;
+        return;
+    }
+    case OP_VMATH: {
+        /* sqrtps sqrtpd; roundps roundpd: down 9, up 10, toward zero 11, the current way 4 (12: without inexact) */
+        static const u8 rnd[6] = { 0, 9, 10, 11, 4, 12 };
+        m = emit(X_VUN, 0, d, reg_of(i->a), NOREG);
+        m->imm = i->b == VM_SQRT ? (n == 8 ? VP66 : O_0F) | 0x51 : VP66 | O_3A | (n == 8 ? 0x09 : 0x08) | VIMM(rnd[i->b]);
+        return;
+    }
+    case OP_SITOF: /* cvtdq2ps */
+    case OP_FTOSI: /* cvttps2dq */
+        m = emit(X_VUN, 0, d, reg_of(i->a), NOREG);
+        m->imm = (i->op == OP_SITOF ? 0 : O_F3) | O_0F | 0x5b;
+        return;
+    case OP_NEG: {
+        static const u8 psub[4] = { 0xf8, 0xf9, 0xfa, 0xfb };
+        u32 z = vtmp();
+        ra = reg_of(i->a);
+        m = emit(X_VONES, 0, z, NOREG, NOREG);
+        m->imm = 1; /* zeros */
+        vbin(d, VP66 | psub[sh], z, ra, 0);
+        return;
+    }
+    case OP_FNEG: {
+        u32 t = vtmp();
+        ra = reg_of(i->a);
+        vsplat_const(t, k, k == M_F32 ? 0x80000000U : 0x8000000000000000UL);
+        vbin(d, VP66 | 0xef, ra, t, 1);
+        return;
+    }
+    default:
+        break;
+    }
+    ra = reg_of(i->a);
+    rb = reg_of(i->b);
+    switch (i->op) {
+    case OP_ADD: {
+        static const u8 padd[4] = { 0xfc, 0xfd, 0xfe, 0xd4 };
+        vbin(d, VP66 | padd[sh], ra, rb, 1);
+        return;
+    }
+    case OP_SUB: {
+        static const u8 psub[4] = { 0xf8, 0xf9, 0xfa, 0xfb };
+        vbin(d, VP66 | psub[sh], ra, rb, 0);
+        return;
+    }
+    case OP_MUL: vbin(d, n == 2 ? VP66 | 0xd5 : VP66 | O_38 | 0x40, ra, rb, 1); return; /* pmullw, pmulld */
+    case OP_AND: vbin(d, VP66 | 0xdb, ra, rb, 1); return;
+    case OP_OR: vbin(d, VP66 | 0xeb, ra, rb, 1); return;
+    case OP_XOR: vbin(d, VP66 | 0xef, ra, rb, 1); return;
+    case OP_FADD: vbin(d, (n == 8 ? VP66 : O_0F) | 0x58, ra, rb, 1); return;
+    case OP_FSUB: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5c, ra, rb, 0); return;
+    case OP_FMUL: vbin(d, (n == 8 ? VP66 : O_0F) | 0x59, ra, rb, 1); return;
+    case OP_FDIV: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5e, ra, rb, 0); return;
+    case OP_VSMAX: case OP_VSMIN: case OP_VUMAX: case OP_VUMIN:
+        vbin(d, minmax_code(i->op, n), ra, rb, 1);
+        return;
+    case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE: {
+        /* cmpps / cmppd: 0 eq, 1 lt, 2 le, 4 neq (true where unordered, as != is) */
+        int p = i->op == OP_FEQ ? 0 : i->op == OP_FNE ? 4 : i->op == OP_FLT || i->op == OP_FGT ? 1 : 2;
+        if (i->op == OP_FGT || i->op == OP_FGE) {
+            u32 t = ra;
+            ra = rb;
+            rb = t;
+        }
+        vbin(d, (n == 8 ? VP66 : O_0F) | 0xc2 | VIMM(p), ra, rb, p == 0 || p == 4);
+        return;
+    }
+    default:
+        break;
+    }
+    if (i->op >= OP_EQ && i->op <= OP_UGE) {
+        /* pcmpeq, pcmpgt: "less" is "greater" turned round, "or equal" the opposite of the strict one turned round;
+           without sign, both flipped in the top bit first */
+        static const u8 peq[3] = { 0x74, 0x75, 0x76 }, pgt[3] = { 0x64, 0x65, 0x66 };
+        int op = i->op, sw = 0, neg = 0;
+        if (op == OP_EQ || op == OP_NE) {
+            if (op == OP_NE) {
+                u32 t = vtmp();
+                vbin(t, VP66 | peq[sh], ra, rb, 1);
+                vnot(d, t);
+            } else {
+                vbin(d, VP66 | peq[sh], ra, rb, 1);
+            }
+            return;
+        }
+        if (op >= OP_ULT) {
+            u32 bias = vtmp(), x = vtmp(), y = vtmp();
+            vsplat_const(bias, k, (u64)1 << (8 * n - 1));
+            vbin(x, VP66 | 0xef, ra, bias, 1);
+            vbin(y, VP66 | 0xef, rb, bias, 1);
+            ra = x;
+            rb = y;
+            op += OP_SLT - OP_ULT;
+        }
+        switch (op) {
+        case OP_SGT: break;
+        case OP_SLT: sw = 1; break;
+        case OP_SGE: sw = 1; neg = 1; break; /* a >= b: not (b > a) */
+        default: neg = 1; break;              /* a <= b: not (a > b) */
+        }
+        if (sw) {
+            u32 t = ra;
+            ra = rb;
+            rb = t;
+        }
+        if (neg) {
+            u32 t = vtmp();
+            vbin(t, VP66 | pgt[sh], ra, rb, 0);
+            vnot(d, t);
+        } else {
+            vbin(d, VP66 | pgt[sh], ra, rb, 0);
+        }
+        return;
+    }
+    (void)fl;
+    die("internal: x86-64 vector instruction selection: op %d in %s", i->op, f->name);
+}
+
 static void sel_ins(u32 v)
 {
     Ins *i = &f->ins[v];
@@ -797,8 +1129,10 @@ static void sel_ins(u32 v)
     MIns *m;
     Addr a;
 
-    if (i->ty == IT_V128 || i->op == OP_VSTORE || i->op == OP_VSUM)
-        die("%s: vector operations are not supported for x86-64", f->name);
+    if (i->ty == IT_V128 || i->op == OP_VSTORE || i->op == OP_VSUM) {
+        sel_vec(v);
+        return;
+    }
 
     switch (i->op) {
     case OP_PARAM:
@@ -1084,7 +1418,7 @@ static void sel_phi_moves(u32 b, u32 s)
     for (p = sb->phis; p; p = f->ins[p].next) {
         u32 src = f->xargs[f->ins[p].a + pred], t = NOREG;
         if (src != p && f->ins[src].op == OP_PHI && f->ins[src].blk == s) {
-            t = new_vreg(is_fp(f->ins[src].ty));
+            t = new_vreg(cls_of(f->ins[src].ty));
             emit(X_MOV, 1, t, VREG0 + src, NOREG);
         }
         buf_put(&tmp, &t, sizeof t);
@@ -1691,7 +2025,7 @@ static void select_all(void)
         mf.vclass = (u8 *)xrealloc(mf.vclass, mf.capvreg);
     }
     for (v = 0; v < f->nins; v++)
-        mf.vclass[v] = (u8)is_fp(f->ins[v].ty);
+        mf.vclass[v] = (u8)cls_of(f->ins[v].ty);
     mf.nvreg = f->nins;
     if (mf.capblk < nlayout) {
         mf.capblk = nlayout * 2;
@@ -1776,8 +2110,11 @@ static void select_all(void)
                 }
             }
         }
-        for (v = bb->first; v; v = f->ins[v].next)
+        for (v = bb->first; v; v = f->ins[v].next) {
+            if (f->ins[v].loc)
+                sel_loc = f->ins[v].loc;
             sel_ins(v);
+        }
         sel_term(b, k + 1 < nlayout ? layout[k + 1] : 0);
         mb->n = mf.n - mb->first;
         mb->nsucc = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
@@ -1803,14 +2140,40 @@ static u32 nfixups, capfixups;
 static u32 spill_base, frame_size;
 static u64 saved_regs;
 static int has_frame;
+/* -g: line table rows (offsets in the section, locations) and frame events of the function being encoded */
+static u32 *row_off, *row_loc, nrow, caprow;
+static DwCfi *cfi;
+static u32 ncfi, capcfi;
 
-/* an opcode: the byte, then what goes before it */
-#define O_0F 0x100       /* the 0f escape */
-#define O_66 0x660000    /* a prefix */
-#define O_F2 0xf20000
-#define O_F3 0xf30000
-#define O_B8R 0x1000000  /* the reg field names a byte register */
-#define O_B8M 0x2000000  /* the r/m field names a byte register */
+static u32 *moff, capmoff; /* -g: where each machine instruction starts (moff[mf.n]: where the last ends) */
+
+static void cfi_event(int op, u32 reg, u32 n)
+{
+    if (!opt_debug)
+        return;
+    if (ncfi == capcfi) {
+        capcfi = capcfi ? capcfi * 2 : 16;
+        cfi = (DwCfi *)xrealloc(cfi, capcfi * sizeof(DwCfi));
+    }
+    cfi[ncfi].off = (u32)text->len;
+    cfi[ncfi].op = (u8)op;
+    cfi[ncfi].reg = (u8)reg;
+    cfi[ncfi].n = (u8)n;
+    ncfi++;
+}
+
+static void row_add(u32 loc)
+{
+    if (nrow == caprow) {
+        caprow = caprow ? caprow * 2 : 256;
+        row_off = (u32 *)xrealloc(row_off, caprow * sizeof(u32));
+        row_loc = (u32 *)xrealloc(row_loc, caprow * sizeof(u32));
+    }
+    row_off[nrow] = (u32)text->len;
+    row_loc[nrow] = loc;
+    nrow++;
+}
+
 
 typedef struct EA {
     u32 base, idx; /* registers or NOREG */
@@ -1852,6 +2215,10 @@ static void op_prefix(u32 op, int w, u32 reg, u32 idx, u32 base)
         b1(0x40 | rex);
     if (op & O_0F)
         b1(0x0f);
+    if (op & O_38)
+        b1(0x38);
+    if (op & O_3A)
+        b1(0x3a);
     b1(op);
 }
 
@@ -2085,13 +2452,16 @@ static void prologue(void)
     if (!has_frame)
         return;
     b1(0x55);              /* push rbp */
+    cfi_event(CFI_PUSHFP, 0, 0);
     op_rr(0x89, 1, RSP, RBP); /* mov rbp, rsp */
+    cfi_event(CFI_SETFP, 0, 0);
     if (frame_size)
         alu_ri(5, 1, RSP, frame_size);
     for (k = 0; k < 16; k++)
         if (saved_regs >> k & 1) {
             ea_base(&ea, RBP, -(i64)(8 * ++n));
             store_reg(k, &ea);
+            cfi_event(CFI_SAVE, k, 2 + n); /* rbp - 8n is the frame's address - 16 - 8n */
         }
 }
 
@@ -2106,8 +2476,11 @@ static void epilogue(void)
                 load_reg(k, &ea);
             }
         b1(0xc9); /* leave */
+        cfi_event(CFI_EPI, 0, 0);
     }
     b1(0xc3);
+    if (has_frame)
+        cfi_event(CFI_RESTORE, 0, 0); /* code after the return is in the frame again */
 }
 
 /* The memory operand of a load or store whose base and index are s1 and s2 of the instruction given
@@ -2220,12 +2593,275 @@ static void bin_mem(MIns *i, u32 opc, int fp)
 
 static void asm_emit(MIns *i);
 
+/* the register of vector register r, which is never spilled */
+static u32 vloc(u32 r)
+{
+    u32 l = loc_of(r);
+    if (l == NOREG || is_spill(l))
+        die("internal: x86-64: a vector value was not given a register in %s", f->name);
+    return l;
+}
+
+/* op reg, rm [, imm8] for a code as X_VBIN keeps it */
+static void vop_rr(i64 code, u32 reg, u32 rm)
+{
+    op_rr((u32)code, 0, reg, rm);
+    if (code >> 40 & 1)
+        b1((u32)(code >> 32) & 0xff);
+}
+
+static void vop_ri(u32 code, u32 reg, u32 rm, u32 imm8)
+{
+    op_rr(code, 0, reg, rm);
+    b1(imm8);
+}
+
+/* the scalar d (general or xmm register, maybe spilled) = the low lane of the xmm register x; gp: a general register */
+static void vsum_put(MIns *i, u32 x, int gp, int w)
+{
+    u32 l = loc_of(i->d), r;
+    EA ea;
+    if (!gp) {
+        if (is_spill(l)) {
+            ea_spill(&ea, l);
+            store_reg(x, &ea);
+        } else {
+            mov_rr(l, x);
+        }
+        return;
+    }
+    r = is_spill(l) ? SCR0 : l;
+    op_rr(O_66 | O_0F | 0x7e, w, x, r); /* movd / movq r, x */
+    if (i->cc == M_16U && i->imm == 5)
+        alu_ri(0, 0, r, 8 * 32768); /* the bias taken off each lane below */
+    fin(i->d, r);
+}
+
+static void encode_vec(MIns *i)
+{
+    u32 dr, a, b, x;
+    EA ea;
+    switch (i->op) {
+    case X_VBIN: {
+        u32 al = vloc(i->s0), bl = vloc(i->s1);
+        dr = vloc(i->d);
+        if (bl == dr && al != dr) {
+            if (i->w) {
+                bl = al;
+                al = dr;
+            } else {
+                mov_rr(FSCR1, bl);
+                bl = FSCR1;
+            }
+        }
+        mov_rr(dr, al);
+        vop_rr(i->imm, dr, bl);
+        return;
+    }
+    case X_VUN:
+        vop_rr(i->imm, vloc(i->d), vloc(i->s0));
+        return;
+    case X_VSHI:
+        dr = vloc(i->d);
+        mov_rr(dr, vloc(i->s0));
+        vop_ri((u32)i->imm, i->cc, dr, i->sym);
+        return;
+    case X_VSEL:
+        /* (mask & s1) | (~mask & s2), put together in the scratch registers: d may be any of the three */
+        a = vloc(i->s0);
+        mov_rr(FSCR0, a);
+        op_rr(O_66 | O_0F | 0xdb, 0, FSCR0, vloc(i->s1)); /* pand */
+        mov_rr(FSCR1, a);
+        op_rr(O_66 | O_0F | 0xdf, 0, FSCR1, vloc(i->s2)); /* pandn */
+        op_rr(O_66 | O_0F | 0xeb, 0, FSCR0, FSCR1);       /* por */
+        mov_rr(vloc(i->d), FSCR0);
+        return;
+    case X_VPAIR:
+        dr = vloc(i->d);
+        op_loc(O_66 | O_0F | 0x6e, 1, FSCR0, loc_of(i->s1)); /* movq */
+        op_loc(O_66 | O_0F | 0x6e, 1, dr, loc_of(i->s0));
+        op_rr(O_66 | O_0F | 0x6c, 0, dr, FSCR0); /* punpcklqdq */
+        return;
+    case X_VONES:
+        dr = vloc(i->d);
+        op_rr(O_66 | O_0F | (i->imm ? 0xef : 0x76), 0, dr, dr); /* pxor, pcmpeqd */
+        return;
+    case X_VSPLAT: {
+        u32 sl = loc_of(i->s0);
+        int k = i->cc;
+        dr = vloc(i->d);
+        if (i->w) {
+            mov_loc(dr, sl);
+            if (k == M_F32)
+                vop_ri(O_0F | 0xc6, dr, dr, 0); /* shufps */
+            else
+                op_rr(O_66 | O_0F | 0x14, 0, dr, dr); /* unpcklpd */
+            return;
+        }
+        op_loc(O_66 | O_0F | 0x6e, k == M_64, dr, sl); /* movd / movq */
+        if (k == M_64) {
+            op_rr(O_66 | O_0F | 0x6c, 0, dr, dr); /* punpcklqdq */
+            return;
+        }
+        if (mem_bytes[k] == 1)
+            op_rr(O_66 | O_0F | 0x60, 0, dr, dr); /* punpcklbw */
+        if (mem_bytes[k] <= 2)
+            op_rr(O_66 | O_0F | 0x61, 0, dr, dr); /* punpcklwd */
+        vop_ri(O_66 | O_0F | 0x70, dr, dr, 0);     /* pshufd */
+        return;
+    }
+    case X_VLD:
+    case X_VST: {
+        int ld = i->op == X_VLD;
+        b = use(ld ? i->s0 : i->s1, SCR0);
+        x = use(ld ? i->s1 : i->s2, SCR1);
+        ea_base(&ea, b, 0);
+        ea.idx = x;
+        if ((x & 7) == 4 && x < 16) { /* rsp cannot be an index */
+            ea.base = x;
+            ea.idx = b;
+        }
+        if (!i->w) {
+            op_mem(O_F3 | O_0F | (ld ? 0x6f : 0x7f), 0, ld ? vloc(i->d) : vloc(i->s0), &ea, 0); /* movdqu */
+            return;
+        }
+        {
+            int byte = mem_bytes[i->cc] == 1, sgn = i->cc == M_8S || i->cc == M_16S;
+            if (!ld) {
+                /* each lane's low bits, sign-extended so that the saturating packs keep them as they are */
+                u32 t = FSCR0;
+                mov_rr(t, vloc(i->s0));
+                vop_ri(O_66 | O_0F | 0x72, 6, t, byte ? 24 : 16); /* pslld */
+                vop_ri(O_66 | O_0F | 0x72, 4, t, byte ? 24 : 16); /* psrad */
+                op_rr(O_66 | O_0F | 0x6b, 0, t, t);                /* packssdw */
+                if (byte) {
+                    op_rr(O_66 | O_0F | 0x63, 0, t, t); /* packsswb */
+                    op_mem(O_66 | O_0F | 0x7e, 0, t, &ea, 0); /* movd */
+                } else {
+                    op_mem(O_66 | O_0F | 0xd6, 0, t, &ea, 0); /* movq */
+                }
+                return;
+            }
+            dr = vloc(i->d);
+            if (opt_x64_sse41) {
+                /* pmovzxbd pmovsxbd pmovzxwd pmovsxwd */
+                op_mem(O_66 | O_0F | O_38 | (byte ? (sgn ? 0x21 : 0x31) : (sgn ? 0x23 : 0x33)), 0, dr, &ea, 0);
+                return;
+            }
+            if (byte)
+                op_mem(O_66 | O_0F | 0x6e, 0, dr, &ea, 0); /* movd */
+            else
+                op_mem(O_F3 | O_0F | 0x7e, 0, dr, &ea, 0); /* movq */
+            if (sgn) {
+                if (byte)
+                    op_rr(O_66 | O_0F | 0x60, 0, dr, dr);       /* punpcklbw: each byte doubled */
+                op_rr(O_66 | O_0F | 0x61, 0, dr, dr);           /* punpcklwd */
+                vop_ri(O_66 | O_0F | 0x72, 4, dr, byte ? 24 : 16); /* psrad */
+            } else {
+                op_rr(O_66 | O_0F | 0xef, 0, FSCR0, FSCR0);
+                if (byte)
+                    op_rr(O_66 | O_0F | 0x60, 0, dr, FSCR0);
+                op_rr(O_66 | O_0F | 0x61, 0, dr, FSCR0);
+            }
+        }
+        return;
+    }
+    case X_VSUM: {
+        u32 v = vloc(i->s0), T = FSCR0, U = FSCR1;
+        int k = i->cc, fl = (int)i->imm;
+        u32 add = k == M_F32 ? O_0F | 0x58 : k == M_F64 ? O_66 | O_0F | 0x58 : k == M_64 ? O_66 | O_0F | 0xd4 : O_66 | O_0F | 0xfe;
+        if (fl >= 1 && fl <= 4) {
+            static const u32 across[5] = { 0, O_38 | 0x3d, O_38 | 0x39, O_38 | 0x3f, O_38 | 0x3b }; /* pmaxsd pminsd pmaxud pminud */
+            add = O_66 | O_0F | across[fl];
+        }
+        if (fl >= 5) {
+            if (mem_bytes[k] == 1 && fl == 5) {
+                op_rr(O_66 | O_0F | 0xef, 0, T, T);      /* pxor */
+                op_rr(O_66 | O_0F | 0xf6, 0, T, v);      /* psadbw: two sums of eight */
+            } else {
+                if (mem_bytes[k] == 1) {
+                    /* signed bytes: widened to words (each byte doubled, then shifted down with its sign) */
+                    mov_rr(T, v);
+                    op_rr(O_66 | O_0F | 0x60, 0, T, T);  /* punpcklbw */
+                    vop_ri(O_66 | O_0F | 0x71, 4, T, 8); /* psraw 8 */
+                    mov_rr(U, v);
+                    op_rr(O_66 | O_0F | 0x68, 0, U, U);  /* punpckhbw */
+                    vop_ri(O_66 | O_0F | 0x71, 4, U, 8);
+                    op_rr(O_66 | O_0F | 0xfd, 0, T, U);  /* paddw */
+                    op_rr(O_66 | O_0F | 0x75, 0, U, U);  /* pcmpeqw */
+                } else {
+                    op_rr(O_66 | O_0F | 0x75, 0, U, U);
+                    mov_rr(T, v);
+                    if (fl == 5) {
+                        /* without sign: each word less 32768, which pmaddwd then reads right; added back at the end */
+                        vop_ri(O_66 | O_0F | 0x71, 6, U, 15); /* psllw 15 */
+                        op_rr(O_66 | O_0F | 0xef, 0, T, U);
+                    }
+                }
+                vop_ri(O_66 | O_0F | 0x71, 2, U, 15); /* psrlw 15: ones */
+                op_rr(O_66 | O_0F | 0xf5, 0, T, U);   /* pmaddwd: four sums of two */
+                vop_ri(O_66 | O_0F | 0x70, U, T, 0x4e);
+                op_rr(O_66 | O_0F | 0xfe, 0, U, T);
+                vop_ri(O_66 | O_0F | 0x70, T, U, 0xb1);
+                op_rr(O_66 | O_0F | 0xfe, 0, T, U);
+                vsum_put(i, T, 1, 0);
+                return;
+            }
+            vop_ri(O_66 | O_0F | 0x70, U, T, 0x4e); /* pshufd */
+            op_rr(O_66 | O_0F | 0xfe, 0, U, T);     /* paddd */
+            vsum_put(i, U, 1, 0);
+            return;
+        }
+        /* halves, then (four lanes) quarters */
+        vop_ri(O_66 | O_0F | 0x70, T, v, 0x4e);
+        op_rr(add, 0, T, v);
+        if (k == M_64 || k == M_F64) {
+            vsum_put(i, T, k == M_64, 1);
+            return;
+        }
+        vop_ri(O_66 | O_0F | 0x70, U, T, 0xb1);
+        op_rr(add, 0, U, T);
+        vsum_put(i, U, k != M_F32, 0);
+        return;
+    }
+    case X_FUN: {
+        /* how 0: op d, s (sqrtsd, roundsd: d's upper half is whatever it was); 1: fabs; 2: cvtsd2si into a general register */
+        u32 sl = loc_of(i->s0);
+        if (i->cc == 2) {
+            dr = dst(i->d, SCR0);
+            op_loc((u32)i->imm, i->w, dr, sl);
+            fin(i->d, dr);
+            return;
+        }
+        dr = dst(i->d, FSCR0);
+        if (i->cc == 1) {
+            mov_ri(SCR0, i->sym ? 0x7fffffffU : 0x7fffffffffffffffUL, 1);
+            op_rr(O_66 | O_0F | 0x6e, 1, FSCR1, SCR0); /* movq */
+            mov_loc(dr, sl);
+            op_rr(O_66 | O_0F | 0x54, 0, dr, FSCR1); /* andpd */
+        } else {
+            op_loc((u32)i->imm, 0, dr, sl);
+            if ((i->imm & 0xff) == 0x0a || (i->imm & 0xff) == 0x0b)
+                b1((u32)(i->imm >> 32) & 0xff);
+        }
+        fin(i->d, dr);
+        return;
+    }
+    default:
+        die("internal: x86-64 vector encoding");
+    }
+}
+
 static void encode(MIns *i)
 {
     u32 dr, a, b, x, n;
     EA ea;
     int w = i->w;
 
+    if (i->op >= X_VBIN) {
+        encode_vec(i);
+        return;
+    }
     switch (i->op) {
     case X_DEFREG:
         return;
@@ -3150,20 +3786,143 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
             bi++;
         r->off -= cut[bi];
     }
+    for (k = 0, bi = 0; k < nrow; k++) {
+        while (bi < nfixups && fx_start(&fixups[bi]) < row_off[k])
+            bi++;
+        row_off[k] -= cut[bi];
+    }
+    for (k = 0, bi = 0; k < ncfi; k++) {
+        while (bi < nfixups && fx_start(&fixups[bi]) < cfi[k].off)
+            bi++;
+        cfi[k].off -= cut[bi];
+    }
+    if (opt_debug)
+        for (k = 0, bi = 0; k <= mf.n; k++) {
+            while (bi < nfixups && fx_start(&fixups[bi]) < moff[k])
+                bi++;
+            moff[k] -= cut[bi];
+        }
     free(cut);
     free(nb);
+}
+
+/* -g: a DWARF expression for where machine location l (a register or a spill slot) is; byref: the variable
+   is in memory at the address held there */
+static u32 place_expr(u8 *e, u32 l, int byref)
+{
+    u32 n = 0, dw;
+    i64 off;
+    if (l >= SPILL0) {
+        off = -(i64)(spill_base + 8 * (l - SPILL0 + 1)) - 16; /* rbp is the frame's address - 16 */
+        e[n++] = 0x91;                                        /* DW_OP_fbreg */
+        do {
+            u32 byte = (u32)(off & 0x7f);
+            off >>= 7;
+            if ((off == 0 && !(byte & 0x40)) || (off == -1 && (byte & 0x40))) {
+                e[n++] = (u8)byte;
+                break;
+            }
+            e[n++] = (u8)(byte | 0x80);
+        } while (1);
+        if (byref)
+            e[n++] = 0x06; /* DW_OP_deref */
+        return n;
+    }
+    if (l < 16) {
+        static const u8 dwreg[16] = {0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15};
+        dw = dwreg[l];
+    } else if (l >= XMM0 && l < XMM0 + 16) {
+        dw = 17 + l - XMM0;
+    } else {
+        return 0;
+    }
+    if (byref) {
+        e[n++] = (u8)(0x70 + dw); /* DW_OP_bregN 0 */
+        e[n++] = 0;
+    } else {
+        e[n++] = (u8)(0x50 + dw); /* DW_OP_regN */
+    }
+    return n;
+}
+
+/* -g: where the function's variables are. Those still in a stack slot are there throughout; for the others,
+   each value that was the variable's (opt_promote marked them) is where the allocator put it, wherever it is
+   live. Positions of the allocator are turned into code offsets through the instructions' offsets. */
+static void var_places(u32 start)
+{
+    u32 k, v, b, i, nslot = mf.n + mf.nblk + 1, *ss, *se, *byslot, cap = 64, *rs, *re;
+    if (!dwarf_vars(f->sym))
+        return;
+    byslot = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32));
+    memset(byslot, 0, (f->nslots + 1) * sizeof(u32));
+    for (k = dwarf_vars(f->sym); k; k = dwarf_var_next(k)) {
+        u32 sl = dwarf_var_slot(k);
+        if (sl >= f->nslots)
+            continue;
+        byslot[sl] = k;
+        if (f->slots[sl].size && has_frame)
+            dwarf_var_frame(k, f->slots[sl].off - 16);
+    }
+    ss = (u32 *)xmalloc(nslot * sizeof(u32));
+    se = (u32 *)xmalloc(nslot * sizeof(u32));
+    memset(ss, 0, nslot * sizeof(u32));
+    memset(se, 0, nslot * sizeof(u32));
+    for (b = 0; b < mf.nblk; b++) {
+        MBlock *mb = &mf.blk[b];
+        for (i = mb->first; i < mb->first + mb->n; i++) {
+            ss[i + b] = moff[i] - start;
+            se[i + b] = moff[i + 1] - start;
+        }
+        ss[mb->first + mb->n + b] = se[mb->first + mb->n + b] = moff[mb->first + mb->n] - start;
+    }
+    rs = (u32 *)xmalloc(cap * sizeof(u32));
+    re = (u32 *)xmalloc(cap * sizeof(u32));
+    for (v = 1; v < f->nins; v++) {
+        Ins *in = &f->ins[v];
+        u32 d, l, n, len, sl;
+        u8 e[12];
+        if (!in->var || !in->blk || (sl = in->var - 1) >= f->nslots || !byslot[sl])
+            continue;
+        d = ra_dense(v);
+        if (d == NOREG || (l = mf.loc[d]) == NOREG)
+            continue;
+        len = place_expr(e, l, dwarf_var_byref(byslot[sl]));
+        if (!len)
+            continue;
+        n = ra_ranges(d, rs, re, cap);
+        if (n > cap) {
+            cap = n;
+            rs = (u32 *)xrealloc(rs, cap * sizeof(u32));
+            re = (u32 *)xrealloc(re, cap * sizeof(u32));
+            ra_ranges(d, rs, re, cap);
+        }
+        for (i = 0; i < n; i++) {
+            /* a position: 2s + 2 reads in slot s, 2s + 3 writes there (so the value is there after it) */
+            u32 a = rs[i] & 1 ? (rs[i] - 1) / 2 : (rs[i] - 2) / 2, z = re[i] < 2 ? 0 : (re[i] - 2) / 2;
+            if (a >= nslot - 1 || z >= nslot - 1 || z < a)
+                continue;
+            dwarf_var_place(byslot[sl], ss[a], se[z], e, len);
+        }
+    }
+    free(rs);
+    free(re);
+    free(ss);
+    free(se);
+    free(byslot);
 }
 
 void x64_gen(Func *fn, Obj *o)
 {
     u32 k, n, off, start, nsaved, first_rel;
-    u32 *blk_off;
+    u32 *blk_off, saved_loc = ir_loc, last_loc = 0, body_at = 0;
     int has_asm = 0;
 
+    ir_loc = 0;
     opt_finish(fn);
     f = fn;
     obj = o;
     fn_serial++;
+    sel_loc = opt_debug ? dwarf_get_func_loc(f->sym) : 0;
     prepare();
     select_all();
     ra_run(&mf, &target);
@@ -3200,21 +3959,51 @@ void x64_gen(Func *fn, Obj *o)
     o->syms[f->sym].value = start;
 
     first_rel = o->nrel[arm64_text_sec];
+    nrow = ncfi = 0;
+    if (opt_debug && dwarf_get_func_loc(f->sym)) {
+        last_loc = dwarf_get_func_loc(f->sym);
+        row_add(last_loc);
+    }
     prologue();
+    body_at = (u32)text->len;
     blk_off = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));
     nfixups = 0;
+    if (opt_debug && capmoff < mf.n + 1) {
+        capmoff = mf.n + 1;
+        moff = (u32 *)xrealloc(moff, capmoff * sizeof(u32));
+    }
     for (k = 0; k < mf.nblk; k++) {
         MBlock *mb = &mf.blk[k];
         blk_off[k] = (u32)text->len;
         for (n = mb->first; n < mb->first + mb->n; n++) {
             if (mf.ins[n].op == X_ASM)
                 has_asm = 1;
+            if (opt_debug) {
+                moff[n] = (u32)text->len;
+                if (mloc[n] && mloc[n] != last_loc) {
+                    last_loc = mloc[n];
+                    row_add(last_loc);
+                }
+            }
             encode(&mf.ins[n]);
             text = &o->sec[arm64_text_sec];
         }
     }
+    if (opt_debug)
+        moff[mf.n] = (u32)text->len;
     relax(blk_off, first_rel, has_asm);
     o->syms[f->sym].size = text->len - start;
+    if (opt_debug)
+        var_places(start);
+    if (opt_debug) {
+        for (k = 0; k < nrow; k++)
+            row_off[k] -= start;
+        for (k = 0; k < ncfi; k++)
+            cfi[k].off -= start;
+        /* (the first instruction after the prologue: the prologue comes before any jump, so relax left it be) */
+        dwarf_func(f->sym, (u32)(text->len - start), row_off, row_loc, nrow, cfi, ncfi, has_frame ? body_at - start : 0);
+    }
+    ir_loc = saved_loc;
     free(blk_off);
     free(layout);
     free(blk_index);

@@ -67,6 +67,18 @@ keep one register all the way round: copies whose two sides are never alive toge
 before registers are handed out, and an increment written ahead of the last use of the old value
 (`*p++`) is computed after it.
 
+## Debug information
+
+`-g` (any `-g...` but `-g0`; nvcc's `-lineinfo` / `-G` too) on x86-64 Linux adds DWARF 5 to each object:
+`.debug_line` (a row wherever the source location changes, with columns), `.debug_info` (the compile unit
+and each function with its address range), `.debug_rnglists`, and `.eh_frame` frame descriptions of the
+prologues and epilogues, so gdb, perf, addr2line and backtraces see `file:line` and walk the stack. There
+are no variables or types yet. Each IR instruction carries the location of the token the parser was at
+when it was made; what the optimiser makes carries none, and the line table goes on with the one before.
+In CUDA device code `-g` writes `.file` / `.loc` into the PTX, and mcudahw then asks the driver's compiler
+for line information (compute-sanitizer, cuda-gdb). Without `-g` the output is byte-identical. mcc's own
+ELF linker keeps the `.debug_*` sections after the image.
+
 ## Aliasing
 
 The optimiser assumes the C rule that an object is accessed through its own

@@ -1,4 +1,8 @@
 /* Operating system interface. Everything outside ISO C89 lives here. */
+/* glibc hides st_mtim and usleep under -std=c89 unless asked (a native stage-0 build on x86-64 Linux with gcc or clang) */
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
 #include "mcc.h"
 #include <string.h>
 #include <fcntl.h>

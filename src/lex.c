@@ -127,6 +127,8 @@ static SrcFile *src_add(const char *name, char *data, size_t len)
     f->base = next_base;
     f->guard = 0;
     f->once = 0;
+    f->lines = 0;
+    f->nlines = 0;
     f->next = files;
     files = f;
     next_base += (u32)len + 1;
@@ -216,6 +218,61 @@ void loc_decode(u32 loc, const char **file, u32 *line, u32 *col)
     *file = f ? f->name : "<unknown>";
     if (!f)
         return;
+    for (a = line_adjs; a; a = a->next) {
+        if (a->loc <= loc && a->loc >= f->base) {
+            *line = *line - a->at_line + a->line;
+            if (a->name)
+                *file = a->name;
+            return;
+        }
+    }
+}
+
+/* loc_decode by a table of line starts and a search in it, not by counting lines: a line table asks for every
+   instruction's location. */
+void loc_line(u32 loc, const char **file, u32 *line, u32 *col)
+{
+    static SrcFile *last;
+    SrcFile *f = last;
+    LineAdj *a;
+    u32 off, lo, hi;
+    if (!f || loc < f->base || loc > f->base + f->len)
+        for (f = files; f; f = f->next)
+            if (loc >= f->base && loc <= f->base + f->len)
+                break;
+    *line = *col = 0;
+    *file = "<unknown>";
+    if (!f)
+        return;
+    last = f;
+    if (!f->lines) {
+        u32 n = 1, cap = 256;
+        size_t k;
+        f->lines = (u32 *)xmalloc(cap * sizeof(u32));
+        f->lines[0] = 0;
+        for (k = 0; k < f->len; k++)
+            if (f->data[k] == '\n') {
+                if (n == cap) {
+                    cap *= 2;
+                    f->lines = (u32 *)xrealloc(f->lines, cap * sizeof(u32));
+                }
+                f->lines[n++] = (u32)k + 1;
+            }
+        f->nlines = n;
+    }
+    off = loc - f->base;
+    lo = 0;
+    hi = f->nlines;
+    while (hi - lo > 1) {
+        u32 mid = lo + (hi - lo) / 2;
+        if (f->lines[mid] <= off)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    *line = lo + 1;
+    *col = off - f->lines[lo] + 1;
+    *file = f->name;
     for (a = line_adjs; a; a = a->next) {
         if (a->loc <= loc && a->loc >= f->base) {
             *line = *line - a->at_line + a->line;

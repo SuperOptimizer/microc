@@ -45,6 +45,8 @@ void ir_func_reset(Func *f)
     arena_reset(&f->arena);
 }
 
+u32 ir_loc;
+
 u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b)
 {
     Ins *i;
@@ -63,6 +65,8 @@ u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b)
     i->blk = 0;
     i->prev = i->next = 0;
     i->aux = 0;
+    i->loc = ir_loc;
+    i->var = 0;
     return f->nins++;
 }
 
@@ -301,7 +305,7 @@ static void opcount_init(void)
             break;
         case OP_COPY: case OP_NEG: case OP_NOT: case OP_FNEG: case OP_LOAD: case OP_MEMZERO: case OP_PIN:
         case OP_VSPLAT: case OP_VSUM: case OP_ISCONST: case OP_CLZ: case OP_CTZ: case OP_BSWAP: case OP_POPCNT: case OP_BITCAST:
-        case OP_ASMOUT: case OP_TLS: case OP_BYVAL:
+        case OP_ASMOUT: case OP_TLS: case OP_BYVAL: case OP_VMATH:
             ir_opcount_tab[op] = 1;
             break;
         default:

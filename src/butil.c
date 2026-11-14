@@ -218,7 +218,7 @@ int elf_ar_main(int argc, char **argv)
         Buf who, syms;
         u32 count = 0, j;
         size_t at, idxlen;
-        char hdr[61];
+        char hdr[96]; /* 60 used; room for what gcc -Wformat-overflow assumes the numbers can be */
         memset(&who, 0, sizeof who);
         memset(&syms, 0, sizeof syms);
         for (k = 0; k < nmembers; k++) {
@@ -265,7 +265,7 @@ int elf_ar_main(int argc, char **argv)
         buf_free(&syms);
     }
     if (names.len) {
-        char hdr[61];
+        char hdr[96]; /* 60 used; room for what gcc -Wformat-overflow assumes the numbers can be */
         if (names.len & 1)
             buf_u8(&names, '\n');
         sprintf(hdr, "%-16s%-12d%-6d%-6d%-8s%-10lu`\n", "//", 0, 0, 0, "0", (unsigned long)names.len);
@@ -275,7 +275,7 @@ int elf_ar_main(int argc, char **argv)
     names.len = 0;
     for (k = 0; k < nmembers; k++) {
         Member *m = &members[k];
-        char hdr[61], nm[32];
+        char hdr[96], nm[32]; /* hdr: 60 used, see above */
         if (ar_thin || strlen(m->name) > 15 || strchr(m->name, ' ')) {
             sprintf(nm, "/%lu", (unsigned long)names.len);
             names.len += strlen(m->name) + 2;

@@ -9199,6 +9199,7 @@ static void statement(void)
     case KW(KW_FOR): {
         /* the condition guards the loop and is tested again after each step */
         u32 ur = unroll_req > 1 && !opt_nounroll ? unroll_req : 0;
+        int once = unroll_req == 1; /* #pragma unroll 1 */
         /* device code: a short loop that counts to a constant is unrolled unasked, as nvcc does */
         int au = !ur && !unroll_req && cur_fn_dev && !opt_nounroll && !opt_size && !opt_noauto && au_n++ < opt_aumax;
         u32 for_loc = tok.loc;
@@ -9233,7 +9234,7 @@ static void statement(void)
                each, comes out as a constant that is true; the loop ends where it is a constant that is false.
                Where it is not known (or after ur times) what is left is an ordinary loop. */
             Token *ctk, *stk, *btk, semi;
-            u32 cn, sn, bn, copies = 0, c, cnt;
+            u32 cn, sn, bn, copies = 0, c, cnt, fac = 0, j;
             u64 cv = 0;
             int done = 0;
             grab_to(T_SEMI);
@@ -9299,6 +9300,38 @@ static void statement(void)
                 uv->cv = 0;
                 F->cur = keep;
             }
+            if (ur > 1 && ur < 65536 && !au && !opt_unrollpeel) {
+                /* #pragma unroll N, a loop that runs a known T > N times: T % N copies, then a loop whose body is N
+                   copies (as nvcc reads it), not N copies and then a loop of one */
+                i64 v = uval;
+                u32 k, keep = F->cur;
+                F->cur = ir_new_block(F); /* what reading the condition writes is never run */
+                for (k = 0; k <= 4096; k++) {
+                    v = unroll_fit(uv->ty, v);
+                    uv->cv = 1;
+                    uv->val = v;
+                    replay(ctk, cn);
+                    expr(&e);
+                    rvalue(&e);
+                    c = to_bool(&e);
+                    expect(T_SEMI);
+                    if (!ir_is_const(F, c, &cv))
+                        break;
+                    if (!cv) {
+                        if (k > ur) {
+                            fac = ur;
+                            ur = k % fac;
+                        }
+                        break;
+                    }
+                    unroll_quiet = 1;
+                    if (!unroll_step(uv, stk, sn, &v))
+                        k = 4096;
+                    unroll_quiet = 0;
+                }
+                uv->cv = 0;
+                F->cur = keep;
+            }
             end = ir_new_block(F);
             for (;;) {
                 /* the counter is a constant while the condition and the body are read (and has its value in memory) */
@@ -9348,13 +9381,25 @@ static void statement(void)
                 expect(T_SEMI);
                 F->cur = body;
                 F->blk[body].lhdr = 1;
-                break_blk = end;
-                break_level = level;
-                cont_blk = step;
-                cont_level = level;
-                replay(btk, bn);
-                statement();
-                ir_jmp(F, step);
+                F->blk[body].nounroll = fac != 0;
+                for (j = 0; j < (fac ? fac : 1); j++) {
+                    /* (fac copies: the condition holds between them, the loop running a multiple of fac times) */
+                    cnt = j + 1 < fac ? ir_new_block(F) : step;
+                    break_blk = end;
+                    break_level = level;
+                    cont_blk = cnt;
+                    cont_level = level;
+                    replay(btk, bn);
+                    statement();
+                    ir_jmp(F, cnt);
+                    if (cnt != step) {
+                        F->cur = cnt;
+                        replay(stk, sn);
+                        if (tok.kind != T_SEMI)
+                            expr(&e);
+                        expect(T_SEMI);
+                    }
+                }
             }
             F->cur = end;
             pop_scope();
@@ -9410,6 +9455,7 @@ static void statement(void)
         }
         F->cur = body;
         F->blk[body].lhdr = 1;
+        F->blk[body].nounroll = (u8)once;
         break_blk = end;
         break_level = level;
         cont_blk = step;

@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_nounroll, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
 u32 ptx_maxntid;
@@ -1792,6 +1792,107 @@ static void coalesce(const u8 *live)
     free(pos);
 }
 
+/* The way back of a loop, from block b to its head s, with moves for s's phis, the other way out t without:
+   whether the moves can be made before the branch, on both ways (the way back is then one conditional
+   branch, as nvcc writes it; with the moves in a block of their own after the branch out, ptxas peels a
+   copy of the loop: conv_bwd_w_s2_f8_k, 48 MMAs for 24). They can when no register they write is read on
+   the way out: not by anything that t reaches before s comes again, nor by what is computed again where
+   it is read (a comparison, a fused product, ...), nor through a value that shares the register. */
+static int moves_early(const u8 *live, u32 b, u32 s, u32 t)
+{
+    Func *f = PF;
+    Block *sb = &f->blk[s];
+    u32 k, v, n, *p, pi = 0, nb = f->nblk, *stack, sp = 0, w, x;
+    u8 *hit, *reach;
+    int ok = 1, more;
+    if (s > b || t == s || !sb->phis)
+        return 0;
+    for (k = 0; k < sb->npreds; k++)
+        if (sb->preds[k] == b)
+            pi = k;
+    hit = (u8 *)xmalloc(f->nins + 1);
+    memset(hit, 0, f->nins + 1);
+    /* the registers the moves write */
+    for (v = sb->phis; v; v = f->ins[v].next) {
+        u32 src = RV(f->xargs[f->ins[v].a + pi]);
+        if (!used[v] || src == v || !src)
+            continue;
+        if (regno[src] && regno[src] == regno[v] && f->ins[src].op != OP_CONST && cls_of(f->ins[src].ty) == cls_of(f->ins[v].ty))
+            continue;
+        hit[v] = 1;
+    }
+    for (w = 1; w < f->nins; w++)
+        if (f->ins[w].blk && regno[w] && !hit[w])
+            for (v = sb->phis; v; v = f->ins[v].next)
+                if (hit[v] && regno[w] == regno[v] && cls_of(f->ins[w].ty) == cls_of(f->ins[v].ty)) {
+                    hit[w] = 1;
+                    break;
+                }
+    /* what is computed again where it is read reads them there */
+    do {
+        more = 0;
+        for (w = 1; w < f->nins; w++) {
+            Ins *i = &f->ins[w];
+            if (hit[w] || !i->blk || i->op == OP_PHI ||
+                !(is_compare(i->op) || fused[w] || i->op == OP_SELECT || (sh_s && sh_t32[w] && sh_ext(w)) || xlate[w]))
+                continue;
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                if (hit[RV(p[k])]) {
+                    hit[w] = 1;
+                    more = 1;
+                    break;
+                }
+        }
+    } while (more);
+    /* the blocks t reaches before s */
+    reach = (u8 *)xmalloc(nb);
+    memset(reach, 0, nb);
+    stack = (u32 *)xmalloc(nb * sizeof(u32));
+    reach[t] = 1;
+    stack[sp++] = t;
+    while (sp) {
+        Block *bb = &f->blk[stack[--sp]];
+        n = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
+        for (k = 0; k < n; k++) {
+            x = bb->succ[k];
+            if (x != s && live[x] && !reach[x]) {
+                reach[x] = 1;
+                stack[sp++] = x;
+            }
+        }
+    }
+    for (x = 1; x < nb && ok; x++) {
+        Block *bb = &f->blk[x];
+        if (!live[x])
+            continue;
+        for (v = bb->phis; v && ok; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++) {
+                u32 from = bb->preds[k];
+                if (hit[RV(f->xargs[f->ins[v].a + k])] && (reach[from] || (from == b && x != s))) {
+                    ok = 0;
+                    break;
+                }
+            }
+        if (!reach[x])
+            continue;
+        for (v = bb->first; v && ok; v = f->ins[v].next) {
+            IR_OPS(f, &f->ins[v], p, n);
+            for (k = 0; k < n; k++)
+                if (hit[RV(p[k])])
+                    ok = 0;
+            if (f->ins[v].op == OP_CALL && hit[RV(f->ins[v].c)])
+                ok = 0;
+        }
+        if (bb->arg && hit[RV(bb->arg)])
+            ok = 0;
+    }
+    free(hit);
+    free(reach);
+    free(stack);
+    return ok;
+}
+
 /* The place among the PTX parameters of the function's parameter k. */
 static u32 param_index(Func *f, u32 k)
 {
@@ -2052,6 +2153,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
         for (next = b + 1; next < nb && !live[next]; next++)
             ;
         P("L%u:\n", b);
+        if (bb->nounroll)
+            P("\t.pragma \"nounroll\";\n");
         for (v = bb->first; v; v = f->ins[v].next) {
             if (opt_debug && f->ins[v].loc && f->ins[v].loc != last_loc) {
                 /* -g: the line of what follows, for the driver's compiler to put in its line table */
@@ -2086,6 +2189,16 @@ void ptx_gen(Func *f, Obj *o, int entry)
                 edge_moves(b, s1, s0 == s1 ? 1 : 0);
                 P("\tbra.uni L%u;\nL%u_t:\n", s1, b);
                 edge_moves(b, s0, 0);
+                if (s0 != next)
+                    P("\tbra.uni L%u;\n", s0);
+            } else if (m0 && !opt_nolatch && moves_early(live, b, s0, s1)) {
+                edge_moves(b, s0, 0);
+                P("\t@%%p0 bra L%u;\n", s0);
+                if (s1 != next)
+                    P("\tbra.uni L%u;\n", s1);
+            } else if (m1 && !opt_nolatch && moves_early(live, b, s1, s0)) {
+                edge_moves(b, s1, s0 == s1 ? 1 : 0);
+                P("\t@!%%p0 bra L%u;\n", s1);
                 if (s0 != next)
                     P("\tbra.uni L%u;\n", s0);
             } else if (m0) {

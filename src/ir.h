@@ -127,6 +127,8 @@ typedef struct Block {
     u8 term;
     u8 flag;
     u8 lhdr;     /* the body of a for or while loop: where its phis are (see rank_all in ptx.c) */
+    u8 nounroll; /* device code: the head of a loop the GPU's assembler is not to unroll (#pragma unroll 1, or the loop
+                    left of #pragma unroll N: PTX .pragma "nounroll", as nvcc writes) */
     u32 arg;     /* TERM_BR: condition; TERM_RET: value or 0 */
     u32 succ[2]; /* TERM_BR: [0] taken when arg != 0 */
     u32 aux, aux2; /* scratch for passes */
@@ -263,7 +265,7 @@ void x64_gen(Func *f, Obj *o); /* x64.c; arm64_gen hands over to it when opt_arc
 /* ptx.c: the backend for device code */
 extern int opt_fmad; /* CUDA device code: a product and a sum become one fused operation (-fmad=false: never) */
 extern int opt_noparamfwd;
-extern int opt_nounroll, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+extern int opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 extern u32 opt_automax, opt_aumax;
 extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
 extern int opt_dev_code, opt_dolicm; /* the function being read is device code only; MCC_LICM: its loops are hoisted from all the same */ /* debugging: MCC_NOUNROLL, MCC_NOSPLIT in the environment */

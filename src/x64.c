@@ -68,6 +68,7 @@ enum {
     X_RMWI,                  /* [s1 + s2 * scale + (i32)imm] op= imm >> 32                0 add 1 or 4 and 5 sub 6 xor) */
     X_FADD, X_FSUB, X_FMUL, X_FDIV, X_FNEG,
     X_SITOF, X_UITOF, X_FTOSI, X_FTOUI, X_FCVT, /* cc: the source is 64 bits wide */
+    X_BITCAST,               /* movd / movq between the register files; cc: to a floating-point register */
     X_JMP, X_JCC, X_CALL, X_CALLR, X_TAIL, X_RET,
     X_ALLOCA, X_FRAMEADDR, X_TLS,
     X_ATOMIC,                /* read-modify-write of [rdi] with rsi (and rdx); imm as the callee of an IF_ATOMIC call; old value to rax */
@@ -145,6 +146,7 @@ static u32 outargs;     /* bytes of outgoing stack arguments */
 static u32 named_stack; /* bytes of incoming named stack arguments */
 static u32 sym_memcpy, sym_memset;
 static Obj *sym_obj_owner;
+static u32 fconst_sym(u64 bits, u32 size);
 static int has_calls, uses_args, uses_fp, uses_alloca;
 static u32 ret_slot;  /* where a record returned in registers is put together */
 static u32 sret_slot; /* where the address of a record returned in memory is kept */
@@ -175,7 +177,20 @@ static MIns *emit(int op, int w, u32 d, u32 s0, u32 s1)
     i->op = (u16)op;
     i->w = (u8)w;
     i->cc = 0;
-    i->flags = 0;
+    switch (op) { /* the two-address ones: allocation hints */
+    case X_ADD: case X_IMUL: case X_AND: case X_OR: case X_XOR: case X_FADD: case X_FMUL:
+        i->flags = MF_TIED | MF_COMMUT;
+        break;
+    case X_SUB: case X_FSUB: case X_FDIV: case X_ADDI: case X_ANDI: case X_ORI: case X_XORI:
+    case X_SHL: case X_SHR: case X_SAR: case X_SHLI: case X_SHRI: case X_SARI: case X_RORI:
+    case X_NEG: case X_NOT: case X_BSWAP: case X_FNEG:
+    case X_ADDM: case X_SUBM: case X_IMULM: case X_ANDM: case X_ORM: case X_XORM:
+    case X_FADDM: case X_FSUBM: case X_FMULM: case X_FDIVM:
+        i->flags = MF_TIED;
+        break;
+    default:
+        i->flags = 0;
+    }
     i->d = d;
     i->s0 = s0;
     i->s1 = s1;
@@ -427,7 +442,7 @@ static void set_mem(MIns *m, const Addr *a)
 {
     m->sym = a->sym;
     m->imm = a->off;
-    m->flags = a->flags;
+    m->flags = (u8)((m->flags & (MF_TIED | MF_COMMUT | MF_NOTS1)) | a->flags);
 }
 
 static void emit_load(u32 d, const Addr *a, int mem)
@@ -664,6 +679,17 @@ static u32 runtime_sym(const char *name, u32 *cache)
     if (*cache == NOSLOT)
         *cache = obj_add_sym(obj, intern_cstr(name), SEC_UNDEF, 0, 1);
     return *cache;
+}
+
+/* A floating constant (size 4 or 8), or a sign mask (16: the 8 bytes twice), in the constant section: a movss / movsd or
+   an arithmetic operand from there is one instruction where mov imm + movd were two and took a general register */
+static u32 fconst_sym(u64 bits, u32 size)
+{
+    u8 b[16];
+    u32 k;
+    for (k = 0; k < 16; k++)
+        b[k] = (u8)(bits >> (8 * (k & 7)));
+    return const_sym(b, size);
 }
 
 /* memcpy(dst, src, size) or memset(dst, 0, size); the addresses are in registers already or are IR values */
@@ -2008,8 +2034,32 @@ static void sel_ins(u32 v)
             set_mem(m, &a);
             return;
         }
+        if (op == X_FADD || op == X_FSUB || op == X_FMUL || op == X_FDIV) {
+            /* a constant operand straight from the constant section: no register for it (a DCT has dozens) */
+            int cb = f->ins[i->b].op == OP_FCONST, ca = !cb && (op == X_FADD || op == X_FMUL) && f->ins[i->a].op == OP_FCONST;
+            if (cb || ca) {
+                Ins *k = &f->ins[ca ? i->a : i->b];
+                Addr ka;
+                memset(&ka, 0, sizeof ka);
+                ka.base = ka.idx = NOREG;
+                ka.flags = XF_SYM;
+                ka.sym = fconst_sym(w ? ((u64)k->a | (u64)k->b << 32) : k->a, w ? 8 : 4);
+                switch (op) {
+                case X_FADD: op = X_FADDM; break;
+                case X_FSUB: op = X_FSUBM; break;
+                case X_FMUL: op = X_FMULM; break;
+                default: op = X_FDIVM; break;
+                }
+                m = emit(op, w, d, reg_of(ca ? i->b : i->a), NOREG);
+                m->s2 = NOREG;
+                set_mem(m, &ka);
+                return;
+            }
+        }
         ra = reg_of(i->a);
-        emit(op, w, d, ra, reg_of(i->b));
+        m = emit(op, w, d, ra, reg_of(i->b));
+        if (op == X_FSUB || op == X_FDIV || op == X_SUB)
+            m->flags |= MF_NOTS1;
         return;
     }
     case OP_SDIV:
@@ -2145,6 +2195,10 @@ static void sel_ins(u32 v)
     case OP_FEXT:
     case OP_FTRUNC:
         emit(X_FCVT, w, d, reg_of(i->a), NOREG);
+        return;
+    case OP_BITCAST: /* i32 <-> f32, i64 <-> f64: the bits in the other register file */
+        m = emit(X_BITCAST, i->ty == IT_I64 || i->ty == IT_F64, d, reg_of(i->a), NOREG);
+        m->cc = i->ty == IT_F32 || i->ty == IT_F64;
         return;
     case OP_LOAD:
         if (fused[v] == FUSE_LOAD)
@@ -4118,8 +4172,9 @@ static void encode(MIns *i)
         if (i->imm == 0) {
             op_rr(O_0F | 0x57, 0, dr, dr); /* xorps */
         } else {
-            mov_ri(SCR0, (u64)i->imm, w);
-            op_rr(O_66 | O_0F | 0x6e, w, dr, SCR0); /* movd / movq */
+            ea_base(&ea, NOREG, 0);
+            ea.sym = fconst_sym((u64)i->imm & (w ? ~(u64)0 : 0xffffffffu), w ? 8 : 4);
+            op_mem((w ? O_F2 : O_F3) | O_0F | 0x10, 0, dr, &ea, 0); /* movss / movsd from the constant */
         }
         fin(i->d, dr);
         return;
@@ -4517,13 +4572,11 @@ static void encode(MIns *i)
     case X_FNEG: {
         u32 sl = loc_of(i->s0);
         dr = dst(i->d, FSCR0);
-        if (is_spill(sl))
-            mov_loc(SCR0, sl);
-        else
-            op_rr(O_66 | O_0F | 0x7e, w, sl, SCR0); /* movd / movq to the general register */
-        op_rr(O_0F | 0xba, w, 7, SCR0);           /* btc: the sign changes */
-        b1(w ? 63 : 31);
-        op_rr(O_66 | O_0F | 0x6e, w, dr, SCR0);
+        if (sl != dr)
+            mov_loc(dr, sl);
+        ea_base(&ea, NOREG, 0);
+        ea.sym = fconst_sym(w ? (u64)1 << 63 : (u64)0x80000000u << 32 | 0x80000000u, 16);
+        op_mem(O_0F | 0x57, 0, dr, &ea, 0); /* xorps with the sign bits */
         fin(i->d, dr);
         return;
     }
@@ -4554,6 +4607,20 @@ static void encode(MIns *i)
             op_rr((w ? O_F2 : O_F3) | O_0F | 0x2a, 1, dr, SCR1);
             op_rr((w ? O_F2 : O_F3) | O_0F | 0x58, 0, dr, dr);
             text->p[n] = (u8)(text->len - n - 1);
+        }
+        fin(i->d, dr);
+        return;
+    case X_BITCAST:
+        if (i->cc) {
+            dr = dst(i->d, FSCR0);
+            op_loc(O_66 | O_0F | 0x6e, w, dr, loc_of(i->s0)); /* movd / movq xmm, r/m */
+        } else {
+            u32 sl = loc_of(i->s0);
+            dr = dst(i->d, SCR0);
+            if (is_spill(sl))
+                op_loc(0x8b, w, dr, sl); /* the bits straight from the spill slot */
+            else
+                op_rr(O_66 | O_0F | 0x7e, w, sl, dr); /* movd / movq r, xmm */
         }
         fin(i->d, dr);
         return;

@@ -51,6 +51,8 @@ static u32 L;
 static u32 iv;  /* the induction variable that indexes arrays, if any */
 static int ext; /* how the body widens it when it is 32 bits wide */
 static u32 lanesz; /* bytes per element; 0 = not known yet */
+static u32 vw = 16; /* bytes per vector */
+static int vty = IT_V128; /* the type of vector values */
 
 /* induction variables: phi, phi + step each time round */
 static u32 iv_phi[MAX_IV], iv_next[MAX_IV], iv_init[MAX_IV], niv;
@@ -187,7 +189,7 @@ static u32 vec_operand(u32 x, u32 P)
         ;
     if (j == nsplat) {
         splat_of[j] = x;
-        splat[j] = mk(P, OP_VSPLAT, IT_V128, outside(x), 0);
+        splat[j] = mk(P, OP_VSPLAT, vty, outside(x), 0);
         f->ins[splat[j]].mem = (u8)lane_kind(f->ins[x].ty);
         nsplat++;
     }
@@ -1032,7 +1034,7 @@ static int try_loop(u32 l, u32 n0)
     /* sums run four vectors side by side, so that the additions do not wait
        for each other; other loops two, to halve what the counting costs */
     un = wide ? 1 : nred ? 4 : 2;
-    vf = 16 / lanesz * un;
+    vf = vw / lanesz * un;
     for (lsh = 0; ((u32)1 << lsh) < lanesz; lsh++)
         ;
     for (k = 0; k < nkeys; k++)
@@ -1101,9 +1103,9 @@ static int try_loop(u32 l, u32 n0)
     }
     for (k = 0; k < np && !mixed; k++) {
         u32 d = mk(P, OP_SUB, IT_I64, pa[k], pb[k]);
-        ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_UGE, IT_I32, d, C64(16)));
+        ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_UGE, IT_I32, d, C64(vw)));
         d = mk(P, OP_SUB, IT_I64, pb[k], pa[k]);
-        ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_UGE, IT_I32, d, C64(16)));
+        ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_UGE, IT_I32, d, C64(vw)));
     }
     /* what is read once must not be among the elements written */
     for (k = 0; k < nlinv; k++) {
@@ -1174,10 +1176,10 @@ static int try_loop(u32 l, u32 n0)
             continue;
         }
         z = red_op[k] == OP_ADD ? ir_const(f, ty, 0) : red_op[k] == OP_FADD ? ir_fconst(f, ty, 0.0) : f->xargs[f->ins[red_phi[k]].a + pp];
-        z = mk(P, OP_VSPLAT, IT_V128, z, 0);
+        z = mk(P, OP_VSPLAT, vty, z, 0);
         f->ins[z].mem = (u8)lane_kind(ty);
         for (u = 0; u < un; u++) {
-            acc[k][u] = ir_phi(f, V, IT_V128);
+            acc[k][u] = ir_phi(f, V, vty);
             f->ins[acc[k][u]].mem = (u8)lane_kind(ty);
             f->xargs[f->ins[acc[k][u]].a] = z;
         }
@@ -1188,20 +1190,20 @@ static int try_loop(u32 l, u32 n0)
         u32 io, ph2, nx;
         if (!iv_val[k])
             continue;
-        io = mk(P, OP_VIOTA, IT_V128, (u32)(i32)iv_step[k], 0);
+        io = mk(P, OP_VIOTA, vty, (u32)(i32)iv_step[k], 0);
         f->ins[io].mem = (u8)lane_kind(ty);
-        io = mk(P, OP_ADD, IT_V128, vec_operand(iv_init[k], P), io);
+        io = mk(P, OP_ADD, vty, vec_operand(iv_init[k], P), io);
         f->ins[io].mem = (u8)lane_kind(ty);
-        ph2 = ir_phi(f, V, IT_V128);
+        ph2 = ir_phi(f, V, vty);
         f->ins[ph2].mem = (u8)lane_kind(ty);
         f->xargs[f->ins[ph2].a] = io;
-        nx = mk(V, OP_ADD, IT_V128, ph2, vec_operand(ir_const(f, ty, (u64)(iv_step[k] * (i64)vf)), P));
+        nx = mk(V, OP_ADD, vty, ph2, vec_operand(ir_const(f, ty, (u64)(iv_step[k] * (i64)vf)), P));
         f->ins[nx].mem = (u8)lane_kind(ty);
         f->xargs[f->ins[ph2].a + 1] = nx;
         ivvec[k] = ph2;
     }
     for (u = 0; u < un; u++) {
-        offv = u ? mk(V, OP_ADD, IT_I64, ivv, C64(16 * u)) : ivv;
+        offv = u ? mk(V, OP_ADD, IT_I64, ivv, C64(vw * u)) : ivv;
         offn[0] = offn[1] = 0; /* the offsets in arrays of narrower elements, made when first needed */
         for (k = 0; k < niv; k++) {
             int ty = f->ins[iv_phi[k]].ty;
@@ -1210,7 +1212,7 @@ static int try_loop(u32 l, u32 n0)
             map[iv_phi[k]] = ivvec[k];
             if (u) {
                 /* the later vectors of the same round are further along */
-                map[iv_phi[k]] = mk(V, OP_ADD, IT_V128, ivvec[k], vec_operand(ir_const(f, ty, (u64)(iv_step[k] * (i64)(vf / un * u))), P));
+                map[iv_phi[k]] = mk(V, OP_ADD, vty, ivvec[k], vec_operand(ir_const(f, ty, (u64)(iv_step[k] * (i64)(vf / un * u))), P));
                 f->ins[map[iv_phi[k]]].mem = (u8)lane_kind(ty);
             }
         }
@@ -1234,12 +1236,12 @@ static int try_loop(u32 l, u32 n0)
                     acc[k][0] = nv;
                     continue;
                 }
-                nv = mk(V, red_op[k], IT_V128, acc[k][u], vec_operand(red_x[k], P));
+                nv = mk(V, red_op[k], vty, acc[k][u], vec_operand(red_x[k], P));
                 f->xargs[f->ins[acc[k][u]].a + 1] = nv;
                 acc[k][u] = nv;
             } else if (in.op == OP_LOAD && kind[in.a] == K_GADDR) {
                 u32 ga = in.a;
-                nv = mk(V, OP_VGATHER, IT_V128, outside(base[ga]), vec_operand(ioff[ga], P));
+                nv = mk(V, OP_VGATHER, vty, outside(base[ga]), vec_operand(ioff[ga], P));
                 f->ins[nv].c = shift[ga];
                 f->ins[nv].flags = in.mem; /* the elements' kind; the lanes are four bytes */
             } else if (in.op == OP_LOAD || in.op == OP_STORE) {
@@ -1253,7 +1255,7 @@ static int try_loop(u32 l, u32 n0)
                     off = offn[klsh[k]];
                 }
                 if (in.op == OP_LOAD) {
-                    nv = mk(V, OP_VLOAD, IT_V128, start[k], off);
+                    nv = mk(V, OP_VLOAD, vty, start[k], off);
                 } else {
                     lk = lane_kind(f->ins[in.b].ty);
                     x = vec_operand(in.b, P);
@@ -1265,50 +1267,50 @@ static int try_loop(u32 l, u32 n0)
             } else if (in.op == OP_SELECT && mmk[v]) {
                 x = vec_operand(in.b, P);
                 y = vec_operand(in.c, P);
-                nv = mk(V, minmax_op(v), IT_V128, x, y);
+                nv = mk(V, minmax_op(v), vty, x, y);
             } else if (in.op == OP_SELECT) {
                 x = vec_operand(in.b, P);
                 y = vec_operand(in.c, P);
-                nv = mk(V, OP_SELECT, IT_V128, map[in.a], x);
+                nv = mk(V, OP_SELECT, vty, map[in.a], x);
                 f->ins[nv].c = y;
             } else if (in.op == OP_CALL) {
                 x = vec_operand(f->xargs[in.a], P);
                 if (shift[v] == VM_FABS) {
-                    nv = mk(V, OP_AND, IT_V128, x, vec_operand(ir_const(f, in.ty == IT_F32 ? IT_I32 : IT_I64,
+                    nv = mk(V, OP_AND, vty, x, vec_operand(ir_const(f, in.ty == IT_F32 ? IT_I32 : IT_I64,
                                                                           in.ty == IT_F32 ? 0x7fffffffU : ~(u64)0 >> 1), P));
                 } else {
-                    nv = mk(V, OP_VMATH, IT_V128, x, 0);
+                    nv = mk(V, OP_VMATH, vty, x, 0);
                     f->ins[nv].b = (u32)shift[v] - 1;
                 }
             } else if (in.op == OP_ZEXT8 || in.op == OP_ZEXT16) {
-                nv = mk(V, OP_AND, IT_V128, vec_operand(in.a, P), vec_operand(ir_const(f, IT_I32, in.op == OP_ZEXT8 ? 0xff : 0xffff), P));
+                nv = mk(V, OP_AND, vty, vec_operand(in.a, P), vec_operand(ir_const(f, IT_I32, in.op == OP_ZEXT8 ? 0xff : 0xffff), P));
             } else if (in.op == OP_SEXT8 || in.op == OP_SEXT16) {
                 u32 cn = ir_const(f, IT_I32, in.op == OP_SEXT8 ? 24 : 16);
-                x = mk(V, OP_SHL, IT_V128, vec_operand(in.a, P), cn);
+                x = mk(V, OP_SHL, vty, vec_operand(in.a, P), cn);
                 f->ins[x].mem = (u8)lk;
-                nv = mk(V, OP_SAR, IT_V128, x, cn);
+                nv = mk(V, OP_SAR, vty, x, cn);
             } else if (in.op == OP_SHL || in.op == OP_SHR || in.op == OP_SAR) {
-                nv = mk(V, in.op, IT_V128, vec_operand(in.a, P), in.b); /* the count stays a constant */
+                nv = mk(V, in.op, vty, vec_operand(in.a, P), in.b); /* the count stays a constant */
             } else if (ir_opcount_tab[in.op] == 1) {
                 /* x86-64 takes only unsigned values below 2^31 (x64_has): the signed conversion */
-                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : opt_arch == ARCH_X64 && in.op == OP_FTOUI ? OP_FTOSI : in.op, IT_V128, vec_operand(in.a, P), 0);
+                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : opt_arch == ARCH_X64 && in.op == OP_FTOUI ? OP_FTOSI : in.op, vty, vec_operand(in.a, P), 0);
             } else {
                 if (kind[v] == K_MASK)
                     lk = lane_kind(f->ins[in.a].ty);
                 x = vec_operand(in.a, P);
                 y = vec_operand(in.b, P);
-                nv = mk(V, in.op, IT_V128, x, y);
+                nv = mk(V, in.op, vty, x, y);
             }
             f->ins[nv].mem = (u8)lk;
             map[v] = nv;
             if (kind[v] == K_MASK && mmk[v]) {
                 /* the comparison as a number: 1 where the mask is all ones */
-                lpos[v] = mk(V, OP_AND, IT_V128, nv, vec_operand(ir_const(f, IT_I32, 1), P));
+                lpos[v] = mk(V, OP_AND, vty, nv, vec_operand(ir_const(f, IT_I32, 1), P));
                 f->ins[lpos[v]].mem = (u8)lane_kind(IT_I32);
             }
         }
     }
-    ivv2 = mk(V, OP_ADD, IT_I64, ivv, C64(16 * un));
+    ivv2 = mk(V, OP_ADD, IT_I64, ivv, C64(vw * un));
     f->xargs[f->ins[ivv].a + 1] = ivv2;
     f->blk[V].arg = mk(V, OP_NE, IT_I32, ivv2, offend);
 
@@ -1333,7 +1335,7 @@ static int try_loop(u32 l, u32 n0)
             }
             val = acc[k][0];
             for (u = 1; u < un; u++) {
-                val = mk(M, comb, IT_V128, val, acc[k][u]);
+                val = mk(M, comb, vty, val, acc[k][u]);
                 f->ins[val].mem = (u8)lk;
             }
             val = mk(M, OP_VSUM, f->ins[ph].ty, val, 0);

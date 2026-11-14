@@ -309,7 +309,8 @@ static int x64_has(u32 v)
     case OP_UITOF:
         return lanesz == 4 && i->ty == IT_F32 && f->ins[i->a].ty == IT_I32 && nonneg31(i->a);
     case OP_FTOUI:
-        return 0;
+        /* (unsigned char) f: out of the byte's range the C program is undefined, so the signed conversion will do */
+        return lanesz == 4 && cnt[v] == 1 && mmk[v] == 2;
     default:
         return 1;
     }
@@ -672,6 +673,8 @@ static int try_loop(u32 l, u32 n0)
             if (i->ty != IT_I32 || !is_vec(i->a) || ((i->op == OP_ZEXT8 || i->op == OP_ZEXT16) &&
                 !note_splat(ir_const(f, IT_I32, i->op == OP_ZEXT8 ? 0xff : 0xffff))))
                 MISS("a value that is neither per-element nor constant in the loop");
+            if (!INV(i->a) && f->ins[i->a].op == OP_FTOUI)
+                mmk[i->a] = 2; /* only its low bits matter */
             full_only = 1;
             kind[v] = K_VEC;
             nvec++;
@@ -1036,7 +1039,7 @@ static int try_loop(u32 l, u32 n0)
                 nv = mk(V, in.op, IT_V128, vec_operand(in.a, P), in.b); /* the count stays a constant */
             } else if (ir_opcount_tab[in.op] == 1) {
                 /* x86-64 takes only unsigned values below 2^31 (x64_has): the signed conversion */
-                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : in.op, IT_V128, vec_operand(in.a, P), 0);
+                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : opt_arch == ARCH_X64 && in.op == OP_FTOUI ? OP_FTOSI : in.op, IT_V128, vec_operand(in.a, P), 0);
             } else {
                 if (kind[v] == K_MASK)
                     lk = lane_kind(f->ins[in.a].ty);

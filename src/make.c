@@ -365,8 +365,9 @@ static int tvar_value(Buf *out, Target *t, const char *name, size_t n)
             return 0;
         if (first == nlist) { /* only additions: they add to the global value */
             first = nlist - 1;
-            if (list[first]->op == '?' && v && v->origin != O_UNDEF)
-                ;
+            if (list[first]->op == '?' && v && v->origin != O_UNDEF) {
+                /* nothing */
+            }
             scope = 0;
             if (v) {
                 if (v->recursive)

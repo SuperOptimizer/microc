@@ -206,6 +206,7 @@ static int is_fp(int ty)
 #define VC_V128 2
 #define VC_V256 (2 | 8)
 #define VC_SPILL 16
+static int fn_avx;  /* the function is compiled for AVX, or uses intrinsics or 256-bit vectors (VEX code anyway) */
 static int vlegacy; /* the function has 128-bit operations in sel_vec's legacy SSE: its 128-bit vectors are not spilled */
 
 static int is_vec(int ty)
@@ -1026,6 +1027,16 @@ static MIns *emit_vex(u32 enc, int form, u32 d, u32 s0, u32 s1, u32 s2, int imm8
 /* the internal form of a test: reg = s0, rm = s1, nothing written but the flags */
 #define XF_TEST 8
 
+/* May the r/m operand of VEX instruction enc be memory? Not for the mask moves (the memory form is no instruction) nor
+   for vmovhlps / vmovlhps (whose memory forms are other instructions). */
+static int rm_mem_ok(u32 enc)
+{
+    u32 op = XE_OPC(enc);
+    if (XE_MAP(enc) != 1)
+        return 1;
+    return op != 0x50 && op != 0xd7 && op != 0x12 && op != 0x16 && op != 0xc5 && op != 0xf7;
+}
+
 static int xt_is_vec(int xt)
 {
     return xt >= XT_M256 && xt <= XT_M128I;
@@ -1038,7 +1049,7 @@ static u32 vec_mem_operand(u32 u)
     if (x->op == OP_XI) {
         const X86I *t = &x86i_tab[x->c];
         u32 r[3], n = 0, k;
-        if (t->kind != XK_VEX || !xt_is_vec(t->ret))
+        if (t->kind != XK_VEX || !xt_is_vec(t->ret) || !rm_mem_ok(t->enc))
             return 0;
         for (k = 0; k < x->b && k < 5; k++)
             if (t->arg[k] != XT_IMM) {
@@ -1084,7 +1095,68 @@ static void emit_vex_load(u32 enc, u32 d, u32 s0, u32 ld, int imm8)
     m->cc = (u8)(imm8 >= 0 ? imm8 : 0);
 }
 
+/* d (or, with st, the memory from s0) = instruction enc with the memory operand a; s0 as vvvv when not st */
+static void emit_vexm(u32 enc, int st, u32 d, u32 s0, Addr *a, int imm8)
+{
+    MIns *m = emit(X_VEXM, (st ? 1 : s0 != NOREG ? 4 : 0) | (imm8 >= 0 ? 2 : 0), st ? NOREG : d, s0, a->base);
+    m->s2 = a->idx;
+    m->sym = a->sym;
+    m->flags = a->flags;
+    if (!fits32(a->off))
+        die("%s: address offset out of range", f->name);
+    m->imm = (i64)((u64)enc << 32 | (u32)a->off);
+    m->cc = (u8)(imm8 >= 0 ? imm8 : 0);
+}
+
+/* a new vector register of 16 or 32 bytes */
+static u32 vtmp_w(int wide)
+{
+    return new_vreg(cls_of(wide ? IT_V256 : IT_V128));
+}
+
+static u32 const_sym(const u8 *p, u32 n);
+
+/* a new register with the n bytes at p repeated over 16 or 32 bytes (n = 1, 2, 4, 8, 16 or 32) */
+static u32 vconst_w(int wide, const u8 *p, u32 n)
+{
+    u8 b[32];
+    u32 k, t = vtmp_w(wide), w = wide ? 32 : 16;
+    Addr a;
+    for (k = 0; k < w; k++)
+        b[k] = p[k % n];
+    memset(&a, 0, sizeof a);
+    a.base = a.idx = NOREG;
+    a.sym = const_sym(b, w);
+    a.flags = XF_SYM;
+    emit_vexm(0x110 | (wide ? VE_L : 0), 0, t, NOREG, &a, -1); /* vmovups */
+    return t;
+}
+
+static u32 vsplat_w(int wide, u64 val, int bytes)
+{
+    u8 b[8];
+    int k;
+    for (k = 0; k < 8; k++)
+        b[k] = (u8)(val >> (8 * k));
+    return vconst_w(wide, b, (u32)bytes);
+}
+
+/* the address of OP_VLOAD / OP_VSTORE v: a + b, or a + c for a store */
+static void vaddr(u32 v, Addr *a)
+{
+    Ins *i = &f->ins[v];
+    u32 off = i->op == OP_VLOAD ? i->b : i->c, base = reg_of(i->a);
+    i64 c;
+    if (const_of(off, &c) && fits32(c)) {
+        reg_addr(a, base, c);
+    } else {
+        reg_addr(a, base, 0);
+        a->idx = reg_of(off);
+    }
+}
+
 static void sel_xi(u32 v);
+static void sel_avx_more(u32 v);
 
 /* Does sel_avx (VEX) make v? Intrinsics, 256-bit values and whole-vector loads and stores always; in a function compiled
    for AVX also the 128-bit operations it knows. The rest of the 128-bit work is sel_vec's (SSE2 / SSE4.1). */
@@ -1094,13 +1166,15 @@ static int avx_takes(u32 v)
     int op = i->op;
     if (op == OP_XI || ((op == OP_LOAD || op == OP_STORE) && i->mem >= M_V128))
         return 1;
-    if (op == OP_PARAM || op == OP_CALL || op == OP_SELECT)
+    if (op == OP_PARAM || op == OP_CALL)
         return 0;
+    if (op == OP_SELECT)
+        return fn_avx && is_vec(i->ty) && is_vec(f->ins[i->a].ty);
     if (i->ty == IT_V256)
         return 1;
-    if (i->ty != IT_V128 && op != OP_VSTORE)
+    if (i->ty != IT_V128 && op != OP_VSTORE && op != OP_VSUM)
         return 0;
-    if (!f->avx)
+    if (!fn_avx)
         return 0;
     switch (op) {
     case OP_CONST:
@@ -1111,14 +1185,20 @@ static int avx_takes(u32 v)
         return 1;
     case OP_VLOAD:
     case OP_VSTORE:
-        return !(i->flags & 0x80); /* not the widening / narrowing forms */
+    case OP_VSUM:
+    case OP_VIOTA:
+    case OP_VMATH:
+    case OP_SITOF:
+    case OP_FTOSI:
+    case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE:
+        return 1;
     case OP_SHL:
     case OP_SHR:
     case OP_SAR:
         return lane_bits(i->mem) != 8 && !(op == OP_SAR && lane_bits(i->mem) == 64) &&
                !(lane_bits(i->mem) == 16 && !is_floating(i->b) && f->ins[i->b].ty == IT_V128);
     default:
-        return vec_op_enc(op, i->mem) != 0;
+        return vec_op_enc(op, i->mem) != 0 || (op >= OP_EQ && op <= OP_UGE);
     }
 }
 
@@ -1148,7 +1228,12 @@ static void sel_avx(u32 v)
         return;
     }
     case OP_VLOAD:
-    case OP_VSTORE: {
+    case OP_VSTORE:
+        if (i->flags & 0x80) {
+            sel_avx_more(v);
+            return;
+        }
+        {
         /* (opt_vec.c's: the address is a + b, or a + c for a store) */
         u32 off = op == OP_VLOAD ? i->b : i->c, base = reg_of(i->a);
         int mem = (op == OP_VLOAD ? i->ty : f->ins[i->b].ty) == IT_V256 ? M_V256 : M_V128;
@@ -1227,11 +1312,21 @@ static void sel_avx(u32 v)
         return;
     case OP_VSUM:
     case OP_VIOTA:
-        break;
+    case OP_VMATH:
+    case OP_SITOF:
+    case OP_FTOSI:
+    case OP_SELECT:
+        sel_avx_more(v);
+        return;
     default:
         enc = vec_op_enc(op, i->mem);
-        if (!enc)
+        if (!enc) {
+            if ((op >= OP_EQ && op <= OP_UGE) || (op >= OP_FEQ && op <= OP_FGE)) {
+                sel_avx_more(v);
+                return;
+            }
             break;
+        }
         if (fused[i->b] == FUSE_LOAD)
             emit_vex_load(enc | L, d, reg_of(i->a), i->b, -1);
         else
@@ -1262,6 +1357,191 @@ static void sel_splat_const(u32 v, u32 d)
     m->sym = const_sym(b, (u32)bits / 8);
     m->flags = XF_SYM;
     m->imm = (i64)((u64)enc << 32);
+}
+
+/* sel_avx for what opt_vec.c makes besides lane arithmetic: sums across lanes, lane numbers, sqrt / rounding, conversions,
+   bitwise selects, comparisons, widening loads and narrowing stores; 128 or 256 bits, VEX encoded. The results are those of
+   sel_vec's SSE code for the same operations. */
+static void sel_avx_more(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u32 d = VREG0 + v, L = i->ty == IT_V256 ? VE_L : 0, t, u, ra, rb;
+    int op = i->op, k = i->mem, n = lane_bits(k) / 8, pd = k == M_F64, wide = i->ty == IT_V256;
+    MIns *m;
+    Addr a;
+
+    switch (op) {
+    case OP_VLOAD: {
+        int nk = i->flags & 0x7f, byte = nk == M_8S || nk == M_8U, sgn = nk == M_8S || nk == M_16S;
+        vaddr(v, &a);
+        emit_vexm(VE(byte ? (sgn ? 0x21 : 0x31) : (sgn ? 0x23 : 0x33), 2, 1, 0) | L, 0, d, NOREG, &a, -1); /* vpmov[sz]x b/w d */
+        return;
+    }
+    case OP_VSTORE: {
+        /* each lane's low bits, sign-extended so that the saturating packs keep them as they are */
+        int nk = i->flags & 0x7f, byte = nk == M_8S || nk == M_8U;
+        u32 x = reg_of(i->b);
+        wide = f->ins[i->b].ty == IT_V256;
+        L = wide ? VE_L : 0;
+        t = vtmp_w(wide);
+        emit_vex(VE(0x72, 1, 1, 0) | L | VE_DIGIT(6), XF_VMI, t, x, NOREG, NOREG, byte ? 24 : 16); /* vpslld */
+        u = vtmp_w(wide);
+        emit_vex(VE(0x72, 1, 1, 0) | L | VE_DIGIT(4), XF_VMI, u, t, NOREG, NOREG, byte ? 24 : 16); /* vpsrad */
+        t = vtmp_w(wide);
+        emit_vex(VE(0x6b, 1, 1, 0) | L, XF_RVM, t, u, u, NOREG, -1); /* vpackssdw */
+        if (wide) {
+            u = vtmp_w(1);
+            emit_vex(VE(0x00, 3, 1, 1) | VE_L, XF_RM, u, t, NOREG, NOREG, 0x08); /* vpermq: the two halves' words together */
+            t = u;
+        }
+        if (byte) {
+            u = vtmp_w(0);
+            emit_vex(VE(0x63, 1, 1, 0), XF_RVM, u, t, t, NOREG, -1); /* vpacksswb */
+            t = u;
+        }
+        vaddr(v, &a);
+        emit_vexm(wide ? (byte ? VE(0xd6, 1, 1, 0) : VE(0x7f, 1, 2, 0)) : byte ? VE(0x7e, 1, 1, 0) : VE(0xd6, 1, 1, 0), 1, NOREG, t,
+                  &a, -1); /* vmovq / vmovdqu / vmovd */
+        return;
+    }
+    case OP_VSUM: {
+        u32 x = reg_of(i->a), lo, hi;
+        int fl = (int)i->flags, ak = k, fsum = (ak == M_F32 || ak == M_F64);
+        if (f->ins[i->a].ty == IT_V256) {
+            hi = new_vreg(1 | VC_V128);
+            emit_vex(VE(0x39, 3, 1, 0) | VE_L, XF_MR, hi, x, NOREG, NOREG, 1); /* vextracti128 */
+            lo = new_vreg(1 | VC_V128);
+            emit(X_YMOVLO, 0, lo, x, NOREG);
+            if ((fl == 0 && !fsum) || fl >= 5) {
+                /* each half summed (in its wider total), then the two added */
+                u32 s1 = new_vreg(cls_of(i->ty)), s2 = new_vreg(cls_of(i->ty));
+                m = emit(X_VSUM, 0, s1, lo, NOREG);
+                m->cc = (u8)ak;
+                m->imm = fl;
+                m = emit(X_VSUM, 0, s2, hi, NOREG);
+                m->cc = (u8)ak;
+                m->imm = fl;
+                emit(X_ADD, is_w(i->ty), d, s1, s2);
+                return;
+            }
+            {
+                static const u8 across[5] = {0, 0x3d, 0x39, 0x3f, 0x3b}; /* vpmaxsd vpminsd vpmaxud vpminud */
+                u32 c = new_vreg(1 | VC_V128);
+                u32 enc = !fl ? VE(0x58, 1, ak == M_F64, 0)                          /* vaddps / pd */
+                          : fsum ? VE(fl == 1 ? 0x5f : 0x5d, 1, ak == M_F64, 0) /* vmaxps / vminps (pd) */
+                                 : VE(across[fl], 2, 1, 0);
+                emit_vex(enc, XF_RVM, c, lo, hi, NOREG, -1);
+                x = c;
+            }
+        } else {
+            /* sel_vec's SSE code does the rest, on a register it may keep (it has no spill slots) */
+            t = new_vreg(1 | VC_V128);
+            emit(X_MOV, 1, t, x, NOREG);
+            x = t;
+        }
+        m = emit(X_VSUM, 0, d, x, NOREG);
+        m->cc = (u8)ak;
+        m->imm = fl;
+        return;
+    }
+    case OP_VIOTA: {
+        u8 b[32];
+        u64 st = (u64)(i64)(i32)i->a;
+        u32 j, w = wide ? 32 : 16, nl = w / (u32)n;
+        for (j = 0; j < nl; j++) {
+            u64 x = st * j;
+            int q;
+            for (q = 0; q < n; q++)
+                b[j * (u32)n + (u32)q] = (u8)(x >> (8 * q));
+        }
+        t = vconst_w(wide, b, w);
+        emit(X_MOV, 1, d, t, NOREG);
+        return;
+    }
+    case OP_VMATH: {
+        static const u8 rnd[6] = {0, 9, 10, 11, 4, 12};
+        if (i->b == VM_SQRT)
+            emit_vex(VE(0x51, 1, pd, 0) | L, XF_RM, d, reg_of(i->a), NOREG, NOREG, -1); /* vsqrtps / pd */
+        else
+            emit_vex(VE(pd ? 0x09 : 0x08, 3, 1, 0) | L, XF_RM, d, reg_of(i->a), NOREG, NOREG, rnd[i->b]); /* vroundps / pd */
+        return;
+    }
+    case OP_SITOF:
+    case OP_FTOSI:
+        emit_vex(VE(0x5b, 1, op == OP_SITOF ? 0 : 2, 0) | L, XF_RM, d, reg_of(i->a), NOREG, NOREG, -1); /* vcvtdq2ps, vcvttps2dq */
+        return;
+    case OP_SELECT: {
+        u32 c = reg_of(i->a);
+        t = vtmp_w(wide);
+        emit_vex(VE(0xdb, 1, 1, 0) | L, XF_RVM, t, c, reg_of(i->b), NOREG, -1); /* vpand */
+        u = vtmp_w(wide);
+        emit_vex(VE(0xdf, 1, 1, 0) | L, XF_RVM, u, c, reg_of(i->c), NOREG, -1); /* vpandn */
+        emit_vex(VE(0xeb, 1, 1, 0) | L, XF_RVM, d, t, u, NOREG, -1);          /* vpor */
+        return;
+    }
+    default:
+        break;
+    }
+    ra = reg_of(i->a);
+    rb = reg_of(i->b);
+    if (op >= OP_FEQ && op <= OP_FGE) {
+        /* vcmpps / vcmppd: 0 eq, 1 lt, 2 le, 4 neq (true where unordered, as != is) */
+        int p = op == OP_FEQ ? 0 : op == OP_FNE ? 4 : op == OP_FLT || op == OP_FGT ? 1 : 2;
+        if (op == OP_FGT || op == OP_FGE) {
+            t = ra;
+            ra = rb;
+            rb = t;
+        }
+        emit_vex(VE(0xc2, 1, pd, 0) | L, XF_RVM, d, ra, rb, NOREG, p);
+        return;
+    }
+    if (op >= OP_EQ && op <= OP_UGE) {
+        /* vpcmpeq, vpcmpgt: "less" is "greater" turned round, "or equal" the opposite of the strict one turned round;
+           without sign, both flipped in the top bit first */
+        u32 eq = n == 8 ? VE(0x29, 2, 1, 0) : VE(n == 1 ? 0x74 : n == 2 ? 0x75 : 0x76, 1, 1, 0);
+        u32 gt = n == 8 ? VE(0x37, 2, 1, 0) : VE(n == 1 ? 0x64 : n == 2 ? 0x65 : 0x66, 1, 1, 0);
+        int sw = 0, neg = 0;
+        if (op == OP_EQ || op == OP_NE) {
+            if (op == OP_EQ) {
+                emit_vex(eq | L, XF_RVM, d, ra, rb, NOREG, -1);
+                return;
+            }
+            t = vtmp_w(wide);
+            emit_vex(eq | L, XF_RVM, t, ra, rb, NOREG, -1);
+            neg = 1;
+        } else {
+            if (op >= OP_ULT) {
+                u32 bias = vsplat_w(wide, (u64)1 << (8 * n - 1), n), x = vtmp_w(wide), y = vtmp_w(wide);
+                emit_vex(VE(0xef, 1, 1, 0) | L, XF_RVM, x, ra, bias, NOREG, -1);
+                emit_vex(VE(0xef, 1, 1, 0) | L, XF_RVM, y, rb, bias, NOREG, -1);
+                ra = x;
+                rb = y;
+                op += OP_SLT - OP_ULT;
+            }
+            switch (op) {
+            case OP_SGT: break;
+            case OP_SLT: sw = 1; break;
+            case OP_SGE: sw = 1; neg = 1; break; /* a >= b: not (b > a) */
+            default: neg = 1; break;              /* a <= b: not (a > b) */
+            }
+            if (sw) {
+                t = ra;
+                ra = rb;
+                rb = t;
+            }
+            if (!neg) {
+                emit_vex(gt | L, XF_RVM, d, ra, rb, NOREG, -1);
+                return;
+            }
+            t = vtmp_w(wide);
+            emit_vex(gt | L, XF_RVM, t, ra, rb, NOREG, -1);
+        }
+        u = vtmp_w(wide);
+        emit(X_YONES, wide, u, NOREG, NOREG);
+        emit_vex(VE(0xef, 1, 1, 0) | L, XF_RVM, d, t, u, NOREG, -1); /* not */
+        return;
+    }
+    die("internal: x86-64 AVX instruction selection: op %d in %s", op, f->name);
 }
 
 /* An intrinsic (OP_XI): the instruction its table entry describes. */
@@ -1662,7 +1942,9 @@ static void sel_ins(u32 v)
         sel_avx(v);
         return;
     }
-    if ((i->ty == IT_V128 && i->op != OP_PARAM && i->op != OP_CALL) || i->op == OP_VSTORE || i->op == OP_VSUM) {
+    if ((i->ty == IT_V128 && i->op != OP_PARAM && i->op != OP_CALL &&
+         !(i->op == OP_SELECT && !is_vec(f->ins[i->a].ty))) ||
+        i->op == OP_VSTORE || i->op == OP_VSUM) {
         sel_vec(v);
         return;
     }
@@ -2282,11 +2564,16 @@ static void prepare(void)
 {
     u32 b, v, k, n;
     split_critical_edges();
+    fn_avx = f->avx;
+    for (v = 1; v < f->nins && !fn_avx; v++)
+        if (f->ins[v].blk && (f->ins[v].op == OP_XI || f->ins[v].ty == IT_V256))
+            fn_avx = 1;
     vlegacy = 0;
     for (v = 1; v < f->nins && !vlegacy; v++) {
         Ins *i = &f->ins[v];
         if (i->blk && !avx_takes(v) &&
-            ((i->ty == IT_V128 && i->op != OP_PARAM && i->op != OP_CALL) || i->op == OP_VSTORE || i->op == OP_VSUM))
+            ((i->ty == IT_V128 && i->op != OP_PARAM && i->op != OP_CALL && !(i->op == OP_SELECT && !is_vec(f->ins[i->a].ty))) ||
+             i->op == OP_VSTORE || i->op == OP_VSUM))
             vlegacy = 1;
     }
     layout = (u32 *)xmalloc(f->nblk * sizeof(u32));
@@ -3569,7 +3856,7 @@ static void enc_vex(MIns *i)
     case XF_RVM:
         rv = xuse(i->s0, 0);
         rm = loc_of(i->s1);
-        if (is_spill(rm) && !spill_cached(rm, FSCR1)) {
+        if (is_spill(rm) && !spill_cached(rm, FSCR1) && rm_mem_ok(enc)) {
             /* the r/m source straight from its spill slot */
             EA ea;
             ea_spill(&ea, rm);
@@ -3583,7 +3870,7 @@ static void enc_vex(MIns *i)
         break;
     case XF_RM:
         rm = loc_of(i->s0);
-        if (is_spill(rm) && !spill_cached(rm, FSCR1)) {
+        if (is_spill(rm) && !spill_cached(rm, FSCR1) && rm_mem_ok(enc)) {
             EA ea;
             ea_spill(&ea, rm);
             dr = xdst(i->d);
@@ -3649,7 +3936,7 @@ static void encode(MIns *i)
     EA ea;
     int w = i->w;
 
-    if (i->op >= X_VBIN) {
+    if (i->op >= X_VBIN && i->op <= X_FUN) {
         encode_vec(i);
         return;
     }

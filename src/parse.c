@@ -201,18 +201,47 @@ static int sv_pending, sv_has; /* the next statement is asked for its value; it 
 
 /* Loop conditions are parsed twice (once to guard the loop, once at its
    bottom), so their tokens are recorded and played back. */
+/* Recordings nest: a loop condition can call a lambda (or a function read in place) whose body has loops of its own,
+   and an initializer with an inferred type is recorded while it may do the same. rec / nrec / caprec are the
+   innermost recording; the enclosing ones wait in rec_outer and are given every token too. Each recording has an
+   id (rec_ids counts them); a token put back by replay() carries the last id given out (playgen), and is taken
+   again only by recordings that started after it was put back: those that were running had it already. */
 static Token *rec, *play;
 static u32 nrec, caprec, nplay, iplay, capplay;
-static u32 play_quiet; /* so many of the tokens to be replayed next were put there during a recording: not recorded */
+static u32 *playgen;
 static int recording;
+static u32 rec_id, rec_ids;
+typedef struct RecLevel {
+    Token *rec;
+    u32 nrec, caprec, id;
+} RecLevel;
+static RecLevel rec_outer[32];
+static u32 nrec_outer;
+
+static void rec_add(Token **b, u32 *n, u32 *cap, const Token *t)
+{
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *b = (Token *)xrealloc(*b, *cap * sizeof(Token));
+    }
+    (*b)[(*n)++] = *t;
+}
+
+/* The token t, put back when recording id gen was the last started (0: read from the source), to every recording
+   that does not have it yet. */
+static void rec_put_gen(const Token *t, u32 gen)
+{
+    u32 k;
+    if (rec_id > gen)
+        rec_add(&rec, &nrec, &caprec, t);
+    for (k = 0; k < nrec_outer; k++)
+        if (rec_outer[k].id > gen)
+            rec_add(&rec_outer[k].rec, &rec_outer[k].nrec, &rec_outer[k].caprec, t);
+}
 
 static void rec_put(const Token *t)
 {
-    if (nrec == caprec) {
-        caprec = caprec ? caprec * 2 : 64;
-        rec = (Token *)xrealloc(rec, caprec * sizeof(Token));
-    }
-    rec[nrec++] = *t;
+    rec_put_gen(t, 0);
 }
 
 static Token pushback;
@@ -239,11 +268,10 @@ static u32 attrq_n, attrq_i;
 static void fetch(Token *t)
 {
     if (iplay < nplay) {
-        *t = play[iplay++];
-        if (play_quiet)
-            play_quiet--;
-        else if (recording)
-            rec_put(t);
+        *t = play[iplay];
+        if (recording)
+            rec_put_gen(t, playgen[iplay]);
+        iplay++;
         return;
     }
     for (;;) {
@@ -373,10 +401,22 @@ static Token *peek(void)
 /* Starts recording at the current token. */
 static void rec_start(void)
 {
+    if (recording) {
+        if (nrec_outer == sizeof rec_outer / sizeof rec_outer[0])
+            error_at(tok.loc, "loops and inferred types nested too deeply");
+        rec_outer[nrec_outer].rec = rec;
+        rec_outer[nrec_outer].nrec = nrec;
+        rec_outer[nrec_outer].caprec = caprec;
+        rec_outer[nrec_outer++].id = rec_id;
+        rec = 0;
+        caprec = 0;
+    }
     nrec = 0;
-    rec_put(&tok);
+    rec_id = ++rec_ids;
+    /* the current token (and the one looked at) were read before: the enclosing recordings have them */
+    rec_add(&rec, &nrec, &caprec, &tok);
     if (has_ptok)
-        rec_put(&ptok);
+        rec_add(&rec, &nrec, &caprec, &ptok);
     recording = 1;
 }
 
@@ -384,28 +424,44 @@ static void rec_start(void)
 static Token *rec_stop(u32 n)
 {
     Token *t = (Token *)arena_alloc(&A, (n ? n : 1) * sizeof(Token));
-    recording = 0;
-    play_quiet = 0;
     memcpy(t, rec, n * sizeof(Token));
+    if (nrec_outer) {
+        free(rec);
+        nrec_outer--;
+        rec = rec_outer[nrec_outer].rec;
+        nrec = rec_outer[nrec_outer].nrec;
+        caprec = rec_outer[nrec_outer].caprec;
+        rec_id = rec_outer[nrec_outer].id;
+    } else {
+        recording = 0;
+        rec_id = 0;
+    }
     return t;
 }
 
 /* Makes the n tokens at t the next ones read; the current token follows them. */
 static void replay(const Token *t, u32 n)
 {
-    u32 rest = nplay - iplay, need = n + 2 + rest, k = 0;
+    u32 rest = nplay - iplay, need = n + 2 + rest, k = 0, j;
     Token *b = (Token *)xmalloc(need * sizeof(Token));
+    u32 *g = (u32 *)xmalloc((need ? need : 1) * sizeof(u32));
     memcpy(b, t, n * sizeof(Token));
     k = n;
     b[k++] = tok;
     if (has_ptok)
         b[k++] = ptok;
+    /* what is put back here is not new to the recordings running now (a second reading of a recording
+       will be given these again); recordings started later take it */
+    for (j = 0; j < k; j++)
+        g[j] = rec_ids;
     memcpy(b + k, play + iplay, rest * sizeof(Token));
+    if (rest)
+        memcpy(g + k, playgen + iplay, rest * sizeof(u32));
     k += rest;
-    if (recording)
-        play_quiet += k - rest; /* a second reading of the recording will be given these again */
     free(play);
+    free(playgen);
     play = b;
+    playgen = g;
     capplay = need;
     nplay = k;
     iplay = 0;
@@ -10118,6 +10174,9 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     has_ptok = 0;
     nplay = iplay = 0;
     recording = 0;
+    rec_id = 0;
+    while (nrec_outer)
+        free(rec_outer[--nrec_outer].rec);
     ndeferred = 0;
     if (nlazy)
         memset(lazy, 0, nlazy * sizeof(LazyFn));

@@ -65,7 +65,7 @@ void lto_save(Func *f, Obj *o)
     hdr[4] = f->nxargs;
     hdr[5] = f->nslots;
     hdr[6] = f->nparams;
-    hdr[7] = (u32)f->ret_ty | ((u32)f->has_sret << 8) | ((u32)f->variadic << 16);
+    hdr[7] = (u32)f->ret_ty | ((u32)f->has_sret << 8) | ((u32)f->variadic << 16) | ((u32)f->avx << 24);
     hdr[8] = npreds;
     buf_put(ir, hdr, sizeof hdr);
     /* the symbols the function names, as relocations so that they survive
@@ -222,6 +222,7 @@ static void load(LFn *fn)
     f->ret_ty = (u8)flags;
     f->has_sret = (u8)(flags >> 8);
     f->variadic = (u8)(flags >> 16);
+    f->avx = (u8)(flags >> 24);
     f->cur = 0;
     for (v = 1; v < nins; v++)
         if (f->ins[v].op == OP_ADDR)

@@ -297,7 +297,7 @@ static void opcount_init(void)
         case OP_VIOTA: case OP_FRAMEADDR:
             ir_opcount_tab[op] = 0;
             break;
-        case OP_PHI: case OP_CALL:
+        case OP_PHI: case OP_CALL: case OP_XI:
             ir_opcount_tab[op] = 255;
             break;
         case OP_SELECT: case OP_VSTORE:
@@ -321,13 +321,13 @@ u32 ir_opcount(Func *f, u32 v)
     u32 n = ir_opcount_tab[i->op];
     if (n != 255)
         return n;
-    return i->op == OP_PHI ? i->b : i->b + 1;
+    return i->op == OP_PHI || i->op == OP_XI ? i->b : i->b + 1;
 }
 
 u32 *ir_opref(Func *f, u32 v, u32 k)
 {
     Ins *i = &f->ins[v];
-    if (i->op == OP_PHI)
+    if (i->op == OP_PHI || i->op == OP_XI)
         return &f->xargs[i->a + k];
     if (i->op == OP_CALL)
         return k == 0 ? &i->c : &f->xargs[i->a + k - 1];
@@ -580,6 +580,25 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
 
     if (op == OP_ISCONST)
         return ia->op == OP_CONST || ia->op == OP_FCONST ? ir_const(f, IT_I32, 1) : 0;
+    if (IT_ISVEC(ty)) {
+        /* lane by lane, the lane kind in Ins.mem (which is not known here): only what holds for every kind.
+           The one vector constant is zero; a shift count is a scalar. */
+        if (op < OP_ADD || op > OP_SAR)
+            return 0;
+        ca = ia->op == OP_CONST;
+        cb = ib->op == OP_CONST && ir_is_const(f, b, &y) && y == 0;
+        if (a == b && (op == OP_SUB || op == OP_XOR))
+            return ir_const(f, ty, 0);
+        if (a == b && (op == OP_AND || op == OP_OR))
+            return a;
+        if (cb && (op == OP_ADD || op == OP_SUB || op == OP_OR || op == OP_XOR || op == OP_SHL || op == OP_SHR || op == OP_SAR))
+            return a;
+        if (cb && (op == OP_AND || op == OP_MUL) && ib->ty == ty)
+            return b;
+        if (ca && ir_is_const(f, a, &x) && x == 0 && (op == OP_AND || op == OP_MUL || op == OP_SHL || op == OP_SHR || op == OP_SAR))
+            return a;
+        return 0;
+    }
     if (op >= OP_ADD && op <= OP_SAR) {
         ca = ir_is_const(f, a, &x);
         cb = ir_is_const(f, b, &y);
@@ -957,9 +976,10 @@ void ir_resolve_all(Func *f)
         for (v = bb->first; v; v = ins[v].next) {
             Ins *i = &ins[v];
             n = ir_opcount_tab[i->op];
-            if (n == 255) { /* call: callee and arguments */
+            if (n == 255) { /* call: callee and arguments (an intrinsic's c is a number) */
                 u32 *p = xa + i->a;
-                RESOLVE(i->c);
+                if (i->op == OP_CALL)
+                    RESOLVE(i->c);
                 for (k = 0; k < i->b; k++)
                     RESOLVE(p[k]);
                 continue;
@@ -1036,6 +1056,19 @@ u32 ir_call(Func *f, int ty, u32 callee, const u32 *args, u32 nargs, u32 nfixed,
     v = ir_raw(f, OP_CALL, ty, at + 1, nargs);
     f->ins[v].c = callee;
     f->ins[v].flags = (u8)flags;
+    if (f->cur)
+        ir_append(f, f->cur, v);
+    return v;
+}
+
+/* An x86-64 intrinsic (OP_XI): entry id of x86i_tab applied to args. */
+u32 ir_xi(Func *f, int ty, u32 id, const u32 *args, u32 nargs)
+{
+    u32 at = xalloc(f, nargs ? nargs : 1), v, k;
+    for (k = 0; k < nargs; k++)
+        f->xargs[at + k] = args[k];
+    v = ir_raw(f, OP_XI, ty, at, nargs);
+    f->ins[v].c = id;
     if (f->cur)
         ir_append(f, f->cur, v);
     return v;
@@ -1145,12 +1178,12 @@ static const char *const op_names[OP_COUNT] = {
     "fadd", "fsub", "fmul", "fdiv", "fneg", "feq", "fne", "flt", "fle", "fgt", "fge",
     "sext8", "sext16", "zext8", "zext16", "sext32", "zext32", "trunc",
     "sitof", "uitof", "ftosi", "ftoui", "fext", "ftrunc", "umulh", "smulh", "isconst", "clz", "ctz", "bswap", "popcnt",
-    "tls", "asmout",
+    "bitcast", "tls", "asmout",
     "load", "store", "call", "memcpy", "memzero", "vastart", "select", "frameaddr", "pin", "byval",
-    "vload", "vstore", "vsplat", "vsum", "vsmax", "vsmin", "vumax", "vumin", "viota"
+    "vload", "vstore", "vsplat", "vsum", "vsmax", "vsmin", "vumax", "vumin", "viota", "vmath", "xi"
 };
-static const char *const ty_names[] = { "void", "i32", "i64", "f32", "f64", "v128" };
-static const char *const mem_names[] = { "s8", "u8", "s16", "u16", "m32", "m64", "f32", "f64" };
+static const char *const ty_names[] = { "void", "i32", "i64", "f32", "f64", "v128", "v256" };
+static const char *const mem_names[] = { "s8", "u8", "s16", "u16", "m32", "m64", "f32", "f64", "v128", "v256" };
 
 static void dump_val(Func *f, u32 v)
 {
@@ -1241,6 +1274,15 @@ void ir_dump(Func *f)
                 printf(", %u", i->c);
                 break;
             case OP_VASTART:
+                break;
+            case OP_XI:
+                printf(" #%u(", i->c);
+                for (k = 0; k < i->b; k++) {
+                    if (k)
+                        printf(", ");
+                    dump_val(f, f->xargs[i->a + k]);
+                }
+                printf(")");
                 break;
             case OP_SELECT:
                 printf(" ");

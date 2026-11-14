@@ -66,6 +66,8 @@ static int mem_ty(int mem)
     case M_64: return IT_I64;
     case M_F32: return IT_F32;
     case M_F64: return IT_F64;
+    case M_V128: return IT_V128;
+    case M_V256: return IT_V256;
     }
     return IT_I32;
 }
@@ -255,7 +257,7 @@ void opt_promote(Func *f)
                 if (o->op != OP_SLOT)
                     continue;
                 if (k == 0 && o->b == 0 && (i->op == OP_LOAD || i->op == OP_STORE)) {
-                    u32 size = i->mem <= M_8U ? 1 : i->mem <= M_16U ? 2 : i->mem == M_32 || i->mem == M_F32 ? 4 : 8;
+                    u32 size = M_SIZE(i->mem);
                     if (var_mem[o->a] == 0xfe && f->slots[o->a].size == size)
                         var_mem[o->a] = i->mem;
                     else if (var_mem[o->a] != i->mem)
@@ -434,7 +436,7 @@ static int split_changed;
 
 static u32 mem_size(int mem)
 {
-    return mem <= M_8U ? 1 : mem <= M_16U ? 2 : mem == M_32 || mem == M_F32 ? 4 : 8;
+    return M_SIZE(mem);
 }
 
 static void slot_fail(u32 s)
@@ -493,6 +495,12 @@ static void place_add(u32 s, i32 off, int mem)
         Place *q = &places[p - 1];
         if ((u32)q->off >= (u32)off + size || (u32)q->off + q->size <= (u32)off)
             continue;
+        if (mem >= M_V128 || q->mem >= M_V128) {
+            /* a whole vector (x86-64) is a place of its own, read and written only as that vector */
+            if (q->off != off || q->mem != mem)
+                slot_fail(s);
+            return;
+        }
         n++;
         if (q->off == off && q->size == size) {
             same = 1;
@@ -521,7 +529,7 @@ static void place_add(u32 s, i32 off, int mem)
     }
     (void)same;
     if (!n) {
-        place_put(s, off, size, mem_float(mem) ? mem : mem_int(size));
+        place_put(s, off, size, mem_float(mem) || mem >= M_V128 ? mem : mem_int(size));
         split_changed = 1;
         return;
     }
@@ -608,6 +616,8 @@ static void place_align(u32 s, i32 off, u32 n, u32 al)
         Place *q = &places[p - 1];
         if (q->off < off || (u32)q->off >= (u32)off + n)
             continue;
+        if (q->mem >= M_V128)
+            continue; /* (an x86-64 vector is read and written unaligned) */
         if (q->size > al && opt_dev_fn && (al == 1 || al == 2 || al == 4) && (u32)(q->off - off) % al == 0) {
             /* device code: the place is cut into whole numbers that can be */
             place_add(s, q->off, mem_int(al));
@@ -1038,7 +1048,7 @@ int opt_split(Func *f)
                 if (places[p - 1].off < use[j].off[0] || (u32)places[p - 1].off >= (u32)use[j].off[0] + cnt)
                     continue;
                 zv = pm == M_F32 ? ir_fconst(f, IT_F32, 0.0) : pm == M_F64 ? ir_fconst(f, IT_F64, 0.0)
-                                                                            : ir_const(f, pm == M_64 ? IT_I64 : IT_I32, 0);
+                                                                            : ir_const(f, mem_ty(pm), 0);
                 st = ir_raw(f, OP_STORE, IT_VOID, ir_slot_addr(f, to, 0), zv);
                 f->ins[st].mem = (u8)pm;
                 ir_insert_before(f, at, st);
@@ -1105,7 +1115,8 @@ void opt_dce(Func *f)
         Block *bb = &f->blk[b];
         for (v = bb->first; v; v = f->ins[v].next) {
             int op = f->ins[v].op;
-            if (op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_PARAM || op == OP_VSTORE) {
+            if (op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_PARAM || op == OP_VSTORE ||
+                (op == OP_XI && (f->ins[v].flags & XI_EFFECT))) {
                 live[v] = 1;
                 stack[sp++] = v;
             }

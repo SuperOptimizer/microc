@@ -68,6 +68,7 @@ static int mem_ty(int mem)
     case M_F64: return IT_F64;
     case M_V128: return IT_V128;
     case M_V256: return IT_V256;
+    case M_V512: return IT_V512;
     }
     return IT_I32;
 }

@@ -7,13 +7,15 @@
 /* Value types. Narrow integers exist only in memory accesses. */
 enum { IT_VOID, IT_I32, IT_I64, IT_F32, IT_F64,
        IT_V128, /* 128-bit vector; the lane kind is in Ins.mem (opt_vec.c; x86-64 intrinsics and vector types) */
-       IT_V256  /* 256-bit vector (x86-64 AVX only) */ };
-#define IT_ISVEC(t) ((t) == IT_V128 || (t) == IT_V256)
+       IT_V256, /* 256-bit vector (x86-64 AVX only) */
+       IT_V512  /* 512-bit vector (x86-64 AVX-512 only) */ };
+#define IT_ISVEC(t) ((t) == IT_V128 || (t) == IT_V256 || (t) == IT_V512)
 
 /* Memory access kinds for OP_LOAD / OP_STORE. */
 enum { M_8S, M_8U, M_16S, M_16U, M_32, M_64, M_F32, M_F64,
-       M_V128, M_V256 /* a whole vector (x86-64): the value is IT_V128 / IT_V256; may alias anything */ };
-#define M_SIZE(m) ((m) <= M_8U ? 1u : (m) <= M_16U ? 2u : (m) == M_32 || (m) == M_F32 ? 4u : (m) == M_V128 ? 16u : (m) == M_V256 ? 32u : 8u)
+       M_V128, M_V256, M_V512 /* a whole vector (x86-64): the value is IT_V128 / IT_V256 / IT_V512; may alias anything */ };
+#define M_SIZE(m) ((m) <= M_8U ? 1u : (m) <= M_16U ? 2u : (m) == M_32 || (m) == M_F32 ? 4u : (m) == M_V128 ? 16u : (m) == M_V256 ? 32u : \
+                   (m) == M_V512 ? 64u : 8u)
 
 enum {
     OP_NOP,

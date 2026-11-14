@@ -321,7 +321,7 @@ static void sys_lto(const char *out_path, const char *entry)
 
 /* x86-64 instruction set extensions the code may use (-mavx2, -march=...): what <immintrin.h> users test */
 enum { XF_SSE3 = 1, XF_SSSE3 = 2, XF_SSE41 = 4, XF_SSE42 = 8, XF_POPCNT = 16, XF_AVX = 32, XF_AVX2 = 64, XF_FMA = 128,
-       XF_F16C = 256, XF_BMI = 512, XF_BMI2 = 1024 };
+       XF_F16C = 256, XF_BMI = 512, XF_BMI2 = 1024, XF_AVX512F = 2048, XF_AVX512BW = 4096 };
 static u32 x86_feat;
 #define XF_V2 (XF_SSE3 | XF_SSSE3 | XF_SSE41 | XF_SSE42 | XF_POPCNT)
 #define XF_V3 (XF_V2 | XF_AVX | XF_AVX2 | XF_FMA | XF_F16C | XF_BMI | XF_BMI2)
@@ -331,7 +331,7 @@ static u32 x86_native(void)
 {
 #if defined(__x86_64__)
     unsigned a, b, c, d, r = 0;
-    int os_ymm = 0;
+    int os_ymm = 0, os_zmm = 0;
     __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(1), "2"(0));
     if (c & 1)
         r |= XF_SSE3;
@@ -352,7 +352,8 @@ static u32 x86_native(void)
     if (c >> 27 & 1) { /* OSXSAVE: XCR0 says which register states the system saves */
         unsigned lo, hi;
         __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0)); /* xgetbv */
-        os_ymm = (lo & 6) == 6; /* xmm and ymm state */
+        os_ymm = (lo & 6) == 6;       /* xmm and ymm state */
+        os_zmm = (lo & 0xe6) == 0xe6; /* and the opmask and zmm states */
         (void)hi;
     }
     __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(7), "2"(0));
@@ -362,8 +363,14 @@ static u32 x86_native(void)
         r |= XF_AVX2;
     if (b >> 8 & 1)
         r |= XF_BMI2;
+    if (b >> 16 & 1)
+        r |= XF_AVX512F;
+    if (b >> 30 & 1)
+        r |= XF_AVX512BW;
     if (!os_ymm) /* the processor has AVX but the system does not save ymm registers (some VMs): none of it */
-        r &= ~(u32)(XF_AVX | XF_AVX2 | XF_FMA | XF_F16C);
+        r &= ~(u32)(XF_AVX | XF_AVX2 | XF_FMA | XF_F16C | XF_AVX512F | XF_AVX512BW);
+    if (!os_zmm)
+        r &= ~(u32)(XF_AVX512F | XF_AVX512BW);
     (void)a;
     (void)d;
     return r;
@@ -380,10 +387,12 @@ static int x86_option(const char *a)
         {"sse4.2", XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3}, {"sse4", XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3},
         {"popcnt", XF_POPCNT}, {"avx", XF_AVX | XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3},
         {"avx2", XF_AVX2 | XF_AVX | XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3}, {"fma", XF_FMA | XF_AVX},
-        {"f16c", XF_F16C | XF_AVX}, {"bmi", XF_BMI}, {"bmi2", XF_BMI2}};
-    static const char *const v3[] = {"x86-64-v3", "x86-64-v4", "haswell", "broadwell", "skylake", "skylake-avx512",
-        "cascadelake", "icelake-client", "icelake-server", "tigerlake", "alderlake", "raptorlake", "meteorlake",
-        "sapphirerapids", "graniterapids", "znver1", "znver2", "znver3", "znver4", "znver5", 0};
+        {"f16c", XF_F16C | XF_AVX}, {"bmi", XF_BMI}, {"bmi2", XF_BMI2},
+        {"avx512f", XF_AVX512F | XF_V3}, {"avx512bw", XF_AVX512BW | XF_AVX512F | XF_V3}};
+    static const char *const v3[] = {"x86-64-v3", "haswell", "broadwell", "skylake", "alderlake", "raptorlake", "meteorlake",
+        "znver1", "znver2", "znver3", 0};
+    static const char *const v4[] = {"x86-64-v4", "skylake-avx512", "cascadelake", "icelake-client", "icelake-server",
+        "tigerlake", "sapphirerapids", "graniterapids", "znver4", "znver5", 0};
     u32 k;
     if (strncmp(a, "-march=", 7) == 0 || strncmp(a, "-mtune=", 7) == 0) {
         if (a[2] == 't')
@@ -395,9 +404,12 @@ static int x86_option(const char *a)
         else if (strcmp(a + 7, "x86-64") == 0)
             x86_feat = 0;
         else
-            for (k = 0; v3[k]; k++)
-                if (strcmp(a + 7, v3[k]) == 0)
+            for (k = 0; v3[k] || v4[k]; k++) {
+                if (v3[k] && strcmp(a + 7, v3[k]) == 0)
                     x86_feat = XF_V3;
+                if (v4[k] && strcmp(a + 7, v4[k]) == 0)
+                    x86_feat = XF_V3 | XF_AVX512F | XF_AVX512BW;
+            }
         return 1;
     }
     if (strncmp(a, "-m", 2) != 0)
@@ -477,7 +489,8 @@ static void target_macros(void)
         static const struct { u32 bit; const char *name; } fm[] = {
             {XF_SSE3, "__SSE3__"}, {XF_SSSE3, "__SSSE3__"}, {XF_SSE41, "__SSE4_1__"}, {XF_SSE42, "__SSE4_2__"},
             {XF_POPCNT, "__POPCNT__"}, {XF_AVX, "__AVX__"}, {XF_AVX2, "__AVX2__"}, {XF_FMA, "__FMA__"},
-            {XF_F16C, "__F16C__"}, {XF_BMI, "__BMI__"}, {XF_BMI2, "__BMI2__"}};
+            {XF_F16C, "__F16C__"}, {XF_BMI, "__BMI__"}, {XF_BMI2, "__BMI2__"}, {XF_AVX512F, "__AVX512F__"},
+            {XF_AVX512BW, "__AVX512BW__"}};
         for (k = 0; no[k]; k++)
             pp_undef(no[k]);
         for (k = 0; yes[k]; k++)
@@ -491,6 +504,7 @@ static void target_macros(void)
                 pp_define(fm[k].name);
         opt_avx = (x86_feat & XF_AVX) != 0;
         opt_f16c = (x86_feat & XF_F16C) != 0;
+        opt_avx512 = (x86_feat & XF_AVX512F) != 0;
         opt_x64_sse41 = (x86_feat & XF_SSE41) != 0; /* the vectoriser may use it */
         opt_x64_avx2 = (x86_feat & XF_AVX2) != 0;   /* 32-byte vectors in AVX functions */
         opt_x64_fma = (x86_feat & XF_FMA) != 0;     /* -ffp-contract: a * b + c as vfmadd */

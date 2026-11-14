@@ -1,10 +1,21 @@
 /* mcc's <immintrin.h>: x86-64 SIMD intrinsics (SSE through AVX2, FMA, F16C, BMI2).
    The vector types are GNU vectors; each intrinsic is a compiler builtin (src/x86i.c lists them) that becomes
    the instruction itself in x86-64 host code. They are there whatever -m options say; the __AVX2__ and
-   other macros say what -mavx2, -march=... asked for. No AVX-512. */
+   other macros say what -mavx2, -march=... asked for. AVX-512: the few that ufsm uses
+   (512-bit vectors are registers only with -mavx512f or -march=x86-64-v4 / znver4 / native on such a machine). */
 #ifndef __MCC_IMMINTRIN_H
 #define __MCC_IMMINTRIN_H
 
+typedef float __m512 __attribute__((__vector_size__(64)));
+typedef double __m512d __attribute__((__vector_size__(64)));
+typedef long long __m512i __attribute__((__vector_size__(64)));
+typedef float __m512_u __attribute__((__vector_size__(64), __aligned__(1)));
+typedef double __m512d_u __attribute__((__vector_size__(64), __aligned__(1)));
+typedef long long __m512i_u __attribute__((__vector_size__(64), __aligned__(1)));
+typedef unsigned char __mmask8;
+typedef unsigned short __mmask16;
+typedef unsigned int __mmask32;
+typedef unsigned long long __mmask64;
 typedef float __m256 __attribute__((__vector_size__(32)));
 typedef double __m256d __attribute__((__vector_size__(32)));
 typedef long long __m256i __attribute__((__vector_size__(32)));
@@ -391,6 +402,91 @@ typedef unsigned char __v16qu __attribute__((__vector_size__(16)));
 #define _mm256_zextpd128_pd256 __builtin_x86_mm256_zextpd128_pd256
 #define _mm256_zextps128_ps256 __builtin_x86_mm256_zextps128_ps256
 #define _mm256_zextsi128_si256 __builtin_x86_mm256_zextsi128_si256
+#define _mm512_add_epi16 __builtin_x86_mm512_add_epi16
+#define _mm512_add_epi32 __builtin_x86_mm512_add_epi32
+#define _mm512_add_epi64 __builtin_x86_mm512_add_epi64
+#define _mm512_add_epi8 __builtin_x86_mm512_add_epi8
+#define _mm512_add_pd __builtin_x86_mm512_add_pd
+#define _mm512_add_ps __builtin_x86_mm512_add_ps
+#define _mm512_and_epi32 __builtin_x86_mm512_and_epi32
+#define _mm512_and_epi64 __builtin_x86_mm512_and_epi64
+#define _mm512_and_si512 __builtin_x86_mm512_and_si512
+#define _mm512_andnot_si512 __builtin_x86_mm512_andnot_si512
+#define _mm512_castpd_ps __builtin_x86_mm512_castpd_ps
+#define _mm512_castpd_si512 __builtin_x86_mm512_castpd_si512
+#define _mm512_castps_pd __builtin_x86_mm512_castps_pd
+#define _mm512_castps_si512 __builtin_x86_mm512_castps_si512
+#define _mm512_castsi512_pd __builtin_x86_mm512_castsi512_pd
+#define _mm512_castsi512_ps __builtin_x86_mm512_castsi512_ps
+#define _mm512_cvtepi32_ps __builtin_x86_mm512_cvtepi32_ps
+#define _mm512_cvttps_epi32 __builtin_x86_mm512_cvttps_epi32
+#define _mm512_div_pd __builtin_x86_mm512_div_pd
+#define _mm512_div_ps __builtin_x86_mm512_div_ps
+#define _mm512_fmadd_pd __builtin_x86_mm512_fmadd_pd
+#define _mm512_fmadd_ps __builtin_x86_mm512_fmadd_ps
+#define _mm512_fmsub_pd __builtin_x86_mm512_fmsub_pd
+#define _mm512_fmsub_ps __builtin_x86_mm512_fmsub_ps
+#define _mm512_fnmadd_pd __builtin_x86_mm512_fnmadd_pd
+#define _mm512_fnmadd_ps __builtin_x86_mm512_fnmadd_ps
+#define _mm512_fnmsub_pd __builtin_x86_mm512_fnmsub_pd
+#define _mm512_fnmsub_ps __builtin_x86_mm512_fnmsub_ps
+#define _mm512_load_epi32 __builtin_x86_mm512_load_epi32
+#define _mm512_load_epi64 __builtin_x86_mm512_load_epi64
+#define _mm512_load_pd __builtin_x86_mm512_load_pd
+#define _mm512_load_ps __builtin_x86_mm512_load_ps
+#define _mm512_load_si512 __builtin_x86_mm512_load_si512
+#define _mm512_loadu_epi32 __builtin_x86_mm512_loadu_epi32
+#define _mm512_loadu_epi64 __builtin_x86_mm512_loadu_epi64
+#define _mm512_loadu_pd __builtin_x86_mm512_loadu_pd
+#define _mm512_loadu_ps __builtin_x86_mm512_loadu_ps
+#define _mm512_loadu_si512 __builtin_x86_mm512_loadu_si512
+#define _mm512_max_epu8 __builtin_x86_mm512_max_epu8
+#define _mm512_max_pd __builtin_x86_mm512_max_pd
+#define _mm512_max_ps __builtin_x86_mm512_max_ps
+#define _mm512_min_epu8 __builtin_x86_mm512_min_epu8
+#define _mm512_min_pd __builtin_x86_mm512_min_pd
+#define _mm512_min_ps __builtin_x86_mm512_min_ps
+#define _mm512_mul_pd __builtin_x86_mm512_mul_pd
+#define _mm512_mul_ps __builtin_x86_mm512_mul_ps
+#define _mm512_mullo_epi32 __builtin_x86_mm512_mullo_epi32
+#define _mm512_or_epi32 __builtin_x86_mm512_or_epi32
+#define _mm512_or_epi64 __builtin_x86_mm512_or_epi64
+#define _mm512_or_si512 __builtin_x86_mm512_or_si512
+#define _mm512_set1_epi16 __builtin_x86_mm512_set1_epi16
+#define _mm512_set1_epi32 __builtin_x86_mm512_set1_epi32
+#define _mm512_set1_epi64 __builtin_x86_mm512_set1_epi64
+#define _mm512_set1_epi8 __builtin_x86_mm512_set1_epi8
+#define _mm512_set1_pd __builtin_x86_mm512_set1_pd
+#define _mm512_set1_ps __builtin_x86_mm512_set1_ps
+#define _mm512_setzero_epi32 __builtin_x86_mm512_setzero_epi32
+#define _mm512_setzero_pd __builtin_x86_mm512_setzero_pd
+#define _mm512_setzero_ps __builtin_x86_mm512_setzero_ps
+#define _mm512_setzero_si512 __builtin_x86_mm512_setzero_si512
+#define _mm512_sqrt_pd __builtin_x86_mm512_sqrt_pd
+#define _mm512_sqrt_ps __builtin_x86_mm512_sqrt_ps
+#define _mm512_store_epi32 __builtin_x86_mm512_store_epi32
+#define _mm512_store_epi64 __builtin_x86_mm512_store_epi64
+#define _mm512_store_pd __builtin_x86_mm512_store_pd
+#define _mm512_store_ps __builtin_x86_mm512_store_ps
+#define _mm512_store_si512 __builtin_x86_mm512_store_si512
+#define _mm512_storeu_epi32 __builtin_x86_mm512_storeu_epi32
+#define _mm512_storeu_epi64 __builtin_x86_mm512_storeu_epi64
+#define _mm512_storeu_pd __builtin_x86_mm512_storeu_pd
+#define _mm512_storeu_ps __builtin_x86_mm512_storeu_ps
+#define _mm512_storeu_si512 __builtin_x86_mm512_storeu_si512
+#define _mm512_sub_epi16 __builtin_x86_mm512_sub_epi16
+#define _mm512_sub_epi32 __builtin_x86_mm512_sub_epi32
+#define _mm512_sub_epi64 __builtin_x86_mm512_sub_epi64
+#define _mm512_sub_epi8 __builtin_x86_mm512_sub_epi8
+#define _mm512_sub_pd __builtin_x86_mm512_sub_pd
+#define _mm512_sub_ps __builtin_x86_mm512_sub_ps
+#define _mm512_test_epi16_mask __builtin_x86_mm512_test_epi16_mask
+#define _mm512_test_epi32_mask __builtin_x86_mm512_test_epi32_mask
+#define _mm512_test_epi64_mask __builtin_x86_mm512_test_epi64_mask
+#define _mm512_test_epi8_mask __builtin_x86_mm512_test_epi8_mask
+#define _mm512_xor_epi32 __builtin_x86_mm512_xor_epi32
+#define _mm512_xor_epi64 __builtin_x86_mm512_xor_epi64
+#define _mm512_xor_si512 __builtin_x86_mm512_xor_si512
 #define _mm_abs_epi16 __builtin_x86_mm_abs_epi16
 #define _mm_abs_epi32 __builtin_x86_mm_abs_epi32
 #define _mm_abs_epi8 __builtin_x86_mm_abs_epi8

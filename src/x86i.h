@@ -10,6 +10,7 @@
 /* operand and result kinds */
 enum {
     XT_VOID,
+    XT_M512, XT_M512D, XT_M512I, /* 512-bit vectors: IT_V512 */
     XT_M256, XT_M256D, XT_M256I, /* 256-bit vectors: IT_V256 */
     XT_M128, XT_M128D, XT_M128I, /* 128-bit vectors: IT_V128 */
     XT_I8, XT_I16, XT_U16, XT_I32, XT_U32, XT_I64, XT_U64, XT_F32, XT_F64,
@@ -40,7 +41,8 @@ enum {
     XK_CVTSS_SH, /* float to half, rounded as imm says */
     XK_CPUID,    /* a register of cpuid(leaf, subleaf) */
     XK_RAW,      /* fixed bytes (enc, most significant first) */
-    XK_PREFETCH  /* prefetch hint imm of the address */
+    XK_PREFETCH, /* prefetch hint imm of the address */
+    XK_KTEST     /* vptestm[bwdq] into a mask register, whose bits are the result (kmov) */
 };
 
 /* where the operands of an XK_VEX instruction go: d is the result, a0 a1 a2 the arguments that are not
@@ -56,13 +58,15 @@ enum {
     XF_DVM   /* d = a0 first, then reg = d, vvvv = a1, rm = a2 (FMA 213: d = a0 * a1 + a2) */
 };
 
-/* enc: the opcode byte, then map (1 0f, 2 0f38, 3 0f3a), pp (0 none, 1 66, 2 f3, 3 f2), W, L, /digit */
+/* enc: the opcode byte, then map (1 0f, 2 0f38, 3 0f3a), pp (0 none, 1 66, 2 f3, 3 f2), W, L, /digit, Z (512 bits, EVEX;
+   W then as EVEX wants it) */
 #define XE_OPC(e) ((e) & 0xff)
 #define XE_MAP(e) ((e) >> 8 & 3)
 #define XE_PP(e) ((e) >> 10 & 3)
 #define XE_W(e) ((e) >> 12 & 1)
 #define XE_L(e) ((e) >> 13 & 1)
 #define XE_DIGIT(e) ((e) >> 14 & 7)
+#define XE_Z(e) ((e) >> 17 & 1) /* 512 bits: EVEX encoded */
 
 typedef struct X86I {
     const char *name; /* without the leading underscore */

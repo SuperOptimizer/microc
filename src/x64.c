@@ -105,7 +105,8 @@ enum {
                                 into s0 (or zero); imm = encoding */
     X_CPUID,                 /* rax = register cc of cpuid(imm, imm >> 32) */
     X_RAW,                   /* the bytes of imm, most significant first */
-    X_PREFETCH               /* prefetch [s0 + s1 * scale + imm] with hint digit cc */
+    X_PREFETCH,              /* prefetch [s0 + s1 * scale + imm] with hint digit cc */
+    X_KTEST                  /* general d = the mask of vptestm (encoding imm) on s0, s1: k1, then kmov of cc bytes */
 };
 
 /* conditions: the processor's own, then two that take two tests after a
@@ -143,7 +144,7 @@ static u32 *vuses;     /* ... of them as a value (not the condition of a branch 
 static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk);
 static u32 div_pair(u32 v, int first);
 #define FUSE_NOT 0x80 /* while counting uses: the value is used as a value */
-#define LOAD_SIGNED32 10 /* access kind, here only: a 32-bit load that sign-extends to 64 bits */
+#define LOAD_SIGNED32 11 /* access kind, here only: a 32-bit load that sign-extends to 64 bits */
 static u8 *fused;
 static u8 *fma_sum; /* per IR value: a sum or difference that takes its product into a vfmadd */
 static u32 *cache_reg; /* per floating IR value: register holding it ... */
@@ -234,13 +235,14 @@ static int is_fp(int ty)
    keeps a vector without it in a register whatever it costs: sel_vec's legacy SSE code has no spill slots) */
 #define VC_V128 2
 #define VC_V256 (2 | 8)
+#define VC_V512 (2 | 8 | 32)
 #define VC_SPILL 16
 static int fn_avx;  /* the function is compiled for AVX, or uses intrinsics or 256-bit vectors (VEX code anyway) */
 static int vlegacy; /* the function has 128-bit operations in sel_vec's legacy SSE: its 128-bit vectors are not spilled */
 
 static int is_vec(int ty)
 {
-    return ty == IT_V128 || ty == IT_V256;
+    return ty == IT_V128 || ty == IT_V256 || ty == IT_V512;
 }
 
 /* held in an xmm register */
@@ -251,7 +253,7 @@ static int is_xmm(int ty)
 
 static int cls_of(int ty)
 {
-    return ty == IT_V256 ? 1 | VC_V256 | VC_SPILL : ty == IT_V128 ? 1 | VC_V128 | (vlegacy ? 0 : VC_SPILL) : is_fp(ty);
+    return ty == IT_V512 ? 1 | VC_V512 | VC_SPILL : ty == IT_V256 ? 1 | VC_V256 | VC_SPILL : ty == IT_V128 ? 1 | VC_V128 | (vlegacy ? 0 : VC_SPILL) : is_fp(ty);
 }
 
 static int is_w(int ty)
@@ -385,7 +387,7 @@ static void move_to(u32 d, u32 v)
         emit(X_MOV, 1, d, VREG0 + v, NOREG);
 }
 
-static const u8 mem_bytes[] = { 1, 1, 2, 2, 4, 8, 4, 8, 16, 32, 4 };
+static const u8 mem_bytes[] = { 1, 1, 2, 2, 4, 8, 4, 8, 16, 32, 64, 4 };
 
 typedef struct Addr {
     u32 base;  /* register or NOREG */
@@ -696,7 +698,7 @@ static u32 abi_assign(u32 n, u32 *nfr_out)
 
 static int ty_mem(int ty)
 {
-    return ty == IT_I64 ? M_64 : ty == IT_F32 ? M_F32 : ty == IT_F64 ? M_F64 : ty == IT_V128 ? M_V128 : ty == IT_V256 ? M_V256 : M_32;
+    return ty == IT_I64 ? M_64 : ty == IT_F32 ? M_F32 : ty == IT_F64 ? M_F64 : ty == IT_V128 ? M_V128 : ty == IT_V256 ? M_V256 : ty == IT_V512 ? M_V512 : M_32;
 }
 
 static u32 runtime_sym(const char *name, u32 *cache)
@@ -908,7 +910,7 @@ static void sel_call(u32 v)
     MIns *m;
     Addr a;
     u32 callee = NOREG;
-    int sret_regs = (i->flags & IF_SRET) && i->mem, ymm = i->ty == IT_V256;
+    int sret_regs = (i->flags & IF_SRET) && i->mem, ymm = i->ty == IT_V256 || i->ty == IT_V512;
 
     if (i->flags & IF_ASM) {
         sel_asm(v);
@@ -943,7 +945,7 @@ static void sel_call(u32 v)
             a_size[k] = ai->b | (ai->c > 8 ? 0x80000000U : 0);
         } else {
             a_kind[k] = is_xmm(ai->ty) ? AK_FP : AK_INT;
-            ymm |= ai->ty == IT_V256;
+            ymm |= ai->ty == IT_V256 || ai->ty == IT_V512;
         }
     }
     stack = abi_assign(n, &nfr);
@@ -1027,6 +1029,7 @@ static void sel_call(u32 v)
 
 #define VE(opc, map, pp, w) ((u32)(opc) | (u32)(map) << 8 | (u32)(pp) << 10 | (u32)(w) << 12)
 #define VE_L 0x2000u
+#define VE_Z 0x20000u /* 512 bits (EVEX) */
 #define VE_DIGIT(d) ((u32)(d) << 14)
 
 static int lane_bits(int mem)
@@ -1072,10 +1075,27 @@ static u32 vec_op_enc(int op, int mem)
     return 0;
 }
 
+/* the lane kind of the 512-bit operation being selected (-1: the encodings say W themselves) */
+static int zlane = -1;
+
+/* EVEX wants W set for the 64-bit-lane forms that VEX writes without it (vpaddq, vaddpd, vpsllq, vpbroadcastq ...);
+   the bitwise operations are the same bits as their 32-bit forms */
+static u32 evex_w(u32 enc)
+{
+    u32 op = XE_OPC(enc);
+    if (!(enc & VE_Z) || zlane < 0 || (zlane != M_64 && zlane != M_F64))
+        return enc;
+    if (XE_MAP(enc) == 1 && XE_PP(enc) == 1 && (op == 0xdb || op == 0xdf || op == 0xeb || op == 0xef))
+        return enc;
+    return enc | 0x1000u;
+}
+
 /* d = instruction enc in form (XF_*) on s0 s1 s2; imm8 < 0: no immediate byte */
 static MIns *emit_vex(u32 enc, int form, u32 d, u32 s0, u32 s1, u32 s2, int imm8)
 {
-    MIns *m = emit(X_VEX, form, d, s0, s1);
+    MIns *m;
+    enc = evex_w(enc);
+    m = emit(X_VEX, form, d, s0, s1);
     m->s2 = s2;
     m->imm = (i64)((u64)enc | (imm8 >= 0 ? (u64)1 << 32 | (u64)(u8)imm8 << 40 : 0));
     return m;
@@ -1099,7 +1119,7 @@ static int rm_mem_ok(u32 enc)
 
 static int xt_is_vec(int xt)
 {
-    return xt >= XT_M256 && xt <= XT_M128I;
+    return xt >= XT_M512 && xt <= XT_M128I;
 }
 
 /* The operand of vector instruction u that its encoding can take from memory (its r/m), or 0. */
@@ -1158,7 +1178,9 @@ static void emit_vex_load(u32 enc, u32 d, u32 s0, u32 ld, int imm8)
 /* d (or, with st, the memory from s0) = instruction enc with the memory operand a; s0 as vvvv when not st */
 static void emit_vexm(u32 enc, int st, u32 d, u32 s0, Addr *a, int imm8)
 {
-    MIns *m = emit(X_VEXM, (st ? 1 : s0 != NOREG ? 4 : 0) | (imm8 >= 0 ? 2 : 0), st ? NOREG : d, s0, a->base);
+    MIns *m;
+    enc = evex_w(enc);
+    m = emit(X_VEXM, (st ? 1 : s0 != NOREG ? 4 : 0) | (imm8 >= 0 ? 2 : 0), st ? NOREG : d, s0, a->base);
     m->s2 = a->idx;
     m->sym = a->sym;
     m->flags = a->flags;
@@ -1230,7 +1252,7 @@ static int avx_takes(u32 v)
         return 0;
     if (op == OP_SELECT)
         return fn_avx && is_vec(i->ty) && is_vec(f->ins[i->a].ty);
-    if (i->ty == IT_V256)
+    if (i->ty == IT_V256 || i->ty == IT_V512)
         return 1;
     if (i->ty != IT_V128 && op != OP_VSTORE && op != OP_VSUM)
         return 0;
@@ -1266,11 +1288,14 @@ static int avx_takes(u32 v)
 static void sel_avx(u32 v)
 {
     Ins *i = &f->ins[v];
-    u32 d = VREG0 + v, L = i->ty == IT_V256 ? VE_L : 0, enc, t;
+    u32 d = VREG0 + v, L = i->ty == IT_V512 ? VE_Z : i->ty == IT_V256 ? VE_L : 0, enc, t;
+    int wc = i->ty == IT_V512 ? 2 : i->ty == IT_V256; /* 0 xmm, 1 ymm, 2 zmm */
     int op = i->op, b;
     i64 c;
     MIns *m;
     Addr a;
+
+    zlane = i->ty == IT_V512 ? i->mem : -1;
 
     switch (op) {
     case OP_XI:
@@ -1323,7 +1348,7 @@ static void sel_avx(u32 v)
             lane = M_F64;
         else if (sty == IT_I64 && lane_bits(lane) < 64)
             lane = M_64;
-        m = emit(X_YSPLAT, i->ty == IT_V256, d, reg_of(i->a), NOREG);
+        m = emit(X_YSPLAT, wc, d, reg_of(i->a), NOREG);
         m->cc = (u8)lane;
         return;
     }
@@ -1358,12 +1383,12 @@ static void sel_avx(u32 v)
     case OP_NEG:
     case OP_FNEG:
     case OP_NOT:
-        t = new_vreg(1 | (L ? VC_V256 : VC_V128));
+        t = new_vreg(cls_of(i->ty));
         if (op == OP_NOT) {
-            emit(X_YONES, i->ty == IT_V256, t, NOREG, NOREG);
+            emit(X_YONES, wc, t, NOREG, NOREG);
             emit_vex(VE(0xef, 1, 1, 0) | L, XF_RVM, d, reg_of(i->a), t, NOREG, -1);
         } else if (op == OP_FNEG || i->mem == M_F32 || i->mem == M_F64) {
-            m = emit(X_YSIGN, i->ty == IT_V256, t, NOREG, NOREG);
+            m = emit(X_YSIGN, wc, t, NOREG, NOREG);
             m->cc = i->mem == M_F64 ? M_F64 : M_F32;
             emit_vex(VE(0xef, 1, 1, 0) | L, XF_RVM, d, reg_of(i->a), t, NOREG, -1);
         } else {
@@ -1414,6 +1439,8 @@ static void sel_splat_const(u32 v, u32 d)
     enc = (bits == 8 ? 0x678 : bits == 16 ? 0x679 : bits == 32 ? 0x618 : 0x659) | (i->ty == IT_V256 ? 0x2000u : 0);
     if (bits == 64 && i->ty == IT_V256)
         enc = 0x2619; /* vbroadcastsd */
+    if (i->ty == IT_V512)
+        enc = (bits == 8 ? 0x678 : bits == 16 ? 0x679 : bits == 32 ? 0x618 : 0x1619) | VE_Z; /* (EVEX: vbroadcastsd is W1) */
     m = emit(X_VEXM, 0, d, NOREG, NOREG);
     m->s2 = NOREG;
     m->sym = const_sym(b, (u32)bits / 8);
@@ -1645,6 +1672,7 @@ static void sel_xi(u32 v)
     MIns *m;
     Addr a;
 
+    zlane = -1; /* the table's encodings say W */
     for (k = 0; k < i->b && k < 5; k++)
         if (x->arg[k] == XT_IMM) {
             if (!const_of(args[k], &c))
@@ -1691,6 +1719,11 @@ static void sel_xi(u32 v)
         if (!fits32(a.off))
             die("%s: address offset out of range", f->name);
         m->imm = (i64)((u64)enc << 32 | (u32)a.off);
+        return;
+    case XK_KTEST:
+        m = emit(X_KTEST, 0, d, reg_of(args[0]), reg_of(args[1]));
+        m->imm = enc;
+        m->cc = (u8)(x->ret == XT_U64 ? 8 : x->ret == XT_U32 ? 4 : 2);
         return;
     case XK_LO:
         emit(X_YMOVLO, 0, d, reg_of(args[0]), NOREG);
@@ -2502,7 +2535,7 @@ static void sel_term(u32 b, u32 next)
             move_to(r, bb->arg);
             m = emit(X_RET, 0, NOREG, NOREG, NOREG);
             m->pmask = BIT(r);
-            m->cc = (u8)(f->ins[bb->arg].ty == IT_V256); /* the result is in ymm0: no vzeroupper */
+            m->cc = (u8)(f->ins[bb->arg].ty == IT_V256 || f->ins[bb->arg].ty == IT_V512); /* the result is in ymm0 / zmm0: no vzeroupper */
         } else {
             emit(X_RET, 0, NOREG, NOREG, NOREG);
         }
@@ -2840,7 +2873,7 @@ static void prepare(void)
     split_critical_edges();
     fn_avx = f->avx;
     for (v = 1; v < f->nins && !fn_avx; v++)
-        if (f->ins[v].blk && (f->ins[v].op == OP_XI || f->ins[v].ty == IT_V256))
+        if (f->ins[v].blk && (f->ins[v].op == OP_XI || f->ins[v].ty == IT_V256 || f->ins[v].ty == IT_V512))
             fn_avx = 1;
     vlegacy = 0;
     for (v = 1; v < f->nins && !vlegacy; v++) {
@@ -3481,8 +3514,25 @@ static void vex_prefix(u32 enc, u32 reg, u32 vvvv, u32 idx, u32 base)
     b1(XE_OPC(enc));
 }
 
+/* EVEX (enc with Z): 512 bits, no masking; registers below 16 only (R', V', the X of a register r/m stay clear) */
+static void evex_prefix(u32 enc, u32 reg, u32 vvvv, u32 idx, u32 base, u32 aaa)
+{
+    u32 R = reg != NOREG && (reg & 8), X = idx != NOREG && (idx & 8), B = base != NOREG && (base & 8);
+    u32 vv = vvvv == NOREG ? 0 : vvvv & 15;
+    b1(0x62);
+    b1((R ? 0 : 0x80) | (X ? 0 : 0x40) | (B ? 0 : 0x20) | 0x10 | (u32)XE_MAP(enc));
+    b1((u32)XE_W(enc) << 7 | (~vv & 15) << 3 | 4 | (u32)XE_PP(enc));
+    b1(2 << 5 | 8 | aaa);
+    b1(XE_OPC(enc));
+}
+
 static void vex_rr(u32 enc, u32 reg, u32 vvvv, u32 rm)
 {
+    if (XE_Z(enc)) {
+        evex_prefix(enc, reg, vvvv, NOREG, rm, 0);
+        b1(0xc0 | (reg & 7) << 3 | (rm & 7));
+        return;
+    }
     vex_prefix(enc, reg, vvvv, NOREG, rm);
     b1(0xc0 | (reg & 7) << 3 | (rm & 7));
 }
@@ -3491,6 +3541,18 @@ static void vex_mem(u32 enc, u32 reg, u32 vvvv, const EA *ea, u32 immbytes)
 {
     if (ea->fs)
         b1(0x64);
+    if (XE_Z(enc)) {
+        /* EVEX scales an 8-bit displacement by the operand size: always 32 bits here */
+        EA e = *ea;
+        if (e.sym == NOSLOT && e.base != NOREG && (e.disp != 0 || (e.base & 7) == 5))
+            e.force32 = 1;
+        if (e.sym != NOSLOT)
+            evex_prefix(enc, reg, vvvv, NOREG, NOREG, 0);
+        else
+            evex_prefix(enc, reg, vvvv, e.idx, e.base, 0);
+        mem_tail(reg, &e, immbytes);
+        return;
+    }
     if (ea->sym != NOSLOT)
         vex_prefix(enc, reg, vvvv, NOREG, NOREG);
     else
@@ -3551,7 +3613,7 @@ static int vw_of(u32 r)
     if (r == NOREG || r < VREG0)
         return 0;
     c = mf.vclass[r - VREG0];
-    return (c & 8) ? 32 : c & VC_V128 ? 16 : 0;
+    return (c & 32) ? 64 : (c & 8) ? 32 : c & VC_V128 ? 16 : 0;
 }
 
 static int is_xreg(u32 r)
@@ -3600,7 +3662,7 @@ static void store_reg(u32 s, const EA *ea)
 static void load_regw(u32 d, const EA *ea, int vw)
 {
     if (vw)
-        vex_mem(0x110 | (vw == 32 ? 0x2000u : 0), d, NOREG, ea, 0); /* vmovups */
+        vex_mem(0x110 | (vw == 64 ? VE_Z : vw == 32 ? 0x2000u : 0), d, NOREG, ea, 0); /* vmovups */
     else
         load_reg(d, ea);
 }
@@ -3608,7 +3670,7 @@ static void load_regw(u32 d, const EA *ea, int vw)
 static void store_regw(u32 s, const EA *ea, int vw)
 {
     if (vw)
-        vex_mem(0x111 | (vw == 32 ? 0x2000u : 0), s, NOREG, ea, 0);
+        vex_mem(0x111 | (vw == 64 ? VE_Z : vw == 32 ? 0x2000u : 0), s, NOREG, ea, 0);
     else
         store_reg(s, ea);
 }
@@ -3616,7 +3678,7 @@ static void store_regw(u32 s, const EA *ea, int vw)
 static void vmov_rr(u32 d, u32 s, int vw)
 {
     if (d != s)
-        vex_rr(0x128 | (vw == 32 ? 0x2000u : 0), d, NOREG, s); /* vmovaps */
+        vex_rr(0x128 | (vw == 64 ? VE_Z : vw == 32 ? 0x2000u : 0), d, NOREG, s); /* vmovaps */
 }
 
 /* The spill slot the instruction before stored last, from which register, and where the current instruction's code
@@ -4393,20 +4455,26 @@ static void encode(MIns *i)
         if (i->op == X_YZERO)
             vex_rr(0x5ef, dr, dr, dr); /* vpxor xmm: the whole register */
         else
-            vex_rr(0x576 | (i->w ? 0x2000u : 0), dr, dr, dr); /* vpcmpeqd */
+            if (i->w == 2) {
+                vex_rr(VE(0x25, 3, 1, 0) | VE_Z, dr, dr, dr); /* vpternlogd 0xff */
+                b1(0xff);
+            } else {
+                vex_rr(0x576 | (i->w ? 0x2000u : 0), dr, dr, dr); /* vpcmpeqd */
+            }
         fin(i->d, dr);
         return;
     case X_YSIGN:
         dr = xdst(i->d);
         mov_ri(SCR0, i->cc == M_F64 ? (u64)1 << 63 : 0x80000000UL, i->cc == M_F64);
         vex_rr(0x56e | (i->cc == M_F64 ? 0x1000u : 0), FSCR1, NOREG, SCR0);                           /* vmovd / vmovq */
-        vex_rr((i->cc == M_F64 ? 0x659 : 0x658) | (i->w ? 0x2000u : 0), dr, NOREG, FSCR1); /* vpbroadcastd / q */
+        vex_rr((i->cc == M_F64 ? (i->w == 2 ? 0x1659 : 0x659) : 0x658) | (i->w == 2 ? VE_Z : i->w ? 0x2000u : 0), dr, NOREG,
+               FSCR1); /* vpbroadcastd / q */
         fin(i->d, dr);
         return;
     case X_YSPLAT: {
         int lane = i->cc, bits = lane == M_8S || lane == M_8U ? 8 : lane == M_16S || lane == M_16U ? 16
                               : lane == M_32 || lane == M_F32 ? 32 : 64;
-        u32 L = i->w ? 0x2000u : 0, s = xuse(i->s0, 1);
+        u32 L = i->w == 2 ? VE_Z : i->w ? 0x2000u : 0, s = xuse(i->s0, 1);
         dr = xdst(i->d);
         if (!is_xreg(i->s0)) {
             vex_rr(0x56e | (bits == 64 ? 0x1000u : 0), FSCR1, NOREG, s); /* vmovd / vmovq */
@@ -4415,7 +4483,8 @@ static void encode(MIns *i)
         if (lane == M_F32)
             vex_rr(0x618 | L, dr, NOREG, s); /* vbroadcastss */
         else
-            vex_rr((bits == 8 ? 0x678 : bits == 16 ? 0x679 : bits == 32 ? 0x658 : 0x659) | L, dr, NOREG, s); /* vpbroadcastb w d q */
+            vex_rr((bits == 8 ? 0x678 : bits == 16 ? 0x679 : bits == 32 ? 0x658 : i->w == 2 ? 0x1659 : 0x659) | L, dr, NOREG,
+                   s); /* vpbroadcastb w d q */
         fin(i->d, dr);
         return;
     }
@@ -4445,6 +4514,15 @@ static void encode(MIns *i)
             vmov_rr(loc_of(i->d), FSCR0, vw_of(i->d));
         return;
     }
+    case X_KTEST:
+        a = xuse(i->s0, 0);
+        b = xuse(i->s1, 1);
+        vex_rr((u32)i->imm, 1, a, b); /* vptestm k1, a, b */
+        dr = dst(i->d, SCR0);
+        /* kmovq / kmovd / kmovw r, k1 */
+        vex_rr(i->cc == 8 ? VE(0x93, 1, 3, 1) : i->cc == 4 ? VE(0x93, 1, 3, 0) : VE(0x93, 1, 0, 0), dr, NOREG, 1);
+        fin(i->d, dr);
+        return;
     case X_CPUID:
         b1(0x53); /* push rbx: cpuid writes it */
         mov_ri(RAX, (u64)(u32)i->imm, 0);
@@ -4787,13 +4865,13 @@ static void encode(MIns *i)
         return;
     }
     case X_LOAD: {
-        static const u32 ops[] = { O_0F | 0xbe, O_0F | 0xb6, O_0F | 0xbf, O_0F | 0xb7, 0x8b, 0x8b, 0x8b, 0x8b, 0, 0, 0x63 };
+        static const u32 ops[] = { O_0F | 0xbe, O_0F | 0xb6, O_0F | 0xbf, O_0F | 0xb7, 0x8b, 0x8b, 0x8b, 0x8b, 0, 0, 0, 0x63 }; /* M_V*: none */
         int fp = i->d >= VREG0 ? mf.vclass[i->d - VREG0] & 1 : i->d >= XMM0;
         a = i->s0 == NOREG ? NOREG : use(i->s0, SCR0);
         x = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
         mem_ea(i, a, x, i->imm, &ea);
         dr = dst(i->d, fp ? FSCR0 : SCR0);
-        if (i->cc == M_V128 || i->cc == M_V256) {
+        if (i->cc == M_V128 || i->cc == M_V256 || i->cc == M_V512) {
             load_regw(dr, &ea, mem_bytes[i->cc]);
             fin(i->d, dr);
             return;
@@ -4823,7 +4901,7 @@ static void encode(MIns *i)
         }
         a = use(i->s0, fp ? FSCR0 : SCR0);
         n = mem_bytes[i->cc];
-        if (i->cc == M_V128 || i->cc == M_V256)
+        if (i->cc == M_V128 || i->cc == M_V256 || i->cc == M_V512)
             store_regw(a, &ea, (int)n);
         else if (fp)
             op_mem((n == 8 ? O_F2 : O_F3) | O_0F | 0x11, 0, a, &ea, 0);
@@ -5608,8 +5686,8 @@ void x64_gen(Func *fn, Obj *o)
     uses_ymm = 0;
     for (k = 0; k < mf.nvreg; k++) {
         u32 l = mf.loc[k];
-        int vw = (mf.vclass[k] & 8) ? 32 : mf.vclass[k] & VC_V128 ? 16 : 0;
-        if (vw == 32)
+        int vw = (mf.vclass[k] & 32) ? 64 : (mf.vclass[k] & 8) ? 32 : mf.vclass[k] & VC_V128 ? 16 : 0;
+        if (vw >= 32)
             uses_ymm = 1;
         if (vw && l != NOREG && l >= SPILL0)
             spill_off[l - SPILL0] = (u32)vw;
@@ -5617,7 +5695,7 @@ void x64_gen(Func *fn, Obj *o)
     off = spill_base;
     for (k = 0; k < mf.nspill; k++) {
         u32 sz = spill_off[k];
-        off = (u32)align_up(off + sz, sz > 8 ? 16 : 8);
+        off = (u32)align_up(off + sz, sz > 8 ? 16 : 8); /* (vmovups: no more is needed) */
         spill_off[k] = off;
     }
     for (k = 0; k < f->nslots; k++) {

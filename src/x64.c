@@ -81,8 +81,8 @@ enum {
     X_VPAIR,  /* d = the general registers s0 (low half) and s1 (high half) */
     X_VSPLAT, /* d = the scalar s0 (w: in an xmm register) in every lane; cc = lane kind */
     X_VSUM,   /* scalar d = the lanes of s0 combined; cc = lane kind, imm = OP_VSUM's flags */
-    X_VLD,    /* d = [s0 + s1] */
-    X_VST,    /* [s1 + s2] = s0 */
+    X_VLD,    /* d = [s0 + s1]; w: four elements of the narrow kind cc there, widened to 32 bits */
+    X_VST,    /* [s1 + s2] = s0; w: its four 32-bit lanes narrowed to the kind cc */
     X_VONES,  /* d = all ones (imm 1: all zeros) */
     X_FUN     /* scalar d = a function of the scalar s0, done in line (sel_math): cc says how, imm the opcode */
 };
@@ -955,11 +955,13 @@ static void sel_vec(u32 v)
     MIns *m;
     switch (i->op) {
     case OP_VLOAD:
-        emit(X_VLD, 0, d, reg_of(i->a), reg_of(i->b));
+        m = emit(X_VLD, (i->flags & 0x80) != 0, d, reg_of(i->a), reg_of(i->b));
+        m->cc = i->flags & 0x7f;
         return;
     case OP_VSTORE:
-        m = emit(X_VST, 0, NOREG, reg_of(i->b), reg_of(i->a));
+        m = emit(X_VST, (i->flags & 0x80) != 0, NOREG, reg_of(i->b), reg_of(i->a));
         m->s2 = reg_of(i->c);
+        m->cc = i->flags & 0x7f;
         return;
     case OP_VSPLAT: {
         u64 c;
@@ -999,6 +1001,13 @@ static void sel_vec(u32 v)
         m->imm = VP66 | (0x70 + sh);
         m->cc = i->op == OP_SHL ? 6 : i->op == OP_SHR ? 2 : 4;
         m->sym = f->ins[i->b].a;
+        return;
+    }
+    case OP_VMATH: {
+        /* sqrtps sqrtpd; roundps roundpd: down 9, up 10, toward zero 11, the current way 4 (12: without inexact) */
+        static const u8 rnd[6] = { 0, 9, 10, 11, 4, 12 };
+        m = emit(X_VUN, 0, d, reg_of(i->a), NOREG);
+        m->imm = i->b == VM_SQRT ? (n == 8 ? VP66 : O_0F) | 0x51 : VP66 | O_3A | (n == 8 ? 0x09 : 0x08) | VIMM(rnd[i->b]);
         return;
     }
     case OP_SITOF: /* cvtdq2ps */
@@ -2710,7 +2719,49 @@ static void encode_vec(MIns *i)
             ea.base = x;
             ea.idx = b;
         }
-        op_mem(O_F3 | O_0F | (ld ? 0x6f : 0x7f), 0, ld ? vloc(i->d) : vloc(i->s0), &ea, 0); /* movdqu */
+        if (!i->w) {
+            op_mem(O_F3 | O_0F | (ld ? 0x6f : 0x7f), 0, ld ? vloc(i->d) : vloc(i->s0), &ea, 0); /* movdqu */
+            return;
+        }
+        {
+            int byte = mem_bytes[i->cc] == 1, sgn = i->cc == M_8S || i->cc == M_16S;
+            if (!ld) {
+                /* each lane's low bits, sign-extended so that the saturating packs keep them as they are */
+                u32 t = FSCR0;
+                mov_rr(t, vloc(i->s0));
+                vop_ri(O_66 | O_0F | 0x72, 6, t, byte ? 24 : 16); /* pslld */
+                vop_ri(O_66 | O_0F | 0x72, 4, t, byte ? 24 : 16); /* psrad */
+                op_rr(O_66 | O_0F | 0x6b, 0, t, t);                /* packssdw */
+                if (byte) {
+                    op_rr(O_66 | O_0F | 0x63, 0, t, t); /* packsswb */
+                    op_mem(O_66 | O_0F | 0x7e, 0, t, &ea, 0); /* movd */
+                } else {
+                    op_mem(O_66 | O_0F | 0xd6, 0, t, &ea, 0); /* movq */
+                }
+                return;
+            }
+            dr = vloc(i->d);
+            if (opt_x64_sse41) {
+                /* pmovzxbd pmovsxbd pmovzxwd pmovsxwd */
+                op_mem(O_66 | O_0F | O_38 | (byte ? (sgn ? 0x21 : 0x31) : (sgn ? 0x23 : 0x33)), 0, dr, &ea, 0);
+                return;
+            }
+            if (byte)
+                op_mem(O_66 | O_0F | 0x6e, 0, dr, &ea, 0); /* movd */
+            else
+                op_mem(O_F3 | O_0F | 0x7e, 0, dr, &ea, 0); /* movq */
+            if (sgn) {
+                if (byte)
+                    op_rr(O_66 | O_0F | 0x60, 0, dr, dr);       /* punpcklbw: each byte doubled */
+                op_rr(O_66 | O_0F | 0x61, 0, dr, dr);           /* punpcklwd */
+                vop_ri(O_66 | O_0F | 0x72, 4, dr, byte ? 24 : 16); /* psrad */
+            } else {
+                op_rr(O_66 | O_0F | 0xef, 0, FSCR0, FSCR0);
+                if (byte)
+                    op_rr(O_66 | O_0F | 0x60, 0, dr, FSCR0);
+                op_rr(O_66 | O_0F | 0x61, 0, dr, FSCR0);
+            }
+        }
         return;
     }
     case X_VSUM: {

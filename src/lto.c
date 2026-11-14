@@ -298,6 +298,7 @@ static void count_uses(void)
 static void emit_late(u32 n)
 {
     load(&fns[n]);
+    opt_obj = M;
     opt_run(F);
     arm64_gen(F, M);
     fns[n].state = 2;
@@ -310,6 +311,7 @@ static void compile(u32 n)
     /* a function with one call site is inlined there even when large, and
        then needs no code of its own */
     opt_inline_once = fn->ncalls == 1 && !fn->escapes;
+    opt_obj = M;
     opt_run(F);
     if (!fn->escapes && inline_saved(F->sym)) {
         /* every call may get inlined; code is generated later if one is not */

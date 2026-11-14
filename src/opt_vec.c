@@ -27,11 +27,14 @@ enum { K_NONE, K_IDX, K_ADDR, K_VEC, K_MASK, K_RED, K_SKIP, K_IVPHI, K_IVNEXT, K
 #define MAX_VECS 12 /* few enough that none is ever spilled */
 
 static u8 *kind, *shift;
-static u8 *mmk; /* a select that is a lane-by-lane maximum or minimum: MM_* bits, else 0 */
+static u8 *mmk; /* a select that is a lane-by-lane maximum or minimum: MM_* bits, else 0; a comparison: 1 if also used as a number */
+static int mixed;  /* x86-64: elements of different sizes, all in lanes of four bytes (narrower ones widened as they are
+                      read and narrowed as they are written) */
 #define MM_ON 1
 #define MM_MAX 2 /* else the minimum */
 #define MM_UNS 4 /* compared without sign */
 int opt_x64_sse41; /* x86-64: SSE4.1 may be used (pmulld, pmaxsd, ...); -msse4.1, -mavx2, -march=native ... */
+Obj *opt_obj;
 static u32 *base, *cnt, *map, *lpos;
 static u32 L;
 static u32 iv;  /* the induction variable that indexes arrays, if any */
@@ -102,12 +105,19 @@ static int is_idx(u32 x, u32 *sh)
 static u8 iv_val[MAX_IV]; /* the variable's value is used in the arithmetic, not only to index */
 
 /* x is computed lane by lane: a vector value of the loop, or an induction variable (0, 1, 2, ... per lane) */
+static int note_splat(u32 x);
+
 static int is_vec(u32 x)
 {
     if (INV(x))
         return 0;
     if (kind[x] == K_VEC)
         return 1;
+    if (kind[x] == K_MASK) {
+        /* a comparison used as a number: the mask and 1 (mmk marks it) */
+        mmk[x] = 1;
+        return note_splat(ir_const(f, IT_I32, 1));
+    }
     if (kind[x] != K_IVPHI)
         return 0;
     iv_val[iv_index(x)] = 1;
@@ -160,7 +170,7 @@ static u32 vec_operand(u32 x, u32 P)
 {
     u32 j;
     if (!INV(x))
-        return map[x];
+        return kind[x] == K_MASK && mmk[x] ? lpos[x] : map[x];
     for (j = 0; j < nsplat && splat_of[j] != x; j++)
         ;
     if (j == nsplat) {
@@ -335,6 +345,35 @@ static u32 vec_pressure(u32 extra)
     return most + nsplat + extra;
 }
 
+/* A call of sqrtf, fabsf, floorf and the like (or their double forms) that x86-64 does lane by lane: 1 + VM_*, or
+   VM_FABS; 0 for any other call. */
+#define VM_FABS 0x40
+static int vmath_of(u32 v)
+{
+    static const char *const names[] = { "sqrt", "floor", "ceil", "trunc", "rint", "nearbyint", "fabs", 0 };
+    Ins *i = &f->ins[v], *c = &f->ins[i->c];
+    const char *nm;
+    size_t bl;
+    u32 k, a;
+    int isf;
+    if (opt_arch != ARCH_X64 || !opt_obj || c->op != OP_ADDR || c->b || i->b != 1 || (i->flags & (IF_SRET | IF_ASM | IF_ATOMIC | IF_ALLOCA)))
+        return 0;
+    if (opt_obj->syms[c->a].sec != SEC_UNDEF && opt_obj->syms[c->a].sec != SEC_NONE)
+        return 0; /* the program's own function of that name */
+    nm = intern_str(opt_obj->syms[c->a].name);
+    bl = strlen(nm);
+    isf = bl > 1 && nm[bl - 1] == 'f';
+    a = f->xargs[i->a];
+    if (f->ins[a].ty != (isf ? IT_F32 : IT_F64) || i->ty != f->ins[a].ty)
+        return 0;
+    for (k = 0; names[k]; k++)
+        if (strlen(names[k]) == bl - (size_t)isf && strncmp(nm, names[k], bl - (size_t)isf) == 0)
+            break;
+    if (!names[k] || (k == VM_SQRT && opt_math_errno) || (k > VM_SQRT && k <= VM_NEARBYINT && !opt_x64_sse41))
+        return 0;
+    return names[k + 1] ? 1 + (int)k : VM_FABS;
+}
+
 int opt_vec_report; /* say what was and was not vectorised */
 
 #define MISS(why) \
@@ -350,8 +389,10 @@ static int try_loop(u32 l, u32 n0)
     u32 red_phi[MAX_RED], red_next[MAX_RED], red_x[MAX_RED], acc[MAX_RED][4], nred = 0, un, u, offv;
     int red_op[MAX_RED];
     u32 keys[MAX_BASES], start[MAX_BASES], nkeys = 0, key, ivvec[MAX_IV];
-    u8 stored[MAX_BASES];
+    u8 stored[MAX_BASES], keysz[MAX_BASES], klsh[MAX_BASES];
+    u32 maxmem = 0, offn[4];
     u32 pa[MAX_PAIRS], pb[MAX_PAIRS], np = 0;
+    u8 pka[MAX_PAIRS], pkb[MAX_PAIRS];
     u32 nvec = 0, maxsh = 0, full_only = 0, vf, init64, n64, count, ok, vcnt, ivv, ivv2, sh, offend;
     int uns, c, cty, tnext, lsh, wide = 0;
     i64 st;
@@ -401,7 +442,7 @@ static int try_loop(u32 l, u32 n0)
     for (v = f->blk[l].first; v; v = f->ins[v].next) {
         Ins *i = &f->ins[v];
         u32 *ops, nops;
-        if (i->op == OP_CALL)
+        if (i->op == OP_CALL && !vmath_of(v))
             MISS("it calls a function");
         IR_OPS(f, i, ops, nops);
         for (k = 0; k < nops; k++)
@@ -469,6 +510,7 @@ static int try_loop(u32 l, u32 n0)
         MISS("the loop test is not on a counter");
 
     lanesz = 0;
+    mixed = 0;
     nsplat = 0;
     memset(iv_val, 0, sizeof iv_val);
     iv = 0;
@@ -503,16 +545,26 @@ static int try_loop(u32 l, u32 n0)
             break;
         case OP_LOAD:
         case OP_STORE:
-            if (!walks(i->a, (u32)mem_size(i->mem), &key) || !set_lane(i->mem))
-                MISS("a memory access that does not move by one element each time round, or elements of different sizes");
+            if (!walks(i->a, (u32)mem_size(i->mem), &key))
+                MISS("a memory access that does not move by one element each time round");
+            if (!set_lane(i->mem)) {
+                if (opt_arch != ARCH_X64)
+                    MISS("elements of different sizes");
+                mixed = 1;
+            }
+            if (mem_size(i->mem) > maxmem)
+                maxmem = (u32)mem_size(i->mem);
             for (k = 0; k < nkeys && keys[k] != key; k++)
                 ;
             if (k == nkeys) {
                 if (nkeys == MAX_BASES)
                     MISS("too many arrays");
                 stored[k] = 0;
+                keysz[nkeys] = (u8)mem_size(i->mem);
                 keys[nkeys++] = key;
             }
+            if (keysz[k] != (u8)mem_size(i->mem))
+                MISS("one array read or written as elements of different sizes");
             if (i->op == OP_LOAD) {
                 if (i->flags & 0x80)
                     MISS("an operation that has no vector form");
@@ -601,6 +653,27 @@ static int try_loop(u32 l, u32 n0)
             kind[v] = K_VEC;
             nvec++;
             break;
+        case OP_ZEXT8: case OP_ZEXT16: case OP_SEXT8: case OP_SEXT16:
+            /* the low byte or half of a 32-bit lane, extended: an and, or two shifts */
+            if (i->ty != IT_I32 || !is_vec(i->a) || ((i->op == OP_ZEXT8 || i->op == OP_ZEXT16) &&
+                !note_splat(ir_const(f, IT_I32, i->op == OP_ZEXT8 ? 0xff : 0xffff))))
+                MISS("a value that is neither per-element nor constant in the loop");
+            full_only = 1;
+            kind[v] = K_VEC;
+            nvec++;
+            break;
+        case OP_CALL: {
+            /* sqrtf (x) and its like: the function done lane by lane */
+            u32 a = f->xargs[i->a];
+            int vm = vmath_of(v);
+            if (!is_vec(a) || (vm == VM_FABS && !note_splat(ir_const(f, i->ty == IT_F32 ? IT_I32 : IT_I64,
+                                                                           i->ty == IT_F32 ? 0x7fffffffU : ~(u64)0 >> 1))))
+                MISS("a value that is neither per-element nor constant in the loop");
+            shift[v] = (u8)vm;
+            kind[v] = K_VEC;
+            nvec++;
+            break;
+        }
         case OP_NEG: case OP_FNEG:
             if (!is_vec(i->a))
                 MISS("a value that is neither per-element nor constant in the loop");
@@ -614,6 +687,23 @@ static int try_loop(u32 l, u32 n0)
     for (v = f->blk[l].first; v; v = f->ins[v].next)
         if (kind[v] == K_MASK)
             full_only = 1; /* a lane of all ones or all zeros from values of the full width */
+    if (opt_arch == ARCH_X64 && lanesz && lanesz < 4 && !mixed) {
+        /* narrow lanes cannot do it: lanes of four bytes, the elements widened, can (they do what C does) */
+        int narrow_ok = maxsh < lanesz * 8 && !full_only;
+        for (v = f->blk[l].first; v && narrow_ok; v = f->ins[v].next)
+            if ((kind[v] == K_VEC && mmk[v] && !minmax_op(v)) || ((kind[v] == K_VEC || kind[v] == K_MASK) && !x64_has(v)) ||
+                (kind[v] == K_VEC && (f->ins[v].ty == IT_F32 || f->ins[v].ty == IT_F64)))
+                narrow_ok = 0;
+        for (k = 0; k < nred && narrow_ok; k++)
+            if (!(red_op[k] == OP_ADD && f->ins[red_x[k]].op == OP_LOAD))
+                narrow_ok = 0;
+        mixed = !narrow_ok;
+    }
+    if (mixed) {
+        if (maxmem > 4)
+            MISS("elements of different sizes, some wider than four bytes");
+        lanesz = 4;
+    }
     if (!lanesz || maxsh >= lanesz * 8 || (full_only && lanesz < 4))
         MISS("no array access, or an operation not possible at this element width");
     for (v = f->blk[l].first; v; v = f->ins[v].next) {
@@ -665,6 +755,8 @@ static int try_loop(u32 l, u32 n0)
             extra += red_op[k] == OP_VSUM ? 0 : 4;
         for (k = 0; k < niv; k++)
             extra += iv_val[k] ? 2 : 0;
+        for (v = f->blk[l].first; v; v = f->ins[v].next)
+            extra += kind[v] == K_MASK && mmk[v];
         if (vec_pressure(extra) > 14)
             MISS("too many vector values at once for the x86-64 vector registers");
     }
@@ -708,6 +800,8 @@ static int try_loop(u32 l, u32 n0)
     vf = 16 / lanesz * un;
     for (lsh = 0; ((u32)1 << lsh) < lanesz; lsh++)
         ;
+    for (k = 0; k < nkeys; k++)
+        klsh[k] = (u8)(keysz[k] == 1 ? 0 : keysz[k] == 2 ? 1 : keysz[k] == 4 ? 2 : 3);
     if (st == 1) {
         init64 = cty == IT_I32 ? mk(P, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, iv_init[c], 0) : iv_init[c];
         n64 = cty == IT_I32 ? mk(P, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, n, 0) : n;
@@ -736,8 +830,8 @@ static int try_loop(u32 l, u32 n0)
         if (INV(keys[k])) {
             q = iv_index(iv);
             v = f->ins[iv].ty == IT_I32 ? mk(P, ext, IT_I64, iv_init[q], 0) : iv_init[q];
-            if (lsh)
-                v = mk(P, OP_SHL, IT_I64, v, C64(lsh));
+            if (klsh[k])
+                v = mk(P, OP_SHL, IT_I64, v, C64(klsh[k]));
             start[k] = mk(P, OP_ADD, IT_I64, outside(keys[k]), v);
         } else {
             q = iv_index(keys[k]);
@@ -751,11 +845,20 @@ static int try_loop(u32 l, u32 n0)
                 continue;
             if (np == MAX_PAIRS)
                 MISS("too many arrays to check for overlap"); /* what was added to the preheader is dead code */
+            pka[np] = (u8)k;
+            pkb[np] = (u8)j;
             pa[np] = start[k];
             pb[np++] = start[j];
         }
     }
-    for (k = 0; k < np; k++) {
+    for (k = 0; k < np && mixed; k++) {
+        /* arrays of different strides: the whole of each written one clear of the whole of the other */
+        u32 ka = pka[k], kb = pkb[k], ea, eb;
+        ea = mk(P, OP_ADD, IT_I64, pa[k], klsh[ka] ? mk(P, OP_SHL, IT_I64, count, C64(klsh[ka])) : count);
+        eb = mk(P, OP_ADD, IT_I64, pb[k], klsh[kb] ? mk(P, OP_SHL, IT_I64, count, C64(klsh[kb])) : count);
+        ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_OR, IT_I32, mk(P, OP_ULE, IT_I32, ea, pb[k]), mk(P, OP_ULE, IT_I32, eb, pa[k])));
+    }
+    for (k = 0; k < np && !mixed; k++) {
         u32 d = mk(P, OP_SUB, IT_I64, pa[k], pb[k]);
         ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_UGE, IT_I32, d, C64(16)));
         d = mk(P, OP_SUB, IT_I64, pb[k], pa[k]);
@@ -768,7 +871,7 @@ static int try_loop(u32 l, u32 n0)
             u32 send;
             if (!stored[j])
                 continue;
-            send = mk(P, OP_ADD, IT_I64, start[j], lsh ? mk(P, OP_SHL, IT_I64, count, C64(lsh)) : count);
+            send = mk(P, OP_ADD, IT_I64, start[j], klsh[j] ? mk(P, OP_SHL, IT_I64, count, C64(klsh[j])) : count);
             ok = mk(P, OP_AND, IT_I32, ok,
                     mk(P, OP_OR, IT_I32, mk(P, OP_ULE, IT_I32, aend, start[j]), mk(P, OP_UGE, IT_I32, a, send)));
         }
@@ -836,6 +939,7 @@ static int try_loop(u32 l, u32 n0)
     }
     for (u = 0; u < un; u++) {
         offv = u ? mk(V, OP_ADD, IT_I64, ivv, C64(16 * u)) : ivv;
+        offn[0] = offn[1] = 0; /* the offsets in arrays of narrower elements, made when first needed */
         for (k = 0; k < niv; k++) {
             int ty = f->ins[iv_phi[k]].ty;
             if (!iv_val[k])
@@ -866,21 +970,29 @@ static int try_loop(u32 l, u32 n0)
                     acc[k][0] = nv;
                     continue;
                 }
-                nv = mk(V, red_op[k], IT_V128, acc[k][u], map[red_x[k]]);
+                nv = mk(V, red_op[k], IT_V128, acc[k][u], vec_operand(red_x[k], P));
                 f->xargs[f->ins[acc[k][u]].a + 1] = nv;
                 acc[k][u] = nv;
             } else if (in.op == OP_LOAD || in.op == OP_STORE) {
-                walks(in.a, lanesz, &key);
+                u32 off = offv;
+                walks(in.a, (u32)mem_size(in.mem), &key);
                 for (k = 0; keys[k] != key; k++)
                     ;
+                if (mixed && klsh[k] < 2) {
+                    if (!offn[klsh[k]])
+                        offn[klsh[k]] = mk(V, OP_SHR, IT_I64, offv, C64(2 - klsh[k]));
+                    off = offn[klsh[k]];
+                }
                 if (in.op == OP_LOAD) {
-                    nv = mk(V, OP_VLOAD, IT_V128, start[k], offv);
+                    nv = mk(V, OP_VLOAD, IT_V128, start[k], off);
                 } else {
                     lk = lane_kind(f->ins[in.b].ty);
                     x = vec_operand(in.b, P);
                     nv = mk(V, OP_VSTORE, IT_VOID, start[k], x);
-                    f->ins[nv].c = offv;
+                    f->ins[nv].c = off;
                 }
+                if (mixed && klsh[k] < 2)
+                    f->ins[nv].flags = (u8)(0x80 | in.mem); /* widened as read, narrowed as written (x64.c) */
             } else if (in.op == OP_SELECT && mmk[v]) {
                 x = vec_operand(in.b, P);
                 y = vec_operand(in.c, P);
@@ -890,10 +1002,26 @@ static int try_loop(u32 l, u32 n0)
                 y = vec_operand(in.c, P);
                 nv = mk(V, OP_SELECT, IT_V128, map[in.a], x);
                 f->ins[nv].c = y;
+            } else if (in.op == OP_CALL) {
+                x = vec_operand(f->xargs[in.a], P);
+                if (shift[v] == VM_FABS) {
+                    nv = mk(V, OP_AND, IT_V128, x, vec_operand(ir_const(f, in.ty == IT_F32 ? IT_I32 : IT_I64,
+                                                                          in.ty == IT_F32 ? 0x7fffffffU : ~(u64)0 >> 1), P));
+                } else {
+                    nv = mk(V, OP_VMATH, IT_V128, x, 0);
+                    f->ins[nv].b = (u32)shift[v] - 1;
+                }
+            } else if (in.op == OP_ZEXT8 || in.op == OP_ZEXT16) {
+                nv = mk(V, OP_AND, IT_V128, vec_operand(in.a, P), vec_operand(ir_const(f, IT_I32, in.op == OP_ZEXT8 ? 0xff : 0xffff), P));
+            } else if (in.op == OP_SEXT8 || in.op == OP_SEXT16) {
+                u32 cn = ir_const(f, IT_I32, in.op == OP_SEXT8 ? 24 : 16);
+                x = mk(V, OP_SHL, IT_V128, vec_operand(in.a, P), cn);
+                f->ins[x].mem = (u8)lk;
+                nv = mk(V, OP_SAR, IT_V128, x, cn);
             } else if (in.op == OP_SHL || in.op == OP_SHR || in.op == OP_SAR) {
-                nv = mk(V, in.op, IT_V128, map[in.a], in.b); /* the count stays a constant */
+                nv = mk(V, in.op, IT_V128, vec_operand(in.a, P), in.b); /* the count stays a constant */
             } else if (ir_opcount_tab[in.op] == 1) {
-                nv = mk(V, in.op, IT_V128, map[in.a], 0);
+                nv = mk(V, in.op, IT_V128, vec_operand(in.a, P), 0);
             } else {
                 if (kind[v] == K_MASK)
                     lk = lane_kind(f->ins[in.a].ty);
@@ -903,6 +1031,11 @@ static int try_loop(u32 l, u32 n0)
             }
             f->ins[nv].mem = (u8)lk;
             map[v] = nv;
+            if (kind[v] == K_MASK && mmk[v]) {
+                /* the comparison as a number: 1 where the mask is all ones */
+                lpos[v] = mk(V, OP_AND, IT_V128, nv, vec_operand(ir_const(f, IT_I32, 1), P));
+                f->ins[lpos[v]].mem = (u8)lane_kind(IT_I32);
+            }
         }
     }
     ivv2 = mk(V, OP_ADD, IT_I64, ivv, C64(16 * un));

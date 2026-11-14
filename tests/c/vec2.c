@@ -1,6 +1,7 @@
 /* more loops for the vectoriser: maxima and minima of narrow elements (a select of the two values compared),
    the instructions each element width has or lacks on x86-64, and the shapes of ufsm's hot loops */
 #include <stdio.h>
+#include <math.h>
 
 #define N 77
 static unsigned char ua[N + 40], ub[N + 40], uc[N + 40];
@@ -94,6 +95,28 @@ static void wide(float *o, const float *a, const float *b, int n)
                (a[i] * 9.5f) * (b[i] * 10.5f) + 11.5f * (a[i] + b[i] + 12.5f);
 }
 
+/* elements of different sizes in one loop (x86-64: lanes of four bytes, the narrow ones widened and narrowed) */
+static void u8tof(float *o, const unsigned char *s, float m, float k, int n) { int x; for (x = 0; x < n; x++) o[x] = ((float)s[x] - m) * k; }
+static void ftou8(unsigned char *o, const float *p, int n)
+{ int j; for (j = 0; j < n; j++) { const float v = p[j] + 0.5f; o[j] = v <= 0.f ? 0 : v >= 255.f ? 255 : (unsigned char)v; } }
+static void gtmask(unsigned char *o, const float *p, float t, int n) { int j; for (j = 0; j < n; j++) o[j] = p[j] > t; }
+static void orband(unsigned char *o, const float *p, float t, float b, int n) { int j; for (j = 0; j < n; j++) o[j] |= fabsf(p[j] - t) < b; }
+static void s16toi(int *o, const short *a, const unsigned short *b, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] * 3 + b[i]; }
+static void i2s(short *o, const int *a, int n) { int i; for (i = 0; i < n; i++) o[i] = (short)(a[i] >> 4); }
+static void s8tou16(unsigned short *o, const signed char *a, int n) { int i; for (i = 0; i < n; i++) o[i] = (unsigned short)(a[i] * 7); }
+static void zx(int *o, const int *a, int n)
+{ int i; for (i = 0; i < n; i++) o[i] = (unsigned char)a[i] + (signed char)(a[i] >> 8) + (unsigned short)(a[i] * 3) + (short)a[i]; }
+static void bthresh(unsigned char *o, const unsigned char *a, int t, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] > t ? 255 : a[i] / 2; }
+static int cnt(const float *a, float t, int n) { int i, c = 0; for (i = 0; i < n; i++) c += a[i] < t; return c; }
+static int bsumw(const unsigned char *a, const unsigned char *b, int n) { int i, s = 0; for (i = 0; i < n; i++) s += a[i] * b[i]; return s; }
+
+/* the mathematical library lane by lane (sqrt with -fno-math-errno or -ffast-math; the roundings with SSE4.1) */
+static void roots(float *o, const float *a, int n)
+{ int i; for (i = 0; i < n; i++) o[i] = sqrtf(fabsf(a[i])) + floorf(a[i] * 0.3f) - ceilf(a[i]) + truncf(a[i] * 1.7f) + rintf(a[i] * 0.5f); }
+static void droots(double *o, const double *a, int n) { int i; for (i = 0; i < n; i++) o[i] = sqrt(fabs(a[i])) * floor(a[i]) + nearbyint(a[i]); }
+static unsigned long lr(const double *a, const float *b, int n)
+{ int i; unsigned long s = 0; for (i = 0; i < n; i++) s = s * 3 + (unsigned long)lrint(a[i] * 2.5) + (unsigned long)lrintf(b[i] * 1.5f); return s; }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -143,6 +166,14 @@ int main(void)
             fa[i] = (float)(i % 8) * 0.5f; da[i] = (double)(i % 6) * 0.25;
         }
         wide(fb, fa, fc, n);
+        u8tof(fc, ua, 100.f, 0.125f, n); ftou8(ub, fc, n); ftou8(uc + 1, fb, n); gtmask(ua + 2, fa, 1.5f, n); orband(ua, fb, 3.f, 1.25f, n);
+        s16toi(ib, ha, wa, n); i2s(hb, ia, n); s8tou16(wb, sa, n); zx(ia, ib, n); bthresh(sb, (unsigned char *)sa, 77, n);
+        printf("   %lx %lx %lx %lx %lx %lx %d %d\n", check(fc, sizeof fc), check(ua, sizeof ua) ^ check(ub, sizeof ub), check(uc, sizeof uc),
+               check(ib, sizeof ib) ^ check(hb, sizeof hb), check(wb, sizeof wb) ^ check(ia, sizeof ia), check(sb, sizeof sb), cnt(fb, 9.f, n),
+               bsumw(ua, ub, n));
+        for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 41) * 0.7f - 13.f; da[i] = (double)((i * 11) % 23) * 0.9 - 9.0; }
+        roots(fc, fa, n); droots(db, da, n);
+        printf("   %lx %lx %lu\n", check(fc, sizeof fc), check(db, sizeof db), lr(da, fa, n));
         printf("   %d %u %d %d %d %d %ld %g %g %lx\n", imx(ia, n), umn(qa, n), busum(ua, n), bssum(sa, n), wusum(wa, n), hssum(ha, n),
                lsum2(la, n), (double)fsum(fa, n), dsum(da, n), check(fb, sizeof fb));
     }

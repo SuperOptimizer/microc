@@ -10149,6 +10149,7 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
 {
     Sym *s;
     O = o;
+    opt_obj = o;
     opt_dump_ir = dump_ir;
     nasm_stmts = 0; /* the texts and operand lists of the last file are not reclaimed */
     while (nheld) {

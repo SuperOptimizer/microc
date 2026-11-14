@@ -304,7 +304,7 @@ static void opcount_init(void)
             break;
         case OP_COPY: case OP_NEG: case OP_NOT: case OP_FNEG: case OP_LOAD: case OP_MEMZERO: case OP_PIN:
         case OP_VSPLAT: case OP_VSUM: case OP_ISCONST: case OP_CLZ: case OP_CTZ: case OP_BSWAP: case OP_POPCNT: case OP_BITCAST:
-        case OP_ASMOUT: case OP_TLS: case OP_BYVAL:
+        case OP_ASMOUT: case OP_TLS: case OP_BYVAL: case OP_VMATH:
             ir_opcount_tab[op] = 1;
             break;
         default:

@@ -86,6 +86,10 @@ cuda: tools
 	@build/stage$(STAGE)/bin/sh mkcuda.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 test-cuda: cuda
 	@build/stage$(STAGE)/bin/sh tests/cuda.sh build/stage$(STAGE)
+
+# kernel names (tests/mangle.sh): the Itanium C++ ABI's, as nvcc writes them, so profiles of mcc and nvcc builds match
+test-mangle: cuda
+	@sh tests/mangle.sh build/stage$(STAGE)
 THREADS = 1
 
 # Self-hosting check: each stage is built by the previous one, against the
@@ -102,4 +106,4 @@ STAGE = 0
 clean:
 	rm -rf build
 
-.PHONY: all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda bootstrap clean
+.PHONY: all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle bootstrap clean

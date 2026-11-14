@@ -223,6 +223,7 @@ extern u32 opt_promoted;
 int opt_split(Func *f);    /* local arrays and records read and written only at constant places: one slot for each place */
 void opt_dce(Func *f);
 void opt_cfg_clean(Func *f);
+int opt_param_fwd(Func *f); /* device code: fields of a record parameter read straight from its doublewords */
 int opt_vectorise(Func *f); /* opt_vec.c; returns the number of loops rewritten */
 
 /* opt_inline.c */
@@ -261,6 +262,7 @@ void x64_gen(Func *f, Obj *o); /* x64.c; arm64_gen hands over to it when opt_arc
 
 /* ptx.c: the backend for device code */
 extern int opt_fmad; /* CUDA device code: a product and a sum become one fused operation (-fmad=false: never) */
+extern int opt_noparamfwd;
 extern int opt_nounroll, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 extern u32 opt_automax, opt_aumax;
 extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;

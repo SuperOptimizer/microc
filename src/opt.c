@@ -1591,6 +1591,7 @@ static void slot_check(Func *fn, const char *when)
 }
 
 static void run_passes(Func *fn);
+int opt_noparamfwd; /* MCC_NOPARAMFWD: debugging */
 
 /* (what the passes make has no source location of its own: the line table carries on with the one before) */
 void opt_run(Func *fn)

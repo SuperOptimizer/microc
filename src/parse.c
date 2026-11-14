@@ -2204,6 +2204,23 @@ static u32 x64_arg(Expr *a, u32 *args, u32 nargs, u32 *ngr, u32 *nfr)
 }
 
 /* The parameter p of type pt, a record or a 128-bit integer, of the function being started. */
+/* Is there a pointer member at byte off of record t, filling the doubleword there? (A kernel's: an address of
+   global memory, which loads through it can say.) */
+static int rec_ptr_at(Type *t, u64 off)
+{
+    Field *fl;
+    if (t->kind == TY_PTR)
+        return off == 0;
+    if (t->kind == TY_ARRAY && t->base && type_size(t->base))
+        return rec_ptr_at(t->base, off % type_size(t->base));
+    if (!type_is_record(t) || t->vkind)
+        return 0;
+    for (fl = t->fields; fl; fl = fl->next)
+        if (!fl->bitwidth && off >= fl->off && off < fl->off + type_size(fl->ty))
+            return rec_ptr_at(fl->ty, off - fl->off);
+    return 0;
+}
+
 static void x64_param(Sym *p, Type *pt)
 {
     int sse[2];
@@ -2222,8 +2239,10 @@ static void x64_param(Sym *p, Type *pt)
         p->slot = ir_new_slot(F, 8 * words, type_align(pt) > 8 ? type_align(pt) : 8);
         for (k = 0; k < words; k++) {
             int it = !sse[k] ? IT_I64 : size - 8 * k >= 8 ? IT_F64 : IT_F32;
-            ir_store(F, it == IT_I64 ? M_64 : it == IT_F64 ? M_F64 : M_F32, ir_slot_addr(F, p->slot, 8 * k),
-                     ir_add_param(F, it));
+            v = ir_add_param(F, it);
+            if (cur_fn_kernel && it == IT_I64 && rec_ptr_at(pt, 8 * k))
+                F->ins[v].mem = PARAM_GLOBAL;
+            ir_store(F, it == IT_I64 ? M_64 : it == IT_F64 ? M_F64 : M_F32, ir_slot_addr(F, p->slot, 8 * k), v);
         }
         cur_named_gr += gr;
         cur_named_fr += fr;
@@ -2240,6 +2259,8 @@ static void x64_param(Sym *p, Type *pt)
                 F->param_ty[F->nparams - 1] = 0x40;
             else
                 F->param_ty[F->nparams - 1] |= 0x80 | (type_align(pt) > 8 ? 0x20 : 0);
+            if (rec_ptr_at(pt, 8 * k))
+                F->ins[v].mem = PARAM_GLOBAL;
             ir_store(F, M_64, ir_slot_addr(F, p->slot, 8 * k), v);
         }
         return;

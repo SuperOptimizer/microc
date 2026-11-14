@@ -894,6 +894,12 @@ int opt_split(Func *f)
         ir_resolve_all(f);
         opt_dce(f);
     }
+    /* (each round: inlining and the loads above may have left a record parameter read only at known places) */
+    if (opt_dev_fn && !opt_noparamfwd && opt_param_fwd(f)) {
+        f->copies = 1;
+        ir_resolve_all(f);
+        opt_dce(f);
+    }
     pf = f;
     slot_bad = (u8 *)xmalloc(nslots);
     memset(slot_bad, 0, nslots);
@@ -1148,4 +1154,235 @@ void opt_dce(Func *f)
     }
     free(live);
     free(stack);
+}
+
+/* Device code: a record passed by value arrives as doublewords (OP_PARAM), stored to a slot at the start; its
+   fields are then read from there, in widths of their own, which keeps the slot from becoming values (and
+   leaves its pointers as ones of unknown memory to the PTX writer). When a slot is written only in the entry
+   block, by such doublewords or by zeroing, before any read, and its address goes nowhere but to loads (at
+   known places, or through a choice between two such slots), each load from it is the bits of the doubleword
+   it falls in. Returns how many loads were replaced. */
+#define PF_ZERO 0xffffffffU /* in word: the doubleword is zero */
+
+static u32 *pf_word, *pf_base;
+static u8 *pf_bad;
+
+/* the slot and offset of address a when it is a place in a slot that can be read so; else 0 */
+static int pf_place(Func *f, u32 a, u32 *s, u32 *off)
+{
+    Ins *o = &f->ins[ir_resolve(f, a)];
+    if (o->op != OP_SLOT || pf_bad[o->a] || (i32)o->b < 0)
+        return 0;
+    *s = o->a;
+    *off = o->b;
+    return 1;
+}
+
+/* the value a load of kind mem, type ty, at offset off of slot s reads, made before instruction at; 0 if
+   it falls across doublewords or in one not written */
+static u32 pf_extract(Func *f, u32 at, u32 s, u32 off, int mem, int ty)
+{
+    u32 size = mem <= M_8U ? 1 : mem <= M_16U ? 2 : mem == M_32 || mem == M_F32 ? 4 : 8, w = off / 8, sh = off % 8, x, wv;
+    if (sh + size > 8 || off + size > f->slots[s].size || !(wv = pf_word[pf_base[s] + w]))
+        return 0;
+    if ((ty != IT_I32 && ty != IT_I64 && ty != IT_F32 && ty != IT_F64) || (ty == IT_I64 && size < 8 && mem != M_8U && mem != M_16U))
+        return 0; /* (a widening that would want the sign: left to the load) */
+    if (wv == PF_ZERO)
+        return ty == IT_F32 || ty == IT_F64 ? ir_fconst(f, ty, 0.0) : ir_const(f, ty, 0);
+    x = wv - 1;
+    if (sh) {
+        x = ir_raw(f, OP_SHR, IT_I64, x, ir_const(f, IT_I64, 8 * sh));
+        ir_insert_before(f, at, x);
+    }
+    if (size < 8) {
+        u32 t = ir_raw(f, OP_TRUNC, IT_I32, x, 0);
+        int ext = mem == M_8S ? OP_SEXT8 : mem == M_8U ? OP_ZEXT8 : mem == M_16S ? OP_SEXT16 : mem == M_16U ? OP_ZEXT16 : 0;
+        ir_insert_before(f, at, t);
+        x = t;
+        if (ext) {
+            x = ir_raw(f, ext, IT_I32, t, 0);
+            ir_insert_before(f, at, x);
+        }
+    }
+    if (ty == IT_F32 || ty == IT_F64) {
+        u32 c = ir_raw(f, OP_BITCAST, ty, x, 0);
+        ir_insert_before(f, at, c);
+        x = c;
+    } else if (ty == IT_I64 && size < 8) {
+        u32 c = ir_raw(f, OP_ZEXT32, IT_I64, x, 0);
+        ir_insert_before(f, at, c);
+        x = c;
+    }
+    return x;
+}
+
+int opt_param_fwd(Func *f)
+{
+    u32 b, v, k, n, s, nslots = f->nslots, done = 0, nw = 0, *ops, nsel;
+    u8 *rd; /* the slot has been read in the entry block */
+    u8 *sel; /* by value: a choice between two slot places, used only as the address of loads (2), or not (1) */
+    int changed;
+    if (!nslots || f->nblk < 2)
+        return 0;
+    pf_bad = (u8 *)xmalloc(nslots);
+    memset(pf_bad, 0, nslots);
+    rd = (u8 *)xmalloc(nslots);
+    memset(rd, 0, nslots);
+    pf_base = (u32 *)xmalloc((nslots + 1) * sizeof(u32));
+    for (s = 0; s < nslots; s++) {
+        pf_base[s] = nw;
+        nw += (f->slots[s].size + 7) / 8;
+    }
+    pf_word = (u32 *)xmalloc((nw + 1) * sizeof(u32));
+    memset(pf_word, 0, (nw + 1) * sizeof(u32));
+    /* a field of a choice between two slot places is the choice between the two fields (until nothing changes:
+       blocks are not in dominance order) */
+    do {
+        changed = 0;
+        for (b = 1; b < f->nblk; b++)
+            for (v = f->blk[b].first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                u32 sv, cv, x, y, c2;
+                u64 c;
+                Ins *si;
+                if (i->op != OP_ADD || i->ty != IT_I64)
+                    continue;
+                sv = ir_resolve(f, i->a);
+                cv = ir_resolve(f, i->b);
+                if (f->ins[sv].op != OP_SELECT) {
+                    u32 t = sv;
+                    sv = cv;
+                    cv = t;
+                }
+                si = &f->ins[sv];
+                if (si->op != OP_SELECT || !ir_is_const(f, cv, &c) || (i64)c != (i32)c)
+                    continue;
+                x = ir_resolve(f, si->b);
+                y = ir_resolve(f, si->c);
+                if (f->ins[x].op != OP_SLOT || f->ins[y].op != OP_SLOT)
+                    continue;
+                x = ir_slot_addr(f, f->ins[x].a, (i64)(i32)f->ins[x].b + (i64)c);
+                y = ir_slot_addr(f, f->ins[y].a, (i64)(i32)f->ins[y].b + (i64)c);
+                c2 = ir_raw(f, OP_SELECT, IT_I64, f->ins[sv].a, x);
+                f->ins[c2].c = y;
+                ir_insert_before(f, v, c2);
+                ir_replace(f, v, c2);
+                done++; /* (the copies left are resolved by the caller) */
+                changed = 1;
+            }
+    } while (changed);
+    nsel = f->nins;
+    sel = (u8 *)xmalloc(nsel + 1);
+    memset(sel, 0, nsel + 1);
+    /* choices between two slot places */
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        if (i->op == OP_SELECT && i->blk && f->ins[ir_resolve(f, i->b)].op == OP_SLOT && f->ins[ir_resolve(f, i->c)].op == OP_SLOT)
+            sel[v] = 2;
+    }
+    for (b = 1; b < f->nblk; b++) {
+        Block *bb = &f->blk[b];
+        int phis;
+        for (phis = 1; phis >= 0; phis--)
+            for (v = phis ? bb->phis : bb->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                if (i->op == OP_COPY)
+                    continue; /* seen through where it is read */
+                IR_OPS(f, i, ops, n);
+                if (i->op == OP_CALL && f->ins[i->c].op == OP_SLOT)
+                    pf_bad[f->ins[i->c].a] = 1;
+                for (k = 0; k < n; k++) {
+                    u32 ov = ir_resolve(f, ops[k]);
+                    Ins *o = &f->ins[ov];
+                    i32 off;
+                    if (ov < nsel && sel[ov] && (phis || k != 0 || i->op != OP_LOAD))
+                        sel[ov] = 1; /* the choice is used otherwise */
+                    if (o->op != OP_SLOT)
+                        continue;
+                    s = o->a;
+                    off = (i32)o->b;
+                    if (i->op == OP_SELECT && v < nsel && sel[v] && k > 0)
+                        continue; /* decided below */
+                    if (phis || off < 0 || !((k == 0 && (i->op == OP_LOAD || i->op == OP_STORE || i->op == OP_MEMZERO)))) {
+                        pf_bad[s] = 1;
+                        continue;
+                    }
+                    if (i->op == OP_LOAD) {
+                        if (b == 1)
+                            rd[s] = 1;
+                        continue;
+                    }
+                    if (b != 1 || rd[s]) {
+                        pf_bad[s] = 1; /* written elsewhere, or after a read */
+                        continue;
+                    }
+                    if (i->op == OP_MEMZERO) {
+                        u32 w;
+                        if ((off & 7) || (i->c & 7) || (u32)off + i->c > f->slots[s].size) {
+                            pf_bad[s] = 1;
+                            continue;
+                        }
+                        for (w = (u32)off / 8; w < ((u32)off + i->c) / 8; w++)
+                            pf_word[pf_base[s] + w] = PF_ZERO;
+                    } else {
+                        u32 pv = ir_resolve(f, i->b);
+                        u64 c;
+                        if (i->mem != M_64 || (off & 7) || (u32)off + 8 > f->slots[s].size ||
+                            !((f->ins[pv].op == OP_PARAM && f->ins[pv].ty == IT_I64) || (ir_is_const(f, pv, &c) && c == 0))) {
+                            pf_bad[s] = 1;
+                            continue;
+                        }
+                        pf_word[pf_base[s] + (u32)off / 8] = f->ins[pv].op == OP_PARAM ? pv + 1 : PF_ZERO;
+                    }
+                }
+            }
+        if (bb->arg && f->ins[bb->arg].op == OP_SLOT)
+            pf_bad[f->ins[bb->arg].a] = 1;
+    }
+    /* a choice used otherwise lets both slots out */
+    for (v = 1; v < nsel; v++)
+        if (sel[v] == 1) {
+            pf_bad[f->ins[ir_resolve(f, f->ins[v].b)].a] = 1;
+            pf_bad[f->ins[ir_resolve(f, f->ins[v].c)].a] = 1;
+        }
+    {
+        for (b = 1; b < f->nblk; b++) {
+            u32 nx;
+            for (v = f->blk[b].first; v; v = nx) {
+                Ins *i = &f->ins[v];
+                u32 a, sa, oa, sb2, ob, x, y;
+                nx = i->next;
+                if (i->op != OP_LOAD)
+                    continue;
+                a = ir_resolve(f, i->a);
+                if (pf_place(f, a, &sa, &oa)) {
+                    x = pf_extract(f, v, sa, oa, i->mem, i->ty);
+                } else if (a < nsel && f->ins[a].op == OP_SELECT && sel[a] == 2 &&
+                           pf_place(f, f->ins[a].b, &sa, &oa) && pf_place(f, f->ins[a].c, &sb2, &ob)) {
+                    x = pf_extract(f, v, sa, oa, i->mem, i->ty);
+                    y = x ? pf_extract(f, v, sb2, ob, i->mem, i->ty) : 0;
+                    if (x && y) {
+                        u32 c = ir_raw(f, OP_SELECT, f->ins[v].ty, f->ins[a].a, x);
+                        f->ins[c].c = y;
+                        ir_insert_before(f, v, c);
+                        x = c;
+                    } else {
+                        x = 0;
+                    }
+                } else {
+                    continue;
+                }
+                if (!x)
+                    continue;
+                ir_replace(f, v, x);
+                done++;
+            }
+        }
+    }
+    free(pf_bad);
+    free(pf_base);
+    free(pf_word);
+    free(rd);
+    free(sel);
+    return (int)done;
 }

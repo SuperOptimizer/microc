@@ -815,6 +815,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_cuda = force_cuda || has_suffix(in, ".cu");
         opt_nounroll = getenv("MCC_NOUNROLL") != 0;
         opt_nosplit = getenv("MCC_NOSPLIT") != 0;
+        opt_noparamfwd = getenv("MCC_NOPARAMFWD") != 0;
         opt_noauto = getenv("MCC_NOAUTO") != 0;
         opt_nolicm = getenv("MCC_NOLICM") != 0;
         opt_autolog = getenv("MCC_AUTOLOG") != 0;

@@ -332,7 +332,7 @@ static u32 map_value(u32 yv)
         vmap[yv] = ir_slot_addr(f, smap[i->a], (i32)i->b);
         break;
     default:
-        die("internal: inlining met an unmapped value");
+        die("internal: inlining met an unmapped value (op %d, v%u)", i->op, yv);
     }
     return vmap[yv];
 }

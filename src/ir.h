@@ -228,6 +228,9 @@ extern int opt_inline_limit;
 extern int opt_level;
 extern int opt_fast_math;
 extern int opt_vec_report;
+extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */
+extern int opt_math_errno; /* x64.c: sqrt is a call, for errno (-fno-math-errno, -ffast-math: in line) */
+int x64_cpu_has(const char *flag); /* main.c: the machine mcc runs on has it (/proc/cpuinfo) */
 extern int opt_size; /* prefer smaller code where it costs speed */
 int inline_saved(u32 sym);
 void inline_restore(Func *f, u32 sym);

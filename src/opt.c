@@ -1673,7 +1673,7 @@ static void run_passes(Func *fn)
     }
     if (!(opt_dev_fn && !opt_dolicm) && !(opt_cuda && opt_nolicm) && licm())
         ir_resolve_all(f);
-    if (opt_level >= 3 && !opt_size && !opt_novec && opt_arch != ARCH_X64 && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
+    if (opt_level >= 3 && !opt_size && !opt_novec && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
         opt_dce(f);
         return; /* vector code stays out of the inliner: the scalar passes do not know it */
     }

@@ -76,6 +76,32 @@ static void usage(void)
           stderr);
 }
 
+/* -march=native: does the processor this runs on have the feature (a word of the flags line of /proc/cpuinfo)? */
+int x64_cpu_has(const char *flag)
+{
+    static char line[8192];
+    FILE *fp = fopen("/proc/cpuinfo", "r");
+    size_t n = strlen(flag);
+    int yes = 0;
+    if (!fp)
+        return 0;
+    while (!yes && fgets(line, sizeof line, fp)) {
+        char *p = line;
+        if (strncmp(line, "flags", 5) != 0)
+            continue;
+        while ((p = strstr(p, flag)) != 0) {
+            if (p[-1] == ' ' && (p[n] == ' ' || p[n] == '\n' || p[n] == 0)) {
+                yes = 1;
+                break;
+            }
+            p += n;
+        }
+        break;
+    }
+    fclose(fp);
+    return yes;
+}
+
 static int has_suffix(const char *s, const char *suffix)
 {
     size_t n = strlen(s), m = strlen(suffix);
@@ -314,6 +340,8 @@ static void target_macros(void)
             pp_define("__SSE3__");
             pp_define("__SSSE3__");
         }
+        if (x86_ext & XE_SSE41)
+            opt_x64_sse41 = 1; /* the vectoriser may use it */
         if (x86_ext & XE_SSE41) {
             pp_define("__SSE4_1__");
             pp_define("__SSE4_2__");
@@ -449,8 +477,10 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-MD") == 0 || strcmp(a, "-MMD") == 0 || strcmp(a, "-Wp,-MMD") == 0 ||
                  strcmp(a, "-Wp,-MD") == 0)
             want_deps = 1;
-        else if (strcmp(a, "-MP") == 0 || strcmp(a, "-pthread") == 0 || strcmp(a, "-march=native") == 0)
+        else if (strcmp(a, "-MP") == 0 || strcmp(a, "-pthread") == 0)
             ; /* phony targets for the headers: make does not need them */
+        else if (strcmp(a, "-march=native") == 0)
+            opt_x64_sse41 = x64_cpu_has("sse4_1"); /* the vectoriser's instructions only: no feature macros (see x86_ext) */
         else if (strcmp(a, "-MF") == 0 && i + 1 < argc)
             dep_path = argv[++i];
         else if ((strcmp(a, "-MT") == 0 || strcmp(a, "-MQ") == 0) && i + 1 < argc)
@@ -507,7 +537,11 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-fvec-report") == 0)
             opt_vec_report = 1;
         else if (strcmp(a, "-ffast-math") == 0)
-            opt_fast_math = 1;
+            opt_fast_math = 1, opt_math_errno = 0;
+        else if (strcmp(a, "-fno-math-errno") == 0)
+            opt_math_errno = 0;
+        else if (strcmp(a, "-fmath-errno") == 0)
+            opt_math_errno = 1;
         else if (strcmp(a, "-Os") == 0)
             opt_size = 1;
         else if (strncmp(a, "--target=", 9) == 0)

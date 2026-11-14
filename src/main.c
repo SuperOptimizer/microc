@@ -619,6 +619,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_vec_report = 1;
         else if (strcmp(a, "-fvec-gather") == 0)
             opt_vec_gather = 1;
+        else if (strcmp(a, "-fno-vec-gather") == 0)
+            opt_vec_gather = -1;
         else if (strcmp(a, "-fvec-report=2") == 0)
             opt_vec_report = 2; /* with the instruction that stopped it */
         else if (strcmp(a, "-ffast-math") == 0)

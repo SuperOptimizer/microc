@@ -1214,6 +1214,7 @@ static int avx_takes(u32 v)
     case OP_VSTORE:
     case OP_VSUM:
     case OP_VIOTA:
+    case OP_VGATHER:
     case OP_VMATH:
     case OP_SITOF:
     case OP_FTOSI:
@@ -1339,6 +1340,7 @@ static void sel_avx(u32 v)
         return;
     case OP_VSUM:
     case OP_VIOTA:
+    case OP_VGATHER:
     case OP_VMATH:
     case OP_SITOF:
     case OP_FTOSI:
@@ -1483,6 +1485,33 @@ static void sel_avx_more(u32 v)
         }
         t = vconst_w(wide, b, w);
         emit(X_MOV, 1, d, t, NOREG);
+        return;
+    }
+    case OP_VGATHER: {
+        /* vpgatherdd / vgatherdps, every lane (AVX2: opt_vec.c makes these only then); an element narrower than four
+           bytes is read as the four bytes there (opt_vec.c's range check keeps the reads inside the object: at most 3
+           bytes past an element it reads anyway) and cut to its width */
+        int ek = i->flags, sc = (int)i->c, eb = lane_bits(ek);
+        u32 idx = reg_of(i->b), g = eb == 32 ? d : vtmp_w(wide);
+        if (sc > 3) {
+            u32 t2 = vtmp_w(wide);
+            emit_vex(VE(0x72, 1, 1, 0) | L | VE_DIGIT(6), XF_VMI, t2, idx, NOREG, NOREG, sc); /* vpslld */
+            idx = t2;
+            sc = 0;
+        }
+        m = emit(X_GATHER, 0, g, NOREG, reg_of(i->a));
+        m->s2 = idx;
+        m->cc = (u8)(1 << sc);
+        m->imm = (i64)(VE(ek == M_F32 ? 0x92 : 0x90, 2, 1, 0) | L);
+        if (eb == 32)
+            return;
+        if (ek == M_8U || ek == M_16U) {
+            emit_vex(VE(0xdb, 1, 1, 0) | L, XF_RVM, d, g, vsplat_w(wide, eb == 8 ? 0xff : 0xffff, 4), NOREG, -1); /* vpand */
+        } else {
+            t = vtmp_w(wide);
+            emit_vex(VE(0x72, 1, 1, 0) | L | VE_DIGIT(6), XF_VMI, t, g, NOREG, NOREG, 32 - eb); /* vpslld */
+            emit_vex(VE(0x72, 1, 1, 0) | L | VE_DIGIT(4), XF_VMI, d, t, NOREG, NOREG, 32 - eb); /* vpsrad */
+        }
         return;
     }
     case OP_VMATH: {

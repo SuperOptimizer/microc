@@ -5,8 +5,8 @@
 D=$1
 T=build/x64as
 R=${X64_DIR:-/root/x64}/as
-if [ -z "$X64_SSH" ] || [ "$X64_SSH" = local ]; then
-    echo "tests/x64as.sh: set X64_SSH (how to reach an x86-64 Linux machine)"; exit 1
+if [ -z "$X64_SSH" ]; then
+    echo "tests/x64as.sh: set X64_SSH (how to reach an x86-64 Linux machine, or \"local\")"; exit 1
 fi
 rm -rf $T; mkdir -p $T
 pass=0; fail=0
@@ -26,7 +26,11 @@ for f in *.s; do
     echo "DONE $n"
 done
 XEOF
-(cd $T && tar cf - .) | $X64_SSH "rm -rf $R && mkdir -p $R && cd $R && tar xf - 2>/dev/null && sh run.sh ${X64_CC:-gcc} 2>&1" > $T/out
+if [ "$X64_SSH" = local ]; then # (this is an x86-64 Linux machine: run them in place)
+    (cd $T && sh run.sh ${X64_CC:-gcc} 2>&1) > $T/out.tmp; mv $T/out.tmp $T/out
+else
+    (cd $T && tar cf - .) | $X64_SSH "rm -rf $R && mkdir -p $R && cd $R && tar xf - 2>/dev/null && sh run.sh ${X64_CC:-gcc} 2>&1" > $T/out
+fi
 for f in $T/*.s; do
     n=$(basename $f .s)
     if grep -q "^DONE $n\$" $T/out && ! grep -q "^DIFF $n " $T/out; then pass=$((pass + 1)); else echo "FAIL: $n"; fail=$((fail + 1)); fi

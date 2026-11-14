@@ -339,6 +339,8 @@ enum { TARGET_MACOS, TARGET_LINUX };
 extern int opt_target;
 enum { ARCH_ARM64, ARCH_X64 };
 extern int opt_arch; /* ARCH_X64 only with TARGET_LINUX */
+extern int opt_avx;  /* x86-64: AVX may be used for vector types (-mavx, -march=...) (parse.c) */
+extern int opt_f16c; /* x86-64: F16C converts _Float16 (-mf16c, -march=...) (parse.c) */
 
 enum {
     R_ABS64, R_CALL26, R_PAGE21, R_PAGEOFF12, R_GOTPAGE21, R_GOTPAGEOFF12,

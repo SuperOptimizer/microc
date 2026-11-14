@@ -1,6 +1,7 @@
 /* C89 parser. There is no syntax tree: declarations build types and
    symbols, statements and expressions build IR directly. */
 #include "cc.h"
+#include "x86i.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #define AT_CONSTANT 32768 /* CUDA: device constant memory */
 #define AT_GUARD 65536    /* C++: a lock guard type */
 #define AT_CTOR 131072     /* called before main */
+#define AT_AVX 262144      /* x86-64: target("avx2" ...): the function may use AVX */
 
 enum { SK_VAR, SK_TYPEDEF, SK_ENUM, SK_TEMPLATE };
 
@@ -178,6 +180,14 @@ static u32 load_val(Type *t, u32 addr);
 static void store_val(Type *t, u32 addr, u32 v);
 static u32 rt_call(const char *name, Type *ret, Type *pt, u32 arg);
 static u32 new_temp(Type *t);
+static int vec_mem(Type *t);
+static int cur_fn_avx; /* the function being read has target("avx...") */
+static u32 xi_call(const char *name, int ty, u32 a, u32 b, u32 c, u32 n);
+static u32 h_round(u32 v);
+int opt_f16c;          /* x86-64: -mf16c, -march=...: _Float16 converts with vcvtph2ps / vcvtps2ph */
+int opt_avx;           /* x86-64: -mavx, -mavx2, -march=...: GNU vectors may be AVX registers everywhere */
+static int vec_binop_x64(int op, Expr *l, Expr *r);
+static int vec_unary_x64(int op, Expr *e);
 static u32 id_complex, id_float16, id_bf16, id_real, id_imag, id_alignas, id_alignas2;
 
 /* 1: a GNU vector type, 2: a complex type, else 0 */
@@ -851,6 +861,10 @@ static void attributes(Attr *a)
             } else if (strcmp(name, "section") == 0) {
                 a->section = attr_string();
                 continue;
+            } else if (strcmp(name, "target") == 0) {
+                if (strstr(intern_str(attr_string()), "avx"))
+                    a->flags |= AT_AVX;
+                continue;
             } else if (strcmp(name, "alias") == 0) {
                 a->alias = attr_string();
                 continue;
@@ -906,7 +920,10 @@ static Type *attr_type(Type *t, const Attr *a)
     if (a->vecsize && !VK(t)) {
         if (!type_is_arith(t) || a->vecsize % type_size(t))
             error_at(tok.loc, "invalid vector type");
-        return type_vector(t, (u32)(a->vecsize / type_size(t)), 1); /* its alignment stays that of the element */
+        t = type_vector(t, (u32)(a->vecsize / type_size(t)), 1);
+        if (a->align)
+            t = type_aligned(t, a->align); /* (a typedef may make it less aligned, as GCC lets it) */
+        return t;
     }
     if (a->align)
         t = type_aligned(t, a->align);
@@ -1348,6 +1365,12 @@ static u32 emit_mem(int op, u32 dst, u32 src, u64 size, u32 align)
 static void store(Expr *lv, u32 val)
 {
     Type *t = lv->ty;
+    int vm = vec_mem(t);
+    if (vm) {
+        /* (x86-64: a vector that is one register is copied as one) */
+        ir_store(F, vm, lv->v, ir_load(F, vm == M_V256 ? IT_V256 : IT_V128, vm, val));
+        return;
+    }
     if (type_is_record(t)) {
         emit_mem(OP_MEMCPY, lv->v, val, type_size(t), type_align(t));
         return;
@@ -1687,7 +1710,7 @@ static void binop(int op, Expr *l, Expr *r, u32 loc)
             }
         }
         if (t->kind == TY_FLOAT16)
-            l->v = rt_call("__mcc_fround16", ty_float, ty_float, l->v);
+            l->v = h_round(l->v);
         else if (t->kind == TY_BF16)
             l->v = rt_call("__mcc_froundbf", ty_float, ty_float, l->v);
     }
@@ -1701,6 +1724,36 @@ static u32 new_temp(Type *t)
 }
 
 /* ---- half floats, vectors and complex numbers ---- */
+
+static u32 rt_call(const char *name, Type *ret, Type *pt, u32 arg);
+
+/* _Float16: its bits (in an int) as a float, a float as its bits, a float rounded to it; F16C instructions in
+   x86-64 host code that may use them, else calls */
+static int f16c_here(void)
+{
+    return opt_f16c && opt_arch == ARCH_X64 && !cur_fn_dev;
+}
+
+static u32 h2f(u32 bits)
+{
+    if (f16c_here())
+        return xi_call("cvtsh_ss", IT_F32, bits, 0, 0, 1);
+    return rt_call("__mcc_h2f", ty_float, ty_uint, bits);
+}
+
+static u32 f2h(u32 v)
+{
+    if (f16c_here())
+        return xi_call("cvtss_sh", IT_I32, v, ir_const(F, IT_I32, 0), 0, 2);
+    return rt_call("__mcc_f2h", ty_uint, ty_float, v);
+}
+
+static u32 h_round(u32 v)
+{
+    if (f16c_here())
+        return h2f(f2h(v));
+    return rt_call("__mcc_fround16", ty_float, ty_float, v);
+}
 
 /* A call of a library function of one argument. */
 static u32 rt_call(const char *name, Type *ret, Type *pt, u32 arg)
@@ -1722,7 +1775,7 @@ static u32 rt_call(const char *name, Type *ret, Type *pt, u32 arg)
 static u32 load_val(Type *t, u32 addr)
 {
     if (t->kind == TY_FLOAT16)
-        return rt_call("__mcc_h2f", ty_float, ty_uint, ir_load(F, IT_I32, M_16U, addr));
+        return h2f(ir_load(F, IT_I32, M_16U, addr));
     if (t->kind == TY_BF16)
         return rt_call("__mcc_bf2f", ty_float, ty_uint, ir_load(F, IT_I32, M_16U, addr));
     return ir_load(F, type_ir(t), type_mem(t), addr);
@@ -1731,7 +1784,7 @@ static u32 load_val(Type *t, u32 addr)
 static void store_val(Type *t, u32 addr, u32 v)
 {
     if (t->kind == TY_FLOAT16)
-        v = rt_call("__mcc_f2h", ty_uint, ty_float, v);
+        v = f2h(v);
     else if (t->kind == TY_BF16)
         v = rt_call("__mcc_f2bf", ty_uint, ty_float, v);
     ir_store(F, type_mem(t), addr, v);
@@ -1763,7 +1816,11 @@ static Type *type_vector(Type *elem, u32 n, int vkind)
     memset(f, 0, sizeof *f);
     f->name = intern_cstr("__v");
     f->ty = type_array(elem, n, 1);
-    type_layout(t, f, 0, 0);
+    {
+        /* a GNU vector is aligned to its size (as GCC does), up to 64 bytes; a complex number to its parts */
+        u64 sz = type_size(elem) * n;
+        type_layout(t, f, 0, vkind == 1 && sz <= 64 && !(sz & (sz - 1)) ? (u32)sz : 0);
+    }
     t->vkind = (u8)vkind;
     t->base = elem;
     t->len = n;
@@ -1806,6 +1863,8 @@ static void vec_binop(int op, Expr *l, Expr *r, u32 loc)
         error_at(loc, "vector operands differ in length");
     if ((!VK(l->ty) && !type_is_arith(l->ty)) || (!VK(r->ty) && !type_is_arith(r->ty)))
         error_at(loc, "invalid operands to binary '%s'", tok_names[op]);
+    if (vec_binop_x64(op, l, r))
+        return;
     if (cmp)
         rt = type_vector(int_of_size(type_size(vt->base)), n, 1);
     tmp = new_temp(rt);
@@ -1837,7 +1896,10 @@ static void vec_binop(int op, Expr *l, Expr *r, u32 loc)
 static void vec_unary(int op, Expr *e)
 {
     Type *vt = e->ty->canon, *et = vt->base;
-    u32 n = (u32)vt->len, i, tmp = new_temp(vt);
+    u32 n = (u32)vt->len, i, tmp;
+    if (vec_unary_x64(op, e))
+        return;
+    tmp = new_temp(vt);
     for (i = 0; i < n; i++) {
         Expr a;
         vec_elem(e, i, &a);
@@ -1989,7 +2051,7 @@ static int special_convert(Expr *e, Type *to)
             e->v = rt_call("__mcc_dround16", ty_float, ty_double, e->v);
         } else {
             convert(e, ty_float);
-            e->v = rt_call("__mcc_fround16", ty_float, ty_float, e->v);
+            e->v = h_round(e->v);
         }
         e->ty = to;
         return 1;
@@ -2175,7 +2237,7 @@ static u32 x64_rec(Type *t, int *sse)
 {
     u8 cls[4];
     u64 size;
-    if (!type_is_record(t) || !type_complete(t))
+    if (!type_is_record(t) || !type_complete(t) || vec_mem(t))
         return 0;
     size = type_size(t);
     if (size == 0 || size > 16)
@@ -2212,9 +2274,19 @@ static u32 x64_byval(u32 addr, u64 size, u32 align)
 /* A record or 128-bit argument joins args; *ngr and *nfr count the registers taken so far. */
 static u32 x64_arg(Expr *a, u32 *args, u32 nargs, u32 *ngr, u32 *nfr)
 {
-    int sse[2];
+    int sse[2], vm = vec_mem(a->ty);
     u32 words, k, gr = 0, fr = 0;
     u64 size = type_size(a->ty);
+    if (vm) {
+        /* __m128 / __m256: one xmm / ymm register, or the stack */
+        if (*nfr < 8) {
+            args[nargs++] = ir_load(F, vm == M_V256 ? IT_V256 : IT_V128, vm, a->v);
+            (*nfr)++;
+        } else {
+            args[nargs++] = x64_byval(a->v, size, (u32)size);
+        }
+        return nargs;
+    }
     if (type_is_128(a->ty)) {
         if (*ngr + 2 <= 6) {
             args[nargs++] = a->v;
@@ -2270,9 +2342,15 @@ static int ptr_word(Type *t, u64 off)
 
 static void x64_param(Sym *p, Type *pt)
 {
-    int sse[2];
+    int sse[2], vm = vec_mem(pt);
     u64 size = type_size(pt), off;
     u32 words = x64_rec(pt, sse), k, gr = 0, fr = 0, v;
+    if (vm && cur_named_fr < 8) {
+        p->slot = ir_new_slot(F, size, (u32)size);
+        ir_store(F, vm, ir_slot_addr(F, p->slot, 0), ir_add_param(F, vm == M_V256 ? IT_V256 : IT_V128));
+        cur_named_fr++;
+        return;
+    }
     if (type_is_128(pt)) {
         words = 2;
         sse[0] = sse[1] = 0;
@@ -2666,7 +2744,7 @@ static void call(Expr *e)
     ft = e->ty->base;
     ret = ft->base;
     callee = e->v;
-    if (type_is_record(ret)) {
+    if (type_is_record(ret) && !vec_mem(ret)) {
         if (!type_complete(ret))
             error_at(loc, "function returns an incomplete type");
         /* a result that comes back in registers is stored as two doublewords */
@@ -2819,9 +2897,13 @@ static void call(Expr *e)
         return;
     }
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
-    v = ir_call(F, flags ? IT_VOID : type_ir(ret), callee, args, nargs,
+    v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? (vec_mem(ret) == M_V256 ? IT_V256 : IT_V128) : type_ir(ret), callee, args, nargs,
                 ft->variadic ? ft->nparams + (flags ? 1 : 0) : opt_arch == ARCH_X64 && ft->oldstyle ? nargs : 0xffffffffU, flags);
-    if (flags && type_is_128(ret)) {
+    if (!flags && vec_mem(ret)) {
+        u32 tmp = new_temp(ret);
+        ir_store(F, vec_mem(ret), tmp, v);
+        set_expr(e, ret, tmp, 0);
+    } else if (flags && type_is_128(ret)) {
         F->ins[v].mem = 16;
         v = ir_load(F, IT_I64, M_64, args[0]);
         set_expr(e, ret, v, 0);
@@ -3325,6 +3407,453 @@ static Sym *implicit_func(u32 name, Type *ret)
 /* Handles the current identifier if it names a builtin: returns 1 with the
    result in *e, or 0 (possibly after renaming the token to the library
    function the builtin stands for). */
+/* ---- x86-64: vectors in registers ----
+   In x86-64 host code a GNU vector of 16 or 32 bytes (__m128, __m256 ...) is one value of type IT_V128 or
+   IT_V256 when it is computed: it is read and written whole (M_V128, M_V256), so the slot of a local
+   vector becomes an SSA value, and lane arithmetic is one instruction. Elsewhere vectors stay records
+   handled lane by lane. */
+
+/* M_V128 / M_V256 for a vector type that is one register in x86-64 host code, else 0 */
+static int vec_memx(Type *t)
+{
+    u64 n;
+    if (opt_arch != ARCH_X64 || cur_fn_dev || VK(t) != 1)
+        return 0;
+    n = type_size(t);
+    return n == 16 ? M_V128 : n == 32 ? M_V256 : 0;
+}
+
+/* vec_memx where AVX may be used for it (-mavx2 or the like, or a function with target("avx...")): copies,
+   operators and arguments of vectors. Intrinsics are AVX whatever is asked (the program asked for them). */
+static int vec_mem(Type *t)
+{
+    return opt_avx || cur_fn_avx ? vec_memx(t) : 0;
+}
+
+static int vec_ity(int mem)
+{
+    return mem == M_V256 ? IT_V256 : IT_V128;
+}
+
+/* the lane kind (M_*) of vector type t, or -1 if its lanes have no instructions (half floats) */
+static int vec_lane(Type *t)
+{
+    Type *et = t->canon->base;
+    u64 s = type_size(et);
+    int uns = type_is_unsigned(et);
+    if (type_is_float(et))
+        return et->kind == TY_FLOAT ? M_F32 : et->kind == TY_DOUBLE ? M_F64 : -1;
+    return s == 1 ? (uns ? M_8U : M_8S) : s == 2 ? (uns ? M_16U : M_16S) : s == 4 ? M_32 : s == 8 ? M_64 : -1;
+}
+
+/* An instruction appended as it is (no folding: its mem is the lane kind). */
+static u32 vec_ins(int op, int ty, int lane, u32 a, u32 b)
+{
+    u32 v = ir_raw(F, op, ty, a, b);
+    F->ins[v].mem = (u8)lane;
+    if (F->cur)
+        ir_append(F, F->cur, v);
+    return v;
+}
+
+/* the vector value of e (of vector type vt with lanes lane): the register, or a scalar in every lane */
+static u32 vec_operand(Expr *e, Type *vt, int lane)
+{
+    int mem = vec_memx(vt);
+    Expr s;
+    if (VK(e->ty))
+        return ir_load(F, vec_ity(mem), mem, e->v);
+    s = *e;
+    convert(&s, vt->canon->base);
+    return vec_ins(OP_VSPLAT, vec_ity(mem), lane, s.v, 0);
+}
+
+/* e = a new temporary of vector type t holding v */
+static void vec_result(Expr *e, Type *t, u32 v)
+{
+    int mem = vec_memx(t);
+    u32 tmp = new_temp(t);
+    ir_store(F, mem, tmp, v);
+    set_expr(e, t, tmp, 0);
+}
+
+static u32 xi_call(const char *name, int ty, u32 a, u32 b, u32 c, u32 n)
+{
+    u32 args[3];
+    int id = x86i_find(name);
+    if (id < 0)
+        die("internal: no intrinsic %s", name);
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    return ir_xi(F, ty, (u32)id, args, n);
+}
+
+/* l op r on vectors that are registers, as instructions; 0 if there are none for it (then lane by lane) */
+static int vec_binop_x64(int op, Expr *l, Expr *r)
+{
+    Type *vt = VK(l->ty) ? l->ty->canon : r->ty->canon, *rt = vt;
+    int mem = vec_mem(vt), lane = vec_lane(vt), ity, fl, bits, uns, iop = 0;
+    int cmp = op >= T_LT && op <= T_NE;
+    u32 a, b, v;
+    if (!mem || lane < 0 || (VK(l->ty) && VK(r->ty) && l->ty->canon != r->ty->canon))
+        return 0;
+    ity = vec_ity(mem);
+    fl = lane == M_F32 || lane == M_F64;
+    bits = (int)type_size(vt->base) * 8;
+    uns = type_is_unsigned(vt->base);
+    switch (op) {
+    case T_PLUS: iop = fl ? OP_FADD : OP_ADD; break;
+    case T_MINUS: iop = fl ? OP_FSUB : OP_SUB; break;
+    case T_STAR: iop = fl ? OP_FMUL : (bits == 16 || bits == 32) ? OP_MUL : 0; break;
+    case T_SLASH: iop = fl ? OP_FDIV : 0; break;
+    case T_AMP: iop = fl ? 0 : OP_AND; break;
+    case T_PIPE: iop = fl ? 0 : OP_OR; break;
+    case T_CARET: iop = fl ? 0 : OP_XOR; break;
+    case T_SHL:
+    case T_SHR:
+        if (fl || bits == 8 || !VK(l->ty) || (op == T_SHR && !uns && bits == 64))
+            return 0;
+        if (VK(r->ty) && bits == 16)
+            return 0;
+        if (!VK(r->ty) && !type_is_int(r->ty))
+            return 0;
+        iop = op == T_SHL ? OP_SHL : uns ? OP_SHR : OP_SAR;
+        a = ir_load(F, ity, mem, l->v);
+        if (VK(r->ty)) {
+            b = ir_load(F, ity, mem, r->v);
+        } else {
+            Expr s = *r;
+            rvalue(&s);
+            convert(&s, ty_int);
+            b = s.v;
+        }
+        vec_result(l, vt, vec_ins(iop, ity, lane, a, b));
+        return 1;
+    default:
+        if (!cmp)
+            return 0;
+    }
+    if (cmp) {
+        static const char *const fcmp[2] = {"mm_cmp_ps", "mm256_cmp_ps"}, *const dcmp[2] = {"mm_cmp_pd", "mm256_cmp_pd"};
+        static const char *const eqn[2][4] = {{"mm_cmpeq_epi8", "mm_cmpeq_epi16", "mm_cmpeq_epi32", "mm_cmpeq_epi64"},
+                                              {"mm256_cmpeq_epi8", "mm256_cmpeq_epi16", "mm256_cmpeq_epi32", "mm256_cmpeq_epi64"}};
+        static const char *const gtn[2][4] = {{"mm_cmpgt_epi8", "mm_cmpgt_epi16", "mm_cmpgt_epi32", "mm_cmpgt_epi64"},
+                                              {"mm256_cmpgt_epi8", "mm256_cmpgt_epi16", "mm256_cmpgt_epi32", "mm256_cmpgt_epi64"}};
+        int w = mem == M_V256, k = bits == 8 ? 0 : bits == 16 ? 1 : bits == 32 ? 2 : 3, inv = 0, swap = 0;
+        rt = type_vector(int_of_size(type_size(vt->base)), (u32)vt->len, 1);
+        if (!fl && uns && op != T_EQ && op != T_NE)
+            return 0;
+        a = vec_operand(l, vt, lane);
+        b = vec_operand(r, vt, lane);
+        if (fl) {
+            int pred = op == T_EQ ? 0 : op == T_NE ? 4 : op == T_LT ? 1 : op == T_LE ? 2 : op == T_GT ? 14 : 13;
+            v = xi_call(lane == M_F32 ? fcmp[w] : dcmp[w], ity, a, b, ir_const(F, IT_I32, (u64)pred), 3);
+        } else {
+            const char *nm;
+            switch (op) {
+            case T_EQ: nm = eqn[w][k]; break;
+            case T_NE: nm = eqn[w][k]; inv = 1; break;
+            case T_GT: nm = gtn[w][k]; break;
+            case T_LT: nm = gtn[w][k]; swap = 1; break;
+            case T_LE: nm = gtn[w][k]; inv = 1; break;
+            default: nm = gtn[w][k]; swap = 1; inv = 1; break; /* a >= b: not b > a */
+            }
+            v = swap ? xi_call(nm, ity, b, a, 0, 2) : xi_call(nm, ity, a, b, 0, 2);
+            if (inv)
+                v = vec_ins(OP_NOT, ity, M_32, v, 0);
+        }
+        vec_result(l, rt, v);
+        return 1;
+    }
+    if (!iop)
+        return 0;
+    a = vec_operand(l, vt, lane);
+    b = vec_operand(r, vt, lane);
+    vec_result(l, vt, vec_ins(iop, ity, lane, a, b));
+    return 1;
+}
+
+static int vec_unary_x64(int op, Expr *e)
+{
+    Type *vt = e->ty->canon;
+    int mem = vec_mem(vt), lane = vec_lane(vt), fl = lane == M_F32 || lane == M_F64;
+    u32 a;
+    if (!mem || lane < 0 || (op != T_MINUS && op != T_TILDE) || (op == T_TILDE && fl))
+        return 0;
+    a = ir_load(F, vec_ity(mem), mem, e->v);
+    vec_result(e, vt, vec_ins(op == T_TILDE ? OP_NOT : fl ? OP_FNEG : OP_NEG, vec_ity(mem), lane, a, 0));
+    return 1;
+}
+
+/* a constant vector of n 32-bit lanes, from read-only data */
+static u32 vec_const32(const i32 *lane, u32 n)
+{
+    u8 b[32];
+    u32 k;
+    memset(b, 0, sizeof b);
+    for (k = 0; k < n; k++)
+        put_u32le(b + 4 * k, (u32)lane[k]);
+    return ir_load(F, n == 8 ? IT_V256 : IT_V128, n == 8 ? M_V256 : M_V128, ir_addr(F, string_sym(b, 4 * n), 0));
+}
+
+/* __builtin_shufflevector of vectors that are registers, lanes of 4 or 8 bytes, as many as there are: vpermd
+   (vpermilps) of each source and a blend; 0 if it is not that */
+static int shuffle_x64(Expr *e, Expr *v2, const i64 *idx, u32 n)
+{
+    Type *vt = e->ty->canon;
+    int mem = vec_mem(vt);
+    u32 len = (u32)vt->len, es = (u32)type_size(vt->base) / 4, nd, k, j, blend = 0, a, b, ra = 0, rb = 0, v;
+    i32 ia[8], ib[8];
+    int w;
+    if (!mem || n != len || (es != 1 && es != 2) || vec_lane(vt) < 0)
+        return 0;
+    nd = (u32)type_size(vt) / 4;
+    w = mem == M_V256;
+    for (k = 0; k < n; k++)
+        for (j = 0; j < es; j++) {
+            u32 d = k * es + j;
+            i64 s = idx[k] < 0 ? 0 : idx[k];
+            if (s >= (i64)len) {
+                ib[d] = (i32)((u32)(s - len) * es + j);
+                ia[d] = 0;
+                blend |= 1u << d;
+            } else {
+                ia[d] = (i32)((u32)s * es + j);
+                ib[d] = 0;
+            }
+        }
+    a = ir_load(F, vec_ity(mem), mem, e->v);
+    b = ir_load(F, vec_ity(mem), mem, v2->v);
+    if (blend != (1u << nd) - 1)
+        ra = xi_call(w ? "mm256_permutevar8x32_epi32" : "mm_permutevar_ps", vec_ity(mem), a, vec_const32(ia, nd), 0, 2);
+    if (blend)
+        rb = xi_call(w ? "mm256_permutevar8x32_epi32" : "mm_permutevar_ps", vec_ity(mem), b, vec_const32(ib, nd), 0, 2);
+    v = !blend ? ra : !ra ? rb : xi_call(w ? "mm256_blend_epi32" : "mm_blend_epi32", vec_ity(mem), ra, rb, ir_const(F, IT_I32, blend), 3);
+    vec_result(e, vt, v);
+    return 1;
+}
+
+/* __builtin_convertvector to a vector that is a register, where one instruction does it; 0 if not */
+static int convert_x64(Expr *e, Type *vt)
+{
+    Type *st = e->ty->canon;
+    int mem = vec_mem(vt), dl = vec_lane(vt), sl = vec_lane(st), smem = vec_memx(st);
+    u32 n = (u32)vt->len, ss = (u32)type_size(st->base), ds = (u32)type_size(vt->base), a;
+    const char *nm = 0;
+    if (!mem || dl < 0 || sl < 0 || (u32)st->len != n)
+        return 0;
+    if (ss == 4 && ds == 4 && smem == mem) {
+        if (sl == M_32 && dl == M_F32 && !type_is_unsigned(st->base))
+            nm = mem == M_V256 ? "mm256_cvtepi32_ps" : "mm_cvtepi32_ps";
+        else if (sl == M_F32 && dl == M_32 && !type_is_unsigned(vt->base))
+            nm = mem == M_V256 ? "mm256_cvttps_epi32" : "mm_cvttps_epi32";
+        else if ((sl == M_32) == (dl == M_32))
+            nm = "";
+        if (!nm)
+            return 0;
+        a = ir_load(F, vec_ity(mem), mem, e->v);
+        vec_result(e, vt, *nm ? xi_call(nm, vec_ity(mem), a, 0, 0, 1) : a);
+        return 1;
+    }
+    if (ds <= ss || dl == M_F32 || dl == M_F64 || sl == M_F32 || sl == M_F64 || mem != M_V256)
+        return 0;
+    /* widening integers into 256 bits: the source is the low part of a 128-bit register */
+    if (ss * n == 8)
+        a = xi_call("mm_loadl_epi64", IT_V128, e->v, 0, 0, 1);
+    else if (ss * n == 16)
+        a = ir_load(F, IT_V128, M_V128, e->v);
+    else
+        return 0;
+    {
+        int u = type_is_unsigned(st->base);
+        if (ss == 1 && ds == 2)
+            nm = u ? "mm256_cvtepu8_epi16" : "mm256_cvtepi8_epi16";
+        else if (ss == 1 && ds == 4)
+            nm = u ? "mm256_cvtepu8_epi32" : "mm256_cvtepi8_epi32";
+        else if (ss == 1 && ds == 8)
+            nm = u ? "mm256_cvtepu8_epi64" : "mm256_cvtepi8_epi64";
+        else if (ss == 2 && ds == 4)
+            nm = u ? "mm256_cvtepu16_epi32" : "mm256_cvtepi16_epi32";
+        else if (ss == 2 && ds == 8)
+            nm = u ? "mm256_cvtepu16_epi64" : "mm256_cvtepi16_epi64";
+        else if (ss == 4 && ds == 8)
+            nm = u ? "mm256_cvtepu32_epi64" : "mm256_cvtepi32_epi64";
+        else
+            return 0;
+    }
+    vec_result(e, vt, xi_call(nm, IT_V256, a, 0, 0, 1));
+    return 1;
+}
+
+/* the vector type of an intrinsic's operand or result */
+static Type *xt_type(int xt)
+{
+    switch (xt) {
+    case XT_M256: return type_vector(ty_float, 8, 1);
+    case XT_M256D: return type_vector(ty_double, 4, 1);
+    case XT_M256I: return type_vector(ty_llong, 4, 1);
+    case XT_M128: return type_vector(ty_float, 4, 1);
+    case XT_M128D: return type_vector(ty_double, 2, 1);
+    case XT_M128I: return type_vector(ty_llong, 2, 1);
+    case XT_I8: return ty_char;
+    case XT_I16: return ty_short;
+    case XT_U16: return ty_ushort;
+    case XT_I32: return ty_int;
+    case XT_U32: return ty_uint;
+    case XT_I64: return ty_llong;
+    case XT_U64: return ty_ullong;
+    case XT_F32: return ty_float;
+    case XT_F64: return ty_double;
+    case XT_PTR: return type_ptr(ty_void);
+    case XT_IMM: return ty_int;
+    }
+    return ty_void;
+}
+
+static int xt_vec(int xt)
+{
+    return xt >= XT_M256 && xt <= XT_M128I;
+}
+
+/* __builtin_x86_NAME(...): the intrinsic _NAME of <immintrin.h> */
+static void x86_intrinsic(Expr *e, const char *name, u32 loc)
+{
+    int id = x86i_find(name), k, n;
+    const X86I *x;
+    u32 args[32], v, rty, tmp;
+    Type *rt;
+    if (id < 0)
+        error_at(loc, "unknown intrinsic _%s", name);
+    if (opt_arch != ARCH_X64 || cur_fn_dev)
+        error_at(loc, "_%s: x86-64 intrinsics are for x86-64 host code", name);
+    x = &x86i_tab[id];
+    n = x->nargs;
+    next();
+    expect(T_LPAREN);
+    for (k = 0; k < n; k++) {
+        int xt = x->kind == XK_SET || x->kind == XK_SETR ? x->arg[0] : x->arg[k];
+        Expr a;
+        if (k)
+            expect(T_COMMA);
+        assign_expr(&a);
+        rvalue(&a);
+        if (xt_vec(xt)) {
+            Type *want = xt_type(xt);
+            if (!VK(a.ty) || type_size(a.ty) != type_size(want))
+                error_at(loc, "argument %d of _%s must be a %d-byte vector", k + 1, name, (int)type_size(want));
+            args[k] = ir_load(F, vec_ity(vec_memx(want)), vec_memx(want), a.v);
+        } else if (xt == XT_PTR) {
+            if (a.ty->kind != TY_PTR && !type_is_int(a.ty))
+                error_at(loc, "argument %d of _%s must be an address", k + 1, name);
+            convert(&a, a.ty->kind == TY_PTR ? a.ty : ty_long);
+            args[k] = a.v;
+        } else {
+            u64 cv;
+            convert(&a, xt_type(xt));
+            if (xt == XT_IMM && !ir_is_const(F, a.v, &cv) && x->kind != XK_VEX)
+                error_at(loc, "argument %d of _%s must be a constant", k + 1, name);
+            args[k] = a.v;
+        }
+    }
+    expect(T_RPAREN);
+    rt = xt_type(x->ret);
+    rty = xt_vec(x->ret) ? (u32)vec_ity(vec_memx(rt)) : x->ret == XT_VOID ? IT_VOID : (u32)type_ir(rt);
+    switch (x->kind) {
+    case XK_LOAD:
+        v = ir_load(F, (int)rty, vec_memx(rt), args[0]);
+        break;
+    case XK_STORE:
+        ir_store(F, vec_memx(xt_type(x->arg[1])), args[0], args[1]);
+        set_expr(e, ty_void, 0, 0);
+        return;
+    case XK_ZERO:
+        v = ir_const(F, (int)rty, 0);
+        break;
+    case XK_SPLAT:
+        v = vec_ins(OP_VSPLAT, (int)rty, (int)x->extra, args[0], 0);
+        break;
+    case XK_CAST:
+        v = args[0];
+        break;
+    case XK_SET:
+    case XK_SETR: {
+        /* through memory: the lanes one by one, then the whole */
+        Type *et = xt_type(x->arg[0]);
+        u64 es = type_size(et);
+        tmp = new_temp(rt);
+        for (k = 0; k < n; k++) {
+            u32 at = ir_ins(F, OP_ADD, IT_I64, tmp, ir_const(F, IT_I64, (u64)(x->kind == XK_SET ? n - 1 - k : k) * es));
+            if (xt_vec(x->arg[0]))
+                ir_store(F, vec_memx(et), at, args[k]);
+            else
+                store_val(et, at, args[k]);
+        }
+        v = ir_load(F, (int)rty, vec_memx(rt), tmp);
+        break;
+    }
+    case XK_VSTM:
+        /* the low 4 or 8 bytes, through a general register */
+        if (XE_OPC(x->enc) == 0x7e) {
+            v = xi_call("mm_cvtsi128_si32", IT_I32, args[1], 0, 0, 1);
+            ir_store(F, M_32, args[0], v);
+        } else {
+            v = xi_call("mm_cvtsi128_si64", IT_I64, args[1], 0, 0, 1);
+            ir_store(F, M_64, args[0], v);
+        }
+        set_expr(e, ty_void, 0, 0);
+        return;
+    default:
+        v = ir_xi(F, (int)rty, (u32)id, args, (u32)n);
+        if (x->kind == XK_RAW || x->kind == XK_PREFETCH)
+            F->ins[v].flags = XI_EFFECT;
+        break;
+    }
+    if (xt_vec(x->ret)) {
+        vec_result(e, rt, v);
+    } else if (x->ret == XT_VOID) {
+        set_expr(e, ty_void, 0, 0);
+    } else {
+        set_expr(e, rt, v, 0);
+        if (x->ret == XT_U16)
+            e->v = ir_ins(F, OP_AND, IT_I32, v, ir_const(F, IT_I32, 0xffff));
+    }
+}
+
+/* __builtin_cpu_supports("name"): asked of the processor (cpuid) where the program runs */
+static void cpu_supports(Expr *e, u32 loc)
+{
+    static const struct { const char *name; u8 leaf, reg, bit; } feats[] = {
+        {"sse3", 1, 2, 0}, {"pclmul", 1, 2, 1}, {"ssse3", 1, 2, 9}, {"fma", 1, 2, 12}, {"cmpxchg16b", 1, 2, 13},
+        {"sse4.1", 1, 2, 19}, {"sse4.2", 1, 2, 20}, {"movbe", 1, 2, 22}, {"popcnt", 1, 2, 23}, {"aes", 1, 2, 25},
+        {"avx", 1, 2, 28}, {"f16c", 1, 2, 29}, {"rdrnd", 1, 2, 30}, {"cmov", 1, 3, 15}, {"mmx", 1, 3, 23},
+        {"sse", 1, 3, 25}, {"sse2", 1, 3, 26}, {"bmi", 7, 1, 3}, {"avx2", 7, 1, 5}, {"bmi2", 7, 1, 8},
+        {"avx512f", 7, 1, 16}, {"avx512dq", 7, 1, 17}, {"adx", 7, 1, 19}, {"avx512cd", 7, 1, 28}, {"sha", 7, 1, 29},
+        {"avx512bw", 7, 1, 30}, {"avx512vl", 7, 1, 31}, {"avx512vbmi", 7, 2, 1}, {"gfni", 7, 2, 8},
+        {"vpclmulqdq", 7, 2, 10}, {"avx512vnni", 7, 2, 11}, {"avx512bitalg", 7, 2, 12}, {"avx512vpopcntdq", 7, 2, 14}};
+    u32 k, v;
+    next();
+    {
+        const char *str = intern_str(attr_string());
+        (void)loc;
+        for (k = 0; k < sizeof feats / sizeof feats[0]; k++)
+            if (strcmp(str, feats[k].name) == 0)
+                break;
+        if (k == sizeof feats / sizeof feats[0]) {
+            set_expr(e, ty_int, ir_const(F, IT_I32, 0), 0);
+            return;
+        }
+    }
+    if (opt_arch != ARCH_X64 || cur_fn_dev) {
+        set_expr(e, ty_int, ir_const(F, IT_I32, 0), 0);
+        return;
+    }
+    v = xi_call("mcc_cpuid", IT_I32, ir_const(F, IT_I32, feats[k].leaf), ir_const(F, IT_I32, 0),
+                ir_const(F, IT_I32, feats[k].reg), 3);
+    v = ir_ins(F, OP_AND, IT_I32, ir_ins(F, OP_SHR, IT_I32, v, ir_const(F, IT_I32, feats[k].bit)), ir_const(F, IT_I32, 1));
+    set_expr(e, ty_int, v, 0);
+}
+
 static int builtin(Expr *e)
 {
     const char *nm = intern_str(tok.v), *b;
@@ -3343,6 +3872,21 @@ static int builtin(Expr *e)
     if (strncmp(nm, "__builtin_", 10) != 0)
         return 0;
     b = nm + 10;
+    if (strncmp(b, "x86_", 4) == 0) {
+        x86_intrinsic(e, b + 4, loc);
+        return 1;
+    }
+    if (strcmp(b, "cpu_supports") == 0) {
+        cpu_supports(e, loc);
+        return 1;
+    }
+    if (strcmp(b, "cpu_init") == 0) {
+        next();
+        expect(T_LPAREN);
+        expect(T_RPAREN);
+        set_expr(e, ty_void, 0, 0);
+        return 1;
+    }
     if (strcmp(b, "va_start") == 0 || strcmp(b, "va_arg") == 0 || strcmp(b, "va_end") == 0)
         return 0;
     if (strcmp(b, "expect") == 0 || strcmp(b, "expect_with_probability") == 0 || strcmp(b, "assume_aligned") == 0) {
@@ -3412,6 +3956,8 @@ static int builtin(Expr *e)
         if (VK(e->ty) != 1 || VK(vt) != 1 || e->ty->canon->len != vt->canon->len)
             error_at(loc, "invalid vector conversion");
         vt = vt->canon;
+        if (convert_x64(e, vt))
+            return 1;
         n = (u32)vt->len;
         tmp = new_temp(vt);
         for (i = 0; i < n; i++) {
@@ -3443,6 +3989,8 @@ static int builtin(Expr *e)
             idx[n++] = const_int_expr();
         }
         expect(T_RPAREN);
+        if (shuffle_x64(e, &v2, idx, n))
+            return 1;
         et = e->ty->canon->base;
         len = (u32)e->ty->canon->len;
         rt = type_vector(et, n, 1);
@@ -9585,6 +10133,10 @@ static void statement(void)
                 convert(&e, cur_ret);
             if (cur_ret->kind == TY_VOID) {
                 ret_ins(0);
+            } else if (vec_mem(cur_ret)) {
+                if (!VK(e.ty) || type_size(e.ty) != type_size(cur_ret))
+                    error_at(loc, "incompatible return type");
+                ret_ins(ir_load(F, vec_mem(cur_ret) == M_V256 ? IT_V256 : IT_V128, vec_mem(cur_ret), e.v));
             } else if (type_is_record(cur_ret)) {
                 if (!type_is_record(e.ty) || e.ty->canon != cur_ret->canon)
                     error_at(loc, "incompatible return type");
@@ -9606,7 +10158,9 @@ static void statement(void)
                 ret_ins(e.v);
             }
         } else {
-            if (cur_ret->kind == TY_VOID || type_is_record(cur_ret) || type_is_128(cur_ret))
+            if (vec_mem(cur_ret))
+                ret_ins(ir_const(F, vec_mem(cur_ret) == M_V256 ? IT_V256 : IT_V128, 0));
+            else if (cur_ret->kind == TY_VOID || type_is_record(cur_ret) || type_is_128(cur_ret))
                 ret_ins(0);
             else if (type_is_float(cur_ret))
                 ret_ins(ir_fconst(F, type_ir(cur_ret), 0.0));
@@ -9904,6 +10458,8 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         dwarf_func_loc(F->sym, loc, ty->base);
     ir_loc = loc;
     cur_fn_dev = opt_cuda && (s->aflags & (AT_GLOBAL | AT_DEVICE)) != 0;
+    cur_fn_avx = (s->aflags & AT_AVX) != 0;
+    F->avx = (u8)(opt_avx || cur_fn_avx);
     cur_fn_kernel = cur_fn_dev && (s->aflags & AT_GLOBAL) != 0;
     opt_dev_parse = cur_fn_dev && ((s->aflags & AT_GLOBAL) || !(s->aflags & AT_HOST)); /* (not what is host code as well) */
     cur_ret = ty->base;
@@ -9938,7 +10494,8 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         expect(T_SEMI);
     }
 
-    F->ret_ty = (u8)(type_is_record(cur_ret) || type_is_128(cur_ret) ? IT_VOID : type_ir(cur_ret));
+    F->ret_ty = (u8)(vec_mem(cur_ret) ? (vec_mem(cur_ret) == M_V256 ? IT_V256 : IT_V128)
+                     : type_is_record(cur_ret) || type_is_128(cur_ret) ? IT_VOID : type_ir(cur_ret));
     F->variadic = ty->variadic;
     {
         static const struct Inl none;
@@ -9949,7 +10506,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         F->has_sret = 17; /* two doublewords in registers */
         sret_slot = ir_slot_addr(F, ir_new_slot(F, 8, 8), 0);
         ir_store(F, M_64, sret_slot, v);
-    } else if (type_is_record(cur_ret)) {
+    } else if (type_is_record(cur_ret) && !vec_mem(cur_ret)) {
         v = ir_add_param(F, IT_I64);
         F->has_sret = (u8)(abi_words(cur_ret) ? 1 + type_size(cur_ret) : 1);
         if (opt_arch == ARCH_X64) /* which halves come back in xmm registers */
@@ -10079,6 +10636,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         /* (+4: device code, which has no vector operations) */
         func_stash(F, (s->aflags & (AT_NOINLINE | AT_WEAK) ? 2 : s->aflags & AT_ALWAYS_INLINE ? 1 : 0) + (lf->dev ? 4 : 0) + (lf->dev == 1 ? 8 : 0));
         cur_fn_dev = 0;
+        cur_fn_avx = 0;
         opt_dev_parse = 0;
         if (lf->dev == 1) {
             F = const_func; /* its PTX is written at the end of the unit */

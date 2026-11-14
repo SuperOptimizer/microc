@@ -50,7 +50,7 @@ static void fclamp(float *o, const float *q, int n) { int x; for (x = 0; x < n; 
 static void thresh(int *o, const float *q, float t, int n) { int x; for (x = 0; x < n; x++) o[x] = q[x] > t; }
 static void dlerp(double *o, const double *a, const double *b, double t, int n)
 { int x; for (x = 0; x < n; x++) o[x] = a[x] + (b[x] - a[x]) * t; }
-static void fdiv(float *o, const float *a, const float *b, int n) { int x; for (x = 0; x < n; x++) o[x] = a[x] / (b[x] + 1.f); }
+static void fdivv(float *o, const float *a, const float *b, int n) { int x; for (x = 0; x < n; x++) o[x] = a[x] / (b[x] + 1.f); }
 static void fneg2(float *o, const float *a, int n) { int x; for (x = 0; x < n; x++) o[x] = -a[x]; }
 static void dneg(double *o, const double *a, int n) { int x; for (x = 0; x < n; x++) o[x] = -a[x] * 2.0; }
 
@@ -151,7 +151,7 @@ int main(void)
                check(sa, sizeof sa) ^ check(sb, sizeof sb), check(wa, sizeof wa) ^ check(hb, sizeof hb),
                check(ia, sizeof ia) ^ check(ib, sizeof ib) ^ check(qb, sizeof qb));
         zero(fc, n / 2); axpy(fc, fa, 0.25f, n); axpy(fc + 1, fc, -0.5f, n); fclamp(fb, fc, n); thresh(ia, fa, 0.5f, n);
-        dlerp(da, da, db, 0.375, n); fdiv(fa, fa, fb, n); fneg2(fb + 3, fb, n); dneg(db, da, n);
+        dlerp(da, da, db, 0.375, n); fdivv(fa, fa, fb, n); fneg2(fb + 3, fb, n); dneg(db, da, n);
         printf("   %lx %lx %lx %lx %lx\n", check(fa, sizeof fa), check(fb, sizeof fb), check(fc, sizeof fc), check(ia, sizeof ia),
                check(da, sizeof da) ^ check(db, sizeof db));
         wmul(wb, wa, wb, n); imul(ib, ia, -77, n); wshift(wa, wb, n); hsar(ha, hb, n); ineg(ia + 1, ia, n); hneg(hb, ha, n);

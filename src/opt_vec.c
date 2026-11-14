@@ -272,6 +272,18 @@ static int minmax_op(u32 v)
     return m & MM_MAX ? (uns ? OP_VUMAX : OP_VSMAX) : (uns ? OP_VUMIN : OP_VSMIN);
 }
 
+/* x (an i32 of the loop) is known to be below 2^31: an unsigned conversion of it is the signed one */
+static int nonneg31(u32 x)
+{
+    Ins *i = &f->ins[x];
+    u64 c;
+    if (INV(x))
+        return ir_is_const(f, x, &c) && (u32)c < 0x80000000U;
+    return (i->op == OP_LOAD && (i->mem == M_8U || i->mem == M_16U)) || i->op == OP_ZEXT8 || i->op == OP_ZEXT16 ||
+           (i->op == OP_AND && ((INV(i->b) && nonneg31(i->b)) || (INV(i->a) && nonneg31(i->a)))) ||
+           (i->op == OP_SHR && INV(i->b) && ir_is_const(f, i->b, &c) && (c & 31));
+}
+
 /* Has x86-64 an instruction for the vector form of v, in lanes of lanesz bytes? */
 static int x64_has(u32 v)
 {
@@ -294,7 +306,9 @@ static int x64_has(u32 v)
         return lanesz <= 4;
     case OP_SITOF: case OP_FTOSI:
         return lanesz == 4;
-    case OP_UITOF: case OP_FTOUI:
+    case OP_UITOF:
+        return lanesz == 4 && i->ty == IT_F32 && f->ins[i->a].ty == IT_I32 && nonneg31(i->a);
+    case OP_FTOUI:
         return 0;
     default:
         return 1;
@@ -552,7 +566,7 @@ static int try_loop(u32 l, u32 n0)
                     MISS("elements of different sizes");
                 mixed = 1;
             }
-            if (mem_size(i->mem) > maxmem)
+            if ((u32)mem_size(i->mem) > maxmem)
                 maxmem = (u32)mem_size(i->mem);
             for (k = 0; k < nkeys && keys[k] != key; k++)
                 ;
@@ -1021,7 +1035,8 @@ static int try_loop(u32 l, u32 n0)
             } else if (in.op == OP_SHL || in.op == OP_SHR || in.op == OP_SAR) {
                 nv = mk(V, in.op, IT_V128, vec_operand(in.a, P), in.b); /* the count stays a constant */
             } else if (ir_opcount_tab[in.op] == 1) {
-                nv = mk(V, in.op, IT_V128, vec_operand(in.a, P), 0);
+                /* x86-64 takes only unsigned values below 2^31 (x64_has): the signed conversion */
+                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : in.op, IT_V128, vec_operand(in.a, P), 0);
             } else {
                 if (kind[v] == K_MASK)
                     lk = lane_kind(f->ins[in.a].ty);

@@ -557,9 +557,9 @@ void ra_run(MFunc *m, const MTarget *t)
         for (v = bucket[i]; v != NOREG; v = bnext[v])
             order[norder++] = v;
 
-    /* class bit 1: a 128-bit value, which has no spill slot to go to */
+    /* class bit 1 without bit 4: a vector with no spill slot to go to (x64.c's legacy SSE code) */
     for (v = 0; v < nv; v++)
-        if (m->vclass[v] & 2)
+        if ((m->vclass[v] & 0x12) == 2)
             weight[v] = 0xffffff;
     for (i = 0; i < norder; i++) {
         u32 cur = order[i], s = rg_start[head[cur]], n;

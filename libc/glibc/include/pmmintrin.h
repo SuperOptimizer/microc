@@ -1,2 +1,2 @@
-/* pmmintrin.h: all of these live in <immintrin.h> here */
+/* mcc: everything is in <immintrin.h> */
 #include <immintrin.h>

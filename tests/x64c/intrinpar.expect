@@ -1,0 +1,175 @@
+add_ps 5c93b559
+sub_ps c23bf88a
+mul_ps d21bbb3c
+div_ps e99e903f
+max_ps 2b3f585f
+min_ps 898b4aa1
+sqrt_ps fd5efe2a
+floor_ps aad6bb35
+fmadd_ps bb4e4bcc
+and_ps 12ca8810
+andnot_ps 7f240bea
+or_ps ed53a552
+xor_ps f6f3e53b
+blendv_ps 5fac0b3e
+unpackhi_ps 50ee9c22
+unpacklo_ps 1d83dfe4
+shuffle_ps 0x1b cc07ee0c
+shuffle_ps 0xe4 a7a0d0ba
+shuffle_ps 0x88 72c0437b
+permute2f128_ps 0x21 2de91e63
+permute2f128_ps 0x30 1429c2c5
+permute2f128_ps 0x08 8b5590b1
+permute2f128_ps 0x83 ca3638cd
+movemask_ps cb311937
+cvtepi32_ps cb9b6598
+cvtps_epi32 296711e6
+cvttps_epi32 b47e3c2a
+castpd_ps a128f2c5
+castps_si256 a128f2c5
+castsi256_ps a128f2c5
+castsi256_si128 261ba771
+set1_ps 3b9cd105
+setr_ps b0a2d3e2
+setzero_ps 175370c5
+loadu_ps a128f2c5
+cmp_ps 0 78206b75
+cmp_ps 1 44909d81
+cmp_ps 2 41ccc731
+cmp_ps 3 a20e9949
+cmp_ps 4 ea376415
+cmp_ps 5 0f07b409
+cmp_ps 6 94abce59
+cmp_ps 7 cf3dd041
+cmp_ps 8 739648f9
+cmp_ps 9 0768f905
+cmp_ps 10 2f62beb5
+cmp_ps 11 9cf0c5c5
+cmp_ps 12 d8958091
+cmp_ps 13 4da3ce85
+cmp_ps 14 e660d0d5
+cmp_ps 15 64de67c5
+cmp_ps 16 78206b75
+cmp_ps 17 44909d81
+cmp_ps 18 41ccc731
+cmp_ps 19 a20e9949
+cmp_ps 20 ea376415
+cmp_ps 21 0f07b409
+cmp_ps 22 94abce59
+cmp_ps 23 cf3dd041
+cmp_ps 24 739648f9
+cmp_ps 25 0768f905
+cmp_ps 26 2f62beb5
+cmp_ps 27 9cf0c5c5
+cmp_ps 28 d8958091
+cmp_ps 29 4da3ce85
+cmp_ps 30 e660d0d5
+cmp_ps 31 64de67c5
+cmp_ps aa 0 5c368711
+cmp_ps aa 3 99b3dc79
+cmp_ps aa 4 99b3dc79
+cmp_ps aa 7 5c368711
+cmp_ps aa 13 5c368711
+cmp_ps aa 31 64de67c5
+cvtps_ph 0 2c5b2d16
+cvtps_ph 1 3dd58d45
+cvtps_ph 2 2934943d
+cvtps_ph 3 3c968726
+cvtps_ph 4 2c5b2d16
+cvtps_ph 8 2c5b2d16
+cvtps_ph 9 3dd58d45
+cvtps_ph 10 2934943d
+cvtps_ph 11 3c968726
+cvtps_ph 12 2c5b2d16
+round_ps 0 115a48b2
+round_ps 1 aad6bb35
+round_ps 2 1270413e
+round_ps 3 722d0ae6
+round_ps 4 115a48b2
+round_ps 8 115a48b2
+round_ps 9 aad6bb35
+round_ps 10 1270413e
+round_ps 11 722d0ae6
+round_ps 12 115a48b2
+abs_epi16 70dc6331
+add_epi8 3a008b19
+add_epi16 9665e066
+add_epi32 7ce42bce
+sub_epi8 98141acd
+sub_epi16 6d8cf408
+sub_epi32 483c506d
+mullo_epi16 71458f41
+mullo_epi32 4801a621
+and_si256 12ca8810
+andnot_si256 7f240bea
+or_si256 ed53a552
+xor_si256 f6f3e53b
+blendv_epi8 37f70093
+cmpeq_epi8 11e9be95
+cmpeq_epi8 aa 6553189e
+cmpeq_epi16 80fcd9cd
+cmpeq_epi32 f188b589
+cmpgt_epi16 7bd3321b
+cmpgt_epi32 6216ea25
+max_epu8 029de1ab
+min_epu8 e1fc0285
+min_epi32 f1284871
+movemask_epi8 0a444744
+packus_epi16 211bed11
+packus_epi32 6806074b
+sign_epi16 863ab8a2
+slli_epi32 0 a128f2c5
+slli_epi32 7 c77e4209
+slli_epi32 31 4bfdc545
+slli_epi32 32 9cf0c5c5
+srli_epi32 9 5fd5118e
+srli_epi32 40 9cf0c5c5
+srai_epi32 5 843567d9
+srai_epi32 33 d856bbdd
+srai_epi16 3 c38aece0
+srai_epi16 15 406d0bfd
+srai_epi16 16 406d0bfd
+srlv_epi32 d0625f0c
+cvtepi8_epi16 cf92fab8
+cvtepu8_epi16 fd0a1081
+cvtepu8_epi32 7db8ea8b
+extracti128 0 261ba771
+extracti128 1 8bd6a6a5
+permute4x64 0x4e 8a82b04d
+permute4x64 0xd8 8269d0e9
+permute4x64 0x1b 13f69cbd
+permutevar8x32 cebf6646
+set1_epi8 1dead445
+set1_epi16 d2165f05
+set1_epi32 a5455f55
+setr_epi32 25ef69c0
+setzero_si256 a128f2c5
+loadu_si256 a128f2c5
+testz_si256 72a5a2c5
+testz_si256 0 05dede45
+i32gather_epi32 8e8faca7
+i32gather_ps 7823ad38
+i32gather_ps 2 fabcf789
+i32gather_ps 8 4acbf412
+mask_i32gather_epi32 6040a3ec
+mask_i32gather_ps 82cc8e35
+i32gather_pd 48ce7e08
+storeu 1a61b160
+mm_and_si128 32de0ca0
+mm_cmpeq_epi8 05d3ed36
+mm_cvtsi128_si32 d11b0421
+mm_cvtsi64_si128 7cd13654
+mm_loadu_si128 8a18e415
+mm_max_epu8 f9d43159
+mm_min_epu8 5f2457bf
+mm_movemask_epi8 a2e0ada6
+mm_set1_epi8 ce0b8905
+mm_setzero_si128 f4deb1c5
+mm_srli_si128 1 e575fbf5
+mm_srli_si128 8 09c6e733
+mm_srli_si128 15 a3e76f02
+mm_srli_si128 16 f4deb1c5
+cvtsh_ss 108624e7
+cvtss_sh 0 b1113b5f
+cvtss_sh 3 f0c7b774
+pdep_u64 ad8a774e

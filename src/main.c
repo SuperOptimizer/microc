@@ -546,6 +546,10 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_vec_report = 2; /* with the instruction that stopped it */
         else if (strcmp(a, "-ffast-math") == 0)
             opt_fast_math = 1, opt_math_errno = 0;
+        else if (strcmp(a, "-fassociative-math") == 0 || strcmp(a, "-funsafe-math-optimizations") == 0)
+            opt_fast_math = 1; /* floating-point sums (and, x86-64, maxima and minima) may be reordered */
+        else if (strcmp(a, "-fno-fast-math") == 0 || strcmp(a, "-fno-associative-math") == 0)
+            opt_fast_math = 0;
         else if (strcmp(a, "-fno-math-errno") == 0)
             opt_math_errno = 0;
         else if (strcmp(a, "-fmath-errno") == 0)

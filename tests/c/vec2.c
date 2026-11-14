@@ -137,6 +137,11 @@ static void fgat(float *d, const float *a, int k, int n) { int i; for (i = 0; i 
 static void sgat(int *d, const short *a, int n) { int i; for (i = 0; i < n; i++) d[i] = a[n - 1 - i > i ? i : n - 1 - i] + d[i]; }
 static void selfgat(int *a, int n) { int i; for (i = 0; i < n; i++) a[i + 8] = a[(i >> 1) + 5] + 1; }
 
+/* -ffast-math: floating-point maxima and minima, and sums, reordered (exact here: small multiples of a quarter) */
+static float fmx(const float *a, int n) { int i; float m = -1e30f; for (i = 0; i < n; i++) m = a[i] > m ? a[i] : m; return m; }
+static double dmn(const double *a, int n) { int i; double m = 1e300; for (i = 0; i < n; i++) if (a[i] < m) m = a[i]; return m; }
+static float fsum2(const float *a, const float *b, int n) { int i; float s = 0.f; for (i = 0; i < n; i++) s += a[i] * b[i]; return s; }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -198,6 +203,8 @@ int main(void)
         selfgat(ia + 20, n / 3); half(ua, ua + 30, 3, 0, n / 3);
         printf("   %lx %lx %lx %lx %lx\n", check(fc, sizeof fc), check(ub, sizeof ub), check(fb, sizeof fb), check(ib, sizeof ib),
                check(ia, sizeof ia) ^ check(ua, sizeof ua));
+        for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 29) % 37) * 0.25f - 4.f; fb[i] = (float)(i % 3); da[i] = (double)((i * 13) % 31) * 0.5 - 7.0; }
+        printf("   %g %g %g\n", (double)fmx(fa, n), dmn(da, n), (double)fsum2(fa, fb, n));
         plane(fb, fa, 1, 20, (unsigned long)n / 3); plane(fc, fb, 0, 9, (unsigned long)n / 2); bplane(ua, ub, 3, n / 2); bplane(ub, ub, 1, n / 3);
         printf("   %lx %lx %lx %lx %lx\n", check(fb, sizeof fb), check(ia, sizeof ia), check(ib, sizeof ib), check(fc, sizeof fc),
                check(ua, sizeof ua) ^ check(ub, sizeof ub));

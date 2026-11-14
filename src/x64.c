@@ -1062,6 +1062,10 @@ static void sel_vec(u32 v)
     case OP_FMUL: vbin(d, (n == 8 ? VP66 : O_0F) | 0x59, ra, rb, 1); return;
     case OP_FDIV: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5e, ra, rb, 0); return;
     case OP_VSMAX: case OP_VSMIN: case OP_VUMAX: case OP_VUMIN:
+        if (fl) { /* maxps maxpd minps minpd (-ffast-math reductions) */
+            vbin(d, (n == 8 ? VP66 : O_0F) | (i->op == OP_VSMAX ? 0x5f : 0x5d), ra, rb, 1);
+            return;
+        }
         vbin(d, minmax_code(i->op, n), ra, rb, 1);
         return;
     case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE: {
@@ -2776,7 +2780,9 @@ static void encode_vec(MIns *i)
         u32 v = vloc(i->s0), T = FSCR0, U = FSCR1;
         int k = i->cc, fl = (int)i->imm;
         u32 add = k == M_F32 ? O_0F | 0x58 : k == M_F64 ? O_66 | O_0F | 0x58 : k == M_64 ? O_66 | O_0F | 0xd4 : O_66 | O_0F | 0xfe;
-        if (fl >= 1 && fl <= 4) {
+        if (fl >= 1 && fl <= 4 && (k == M_F32 || k == M_F64)) {
+            add = (k == M_F64 ? O_66 : 0) | O_0F | (fl == 1 ? 0x5f : 0x5d); /* maxps minps (pd) */
+        } else if (fl >= 1 && fl <= 4) {
             static const u32 across[5] = { 0, O_38 | 0x3d, O_38 | 0x39, O_38 | 0x3f, O_38 | 0x3b }; /* pmaxsd pminsd pmaxud pminud */
             add = O_66 | O_0F | across[fl];
         }

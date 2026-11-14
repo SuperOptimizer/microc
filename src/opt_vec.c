@@ -611,7 +611,10 @@ static int try_loop(u32 l, u32 n0)
             Ins *q = &f->ins[ri->a];
             u32 x = ri->b == ph ? ri->c : ri->b;
             int gt, uns_cmp, takes_x_when_true = ri->b != ph;
-            if (ri->ty != IT_I32 || INV(ri->a) || cnt[ri->a] != 1 || cnt[ph] != 2 || (ri->b != ph && ri->c != ph) || x == ph ||
+            /* floating point: x86-64's maxps / minps differ from the select only with NaNs and signed zeros, which
+               -ffast-math lets go */
+            int fl = (ri->ty == IT_F32 || ri->ty == IT_F64) && opt_fast_math && opt_arch == ARCH_X64;
+            if ((ri->ty != IT_I32 && !fl) || INV(ri->a) || cnt[ri->a] != 1 || cnt[ph] != 2 || (ri->b != ph && ri->c != ph) || x == ph ||
                 !((q->a == x && q->b == ph) || (q->a == ph && q->b == x)))
                 MISS("a value carried from one iteration to the next that is not a sum, maximum or minimum");
             switch (q->op) {
@@ -619,8 +622,12 @@ static int try_loop(u32 l, u32 n0)
             case OP_SLT: case OP_SLE: gt = 0; uns_cmp = 0; break;
             case OP_UGT: case OP_UGE: gt = 1; uns_cmp = 1; break;
             case OP_ULT: case OP_ULE: gt = 0; uns_cmp = 1; break;
+            case OP_FGT: case OP_FGE: gt = 1; uns_cmp = 0; break;
+            case OP_FLT: case OP_FLE: gt = 0; uns_cmp = 0; break;
             default: MISS("an operation that has no vector form");
             }
+            if (fl != (q->op >= OP_FEQ && q->op <= OP_FGE))
+                MISS("an operation that has no vector form");
             /* is the larger of the two kept? */
             if ((q->a == x) != takes_x_when_true)
                 gt = !gt;
@@ -937,7 +944,8 @@ static int try_loop(u32 l, u32 n0)
     }
     if (opt_arch == ARCH_X64 && !opt_x64_sse41)
         for (k = 0; k < nred; k++)
-            if (red_op[k] == OP_VSMAX || red_op[k] == OP_VSMIN || red_op[k] == OP_VUMAX || red_op[k] == OP_VUMIN)
+            if ((red_op[k] == OP_VSMAX || red_op[k] == OP_VSMIN || red_op[k] == OP_VUMAX || red_op[k] == OP_VUMIN) &&
+                f->ins[red_phi[k]].ty == IT_I32)
                 MISS("a maximum or minimum that x86-64 has an instruction for only with -msse4.1");
     for (k = 0, j = 0; k < nkeys; k++)
         j += stored[k];

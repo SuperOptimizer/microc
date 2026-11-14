@@ -612,6 +612,12 @@ static int cheap_block(u32 b)
                 return 0;
             continue;
         }
+        /* -O3: a little more, so that the vectoriser finds the loop's choices as selects (clamps and the like) */
+        if (opt_level >= 3 && !opt_size) {
+            if (!(is_pure(op) || op == OP_SELECT) || op == OP_FDIV || op == OP_SDIV || op == OP_UDIV || op == OP_SREM || op == OP_UREM || ++n > 4)
+                return 0;
+            continue;
+        }
         if (!is_pure(op) || op == OP_MUL || (op >= OP_FADD && op <= OP_FDIV) || ++n > 2)
             return 0;
     }

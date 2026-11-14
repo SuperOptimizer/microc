@@ -673,7 +673,12 @@ void eld_link(const char *out_path, const char *entry)
     for (f = files; f; f = f->next) {
         for (i = 0; i < f->nsec; i++) {
             Sec *c = &f->secs[i];
-            if (!(c->flags & 2) || (c->type != 1 && c->type != 8 && c->type != 14 && c->type != 15 && c->type != 7))
+            if (!(c->flags & 2) && c->type == 1 && strncmp(c->name, ".debug_", 7) == 0) {
+                out_for(c); /* debug information: kept, after the image */
+                continue;
+            }
+            if (!(c->flags & 2) || (c->type != 1 && c->type != 8 && c->type != 14 && c->type != 15 && c->type != 7 &&
+                                    c->type != 0x70000001 /* x86-64 .eh_frame */))
                 continue;
             out_for(c);
         }
@@ -737,6 +742,8 @@ void eld_link(const char *out_path, const char *entry)
         o->rank = o->flags & 4 ? 0 : !(o->flags & 1) ? 1 : o->type != 8 ? 2 : 3;
         if (o->rank == 0 && strcmp(o->name, ".text") != 0)
             o->shndx += strcmp(o->name, ".init") == 0 ? 0 : 0x10000;
+        if (!(o->flags & 2))
+            o->rank = 4; /* not loaded: last, after the image */
         if (o->flags & 0x400) {
             /* thread-local: the initialised part, then the zeroed part, ahead of the other data */
             o->shndx = o->type != 8 ? 0 : 1;
@@ -770,6 +777,18 @@ void eld_link(const char *out_path, const char *entry)
         for (i = 0; i < o->n; i++)
             if (o->secs[i]->align > o->align)
                 o->align = o->secs[i]->align;
+        if (o->rank == 4) {
+            /* no address; its place in the file comes once the image is written */
+            for (i = 0; i < o->n; i++) {
+                Sec *c = o->secs[i];
+                size = align_up(size, c->align);
+                c->off = size;
+                size += c->size;
+            }
+            o->size = size;
+            o->addr = 0;
+            continue;
+        }
         if (o->rank >= 2 && !rw_started) {
             rw_started = 1;
             addr = align_up(addr, PAGE) + off % PAGE;
@@ -883,6 +902,12 @@ void eld_link(const char *out_path, const char *entry)
         Out *o = outs[k];
         if (o->type == 8)
             continue;
+        if (o->rank == 4) {
+            buf_zero(&out, (size_t)(align_up(out.len, o->align) - out.len));
+            o->off = out.len;
+            buf_zero(&out, (size_t)o->size);
+            img = out.p;
+        }
         for (i = 0; i < o->n; i++) {
             Sec *c = o->secs[i];
             if (c->type != 8 && c->size)
@@ -965,7 +990,7 @@ void eld_link(const char *out_path, const char *entry)
             h = img + shoff + 64 * (k + 1);
             w32(h, names[k]);
             w32(h + 4, o->type);
-            w64(h + 8, o->flags | 2);
+            w64(h + 8, o->rank == 4 ? o->flags : o->flags | 2);
             w64(h + 16, o->addr);
             w64(h + 24, o->off);
             w64(h + 32, o->size);
@@ -1091,7 +1116,8 @@ void eld_relocatable(const char *out_path)
         nfiles++;
         for (i = 1; i < f->nsec; i++) {
             Sec *c = &f->secs[i];
-            if (c->type == 0 || c->type == 2 || c->type == 3 || c->type == 4 || c->type == 17 || c->type >= 0x60000000)
+            if (c->type == 0 || c->type == 2 || c->type == 3 || c->type == 4 || c->type == 17 ||
+                (c->type >= 0x60000000 && c->type != 0x70000001 /* x86-64 .eh_frame */))
                 continue;
             out_for(c);
         }

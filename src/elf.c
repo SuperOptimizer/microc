@@ -298,6 +298,8 @@ void elf_write_obj(Buf *out, Obj *o)
             n = sec_name(o, i);
             if (strncmp(n, ".note", 5) == 0)
                 type = 7;
+            else if (opt_arch == ARCH_X64 && strcmp(n, ".eh_frame") == 0)
+                type = 0x70000001; /* SHT_X86_64_UNWIND */
             if (fl & SF_WRITE) ef |= 1;
             if (fl & SF_ALLOC) ef |= 2;
             if (fl & SF_EXEC) ef |= 4;

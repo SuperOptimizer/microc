@@ -45,6 +45,8 @@ void ir_func_reset(Func *f)
     arena_reset(&f->arena);
 }
 
+u32 ir_loc;
+
 u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b)
 {
     Ins *i;
@@ -63,6 +65,7 @@ u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b)
     i->blk = 0;
     i->prev = i->next = 0;
     i->aux = 0;
+    i->loc = ir_loc;
     return f->nins++;
 }
 

@@ -112,6 +112,8 @@ static u32 va_slot;   /* variadic function: the register save area */
 static u32 *alink;    /* inline assembly call -> its first OP_ASMOUT -> the next; made when first needed */
 static u64 asm_saved; /* registers written by inline assembly */
 static u32 fn_serial;
+/* -g: the source location of each machine instruction, and of the IR instruction being selected */
+static u32 *mloc, capmloc, sel_loc;
 
 /* ---- machine IR construction ---- */
 
@@ -121,6 +123,13 @@ static MIns *emit(int op, int w, u32 d, u32 s0, u32 s1)
     if (mf.n == mf.cap) {
         mf.cap = mf.cap ? mf.cap * 2 : 1024;
         mf.ins = (MIns *)xrealloc(mf.ins, mf.cap * sizeof(MIns));
+    }
+    if (opt_debug) {
+        if (mf.n >= capmloc) {
+            capmloc = mf.cap;
+            mloc = (u32 *)xrealloc(mloc, capmloc * sizeof(u32));
+        }
+        mloc[mf.n] = sel_loc;
     }
     i = &mf.ins[mf.n++];
     i->op = (u16)op;
@@ -1776,8 +1785,11 @@ static void select_all(void)
                 }
             }
         }
-        for (v = bb->first; v; v = f->ins[v].next)
+        for (v = bb->first; v; v = f->ins[v].next) {
+            if (f->ins[v].loc)
+                sel_loc = f->ins[v].loc;
             sel_ins(v);
+        }
         sel_term(b, k + 1 < nlayout ? layout[k + 1] : 0);
         mb->n = mf.n - mb->first;
         mb->nsucc = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
@@ -1803,6 +1815,37 @@ static u32 nfixups, capfixups;
 static u32 spill_base, frame_size;
 static u64 saved_regs;
 static int has_frame;
+/* -g: line table rows (offsets in the section, locations) and frame events of the function being encoded */
+static u32 *row_off, *row_loc, nrow, caprow;
+static DwCfi *cfi;
+static u32 ncfi, capcfi;
+
+static void cfi_event(int op, u32 reg, u32 n)
+{
+    if (!opt_debug)
+        return;
+    if (ncfi == capcfi) {
+        capcfi = capcfi ? capcfi * 2 : 16;
+        cfi = (DwCfi *)xrealloc(cfi, capcfi * sizeof(DwCfi));
+    }
+    cfi[ncfi].off = (u32)text->len;
+    cfi[ncfi].op = (u8)op;
+    cfi[ncfi].reg = (u8)reg;
+    cfi[ncfi].n = (u8)n;
+    ncfi++;
+}
+
+static void row_add(u32 loc)
+{
+    if (nrow == caprow) {
+        caprow = caprow ? caprow * 2 : 256;
+        row_off = (u32 *)xrealloc(row_off, caprow * sizeof(u32));
+        row_loc = (u32 *)xrealloc(row_loc, caprow * sizeof(u32));
+    }
+    row_off[nrow] = (u32)text->len;
+    row_loc[nrow] = loc;
+    nrow++;
+}
 
 /* an opcode: the byte, then what goes before it */
 #define O_0F 0x100       /* the 0f escape */
@@ -2085,13 +2128,16 @@ static void prologue(void)
     if (!has_frame)
         return;
     b1(0x55);              /* push rbp */
+    cfi_event(CFI_PUSHFP, 0, 0);
     op_rr(0x89, 1, RSP, RBP); /* mov rbp, rsp */
+    cfi_event(CFI_SETFP, 0, 0);
     if (frame_size)
         alu_ri(5, 1, RSP, frame_size);
     for (k = 0; k < 16; k++)
         if (saved_regs >> k & 1) {
             ea_base(&ea, RBP, -(i64)(8 * ++n));
             store_reg(k, &ea);
+            cfi_event(CFI_SAVE, k, 2 + n); /* rbp - 8n is the frame's address - 16 - 8n */
         }
 }
 
@@ -2106,8 +2152,11 @@ static void epilogue(void)
                 load_reg(k, &ea);
             }
         b1(0xc9); /* leave */
+        cfi_event(CFI_EPI, 0, 0);
     }
     b1(0xc3);
+    if (has_frame)
+        cfi_event(CFI_RESTORE, 0, 0); /* code after the return is in the frame again */
 }
 
 /* The memory operand of a load or store whose base and index are s1 and s2 of the instruction given
@@ -3150,6 +3199,16 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
             bi++;
         r->off -= cut[bi];
     }
+    for (k = 0, bi = 0; k < nrow; k++) {
+        while (bi < nfixups && fx_start(&fixups[bi]) < row_off[k])
+            bi++;
+        row_off[k] -= cut[bi];
+    }
+    for (k = 0, bi = 0; k < ncfi; k++) {
+        while (bi < nfixups && fx_start(&fixups[bi]) < cfi[k].off)
+            bi++;
+        cfi[k].off -= cut[bi];
+    }
     free(cut);
     free(nb);
 }
@@ -3157,13 +3216,15 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
 void x64_gen(Func *fn, Obj *o)
 {
     u32 k, n, off, start, nsaved, first_rel;
-    u32 *blk_off;
+    u32 *blk_off, saved_loc = ir_loc, last_loc = 0, body_at = 0;
     int has_asm = 0;
 
+    ir_loc = 0;
     opt_finish(fn);
     f = fn;
     obj = o;
     fn_serial++;
+    sel_loc = opt_debug ? dwarf_get_func_loc(f->sym) : 0;
     prepare();
     select_all();
     ra_run(&mf, &target);
@@ -3200,7 +3261,13 @@ void x64_gen(Func *fn, Obj *o)
     o->syms[f->sym].value = start;
 
     first_rel = o->nrel[arm64_text_sec];
+    nrow = ncfi = 0;
+    if (opt_debug && dwarf_get_func_loc(f->sym)) {
+        last_loc = dwarf_get_func_loc(f->sym);
+        row_add(last_loc);
+    }
     prologue();
+    body_at = (u32)text->len;
     blk_off = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));
     nfixups = 0;
     for (k = 0; k < mf.nblk; k++) {
@@ -3209,12 +3276,25 @@ void x64_gen(Func *fn, Obj *o)
         for (n = mb->first; n < mb->first + mb->n; n++) {
             if (mf.ins[n].op == X_ASM)
                 has_asm = 1;
+            if (opt_debug && mloc[n] && mloc[n] != last_loc) {
+                last_loc = mloc[n];
+                row_add(last_loc);
+            }
             encode(&mf.ins[n]);
             text = &o->sec[arm64_text_sec];
         }
     }
     relax(blk_off, first_rel, has_asm);
     o->syms[f->sym].size = text->len - start;
+    if (opt_debug) {
+        for (k = 0; k < nrow; k++)
+            row_off[k] -= start;
+        for (k = 0; k < ncfi; k++)
+            cfi[k].off -= start;
+        /* (the first instruction after the prologue: the prologue comes before any jump, so relax left it be) */
+        dwarf_func(f->sym, (u32)(text->len - start), row_off, row_loc, nrow, cfi, ncfi, has_frame ? body_at - start : 0);
+    }
+    ir_loc = saved_loc;
     free(blk_off);
     free(layout);
     free(blk_index);

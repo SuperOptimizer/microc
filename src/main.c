@@ -281,6 +281,7 @@ static u32 x86_native(void)
 {
 #if defined(__x86_64__)
     unsigned a, b, c, d, r = 0;
+    int os_ymm = 0;
     __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(1), "2"(0));
     if (c & 1)
         r |= XF_SSE3;
@@ -298,6 +299,12 @@ static u32 x86_native(void)
         r |= XF_FMA;
     if (c >> 29 & 1)
         r |= XF_F16C;
+    if (c >> 27 & 1) { /* OSXSAVE: XCR0 says which register states the system saves */
+        unsigned lo, hi;
+        __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0)); /* xgetbv */
+        os_ymm = (lo & 6) == 6; /* xmm and ymm state */
+        (void)hi;
+    }
     __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(7), "2"(0));
     if (b >> 3 & 1)
         r |= XF_BMI;
@@ -305,6 +312,8 @@ static u32 x86_native(void)
         r |= XF_AVX2;
     if (b >> 8 & 1)
         r |= XF_BMI2;
+    if (!os_ymm) /* the processor has AVX but the system does not save ymm registers (some VMs): none of it */
+        r &= ~(u32)(XF_AVX | XF_AVX2 | XF_FMA | XF_F16C);
     (void)a;
     (void)d;
     return r;

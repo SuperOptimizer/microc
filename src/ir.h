@@ -114,6 +114,7 @@ typedef struct Ins {
     u32 prev, next;
     u32 aux; /* scratch for passes */
     u32 loc; /* source location it was made for (-g: line tables), 0 if none */
+    u32 var; /* -g: 1 + the stack slot of the variable whose value this is (opt_promote), else 0 */
 } Ins;
 
 enum { TERM_NONE, TERM_JMP, TERM_BR, TERM_RET };

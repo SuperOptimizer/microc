@@ -51,6 +51,7 @@ void opt_cfg_clean(Func *f)
 
 static Func *pf;
 static u32 *slot_var; /* slot -> variable index or NOVAR */
+static u32 *var_slot; /* -g: variable index -> slot */
 static u8 *var_mem;
 static u32 nvars;
 static u32 *defs; /* [block * nvars + var]: value at the end of the block */
@@ -72,6 +73,8 @@ static int mem_ty(int mem)
 static u32 new_phi(u32 b, u32 var)
 {
     u32 v = ir_phi(pf, b, mem_ty(var_mem[var]));
+    if (opt_debug)
+        pf->ins[v].var = var_slot[var] + 1; /* the variable's value where paths join */
     if (nwork == capwork) {
         capwork = capwork ? capwork * 2 : 256;
         work = (u32 *)xrealloc(work, capwork * sizeof(u32));
@@ -227,6 +230,7 @@ void opt_promote(Func *f)
         return;
     pf = f;
     slot_var = (u32 *)xmalloc(f->nslots * sizeof(u32));
+    var_slot = (u32 *)xmalloc(f->nslots * sizeof(u32));
     var_mem = (u8 *)xmalloc(f->nslots);
     /* 0xfe: not yet seen; 0xff: not promotable */
     memset(var_mem, 0xfe, f->nslots);
@@ -269,6 +273,7 @@ void opt_promote(Func *f)
     for (k = 0; k < f->nslots; k++) {
         if (var_mem[k] < 0xfe) {
             var_mem[nvars] = var_mem[k];
+            var_slot[nvars] = k;
             slot_var[k] = nvars++;
             f->slots[k].size = 0; /* no longer needs storage */
         } else {
@@ -302,6 +307,8 @@ void opt_promote(Func *f)
                 var = slot_var[o->a];
                 if (i->op == OP_STORE) {
                     cur[var] = narrow(v, ir_resolve(f, i->b), i->mem);
+                    if (opt_debug && f->ins[cur[var]].blk && !f->ins[cur[var]].var)
+                        f->ins[cur[var]].var = o->a + 1; /* -g: the value the variable now has */
                     ir_remove(f, v);
                     f->ins[v].op = OP_NOP;
                 } else {
@@ -390,6 +397,7 @@ void opt_promote(Func *f)
         free(defs);
     }
     free(slot_var);
+    free(var_slot);
     free(var_mem);
     /* copies left behind are resolved by value numbering, which reads
        every operand through them */

@@ -49,6 +49,7 @@ void lto_save(Func *f, Obj *o)
         if (copy[v].op == OP_ADDR)
             copy[v].a = sym_slot(o, &syms, copy[v].a);
         copy[v].loc = 0; /* source locations mean nothing outside this compilation */
+        copy[v].var = 0;
     }
     nsym = (u32)(syms.len / sizeof(u32));
     for (b = 1; b < f->nblk; b++)

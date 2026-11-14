@@ -402,6 +402,8 @@ int obj_section(Obj *o, u32 name, u32 flags);          /* the section of that na
 
 /* ---- dwarf.c: debug information (-g) ---- */
 
+struct Type; /* cc.h */
+
 extern int opt_debug; /* -g: line tables, the functions of each unit, frame descriptions */
 /* a change of the frame, at an offset in a function's code (x86-64): */
 enum { CFI_PUSHFP,  /* rbp pushed: the frame is 16 bytes above rsp, rbp saved at its bottom */
@@ -414,12 +416,22 @@ typedef struct DwCfi {
     u8 op, reg, n;
 } DwCfi;
 void dwarf_reset(const char *path);
-void dwarf_func_loc(u32 sym, u32 loc); /* where the definition of a function is */
+void dwarf_func_loc(u32 sym, u32 loc, struct Type *ret); /* where the definition of a function is, its result type */
+/* a parameter or local of function fsym, in stack slot slot (byref: the slot holds its address) */
+void dwarf_var(u32 fsym, u32 name, struct Type *ty, u32 slot, int param, int byref, u32 loc);
+u32 dwarf_vars(u32 fsym);              /* the back end: 1 + its first variable, or 0 */
+u32 dwarf_var_next(u32 k);
+u32 dwarf_var_slot(u32 k);
+int dwarf_var_byref(u32 k);
+void dwarf_var_frame(u32 k, i32 cfa_off); /* it stays in memory, at the frame's address + cfa_off */
+void dwarf_var_place(u32 k, u32 start, u32 end, const u8 *expr, u32 len); /* there from start to end (DWARF expression) */
 u32 dwarf_get_func_loc(u32 sym);
 u32 dwarf_file(const char *name);      /* its index in the unit's table of files */
 const char *dwarf_file_name(u32 k);
 u32 dwarf_nfiles(void);
 void dwarf_where(u32 loc, u32 *file, u32 *line, u32 *col);
+u32 dwarf_inline(u32 callee, u32 call_loc);  /* an inlined call of callee (1 + its number) */
+u32 dwarf_inline_loc(u32 inst, u32 loc);     /* the location of code at loc copied into inlined call inst */
 /* a function's code is final: size bytes; the source location from off[k] on is loc[k]; its frame changes */
 void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const DwCfi *cf, u32 ncf, u32 prologue_end);
 void dwarf_finish(Obj *o); /* the unit's sections */

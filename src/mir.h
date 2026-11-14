@@ -55,5 +55,7 @@ typedef struct MTarget {
 } MTarget;
 
 void ra_run(MFunc *m, const MTarget *t);
+u32 ra_dense(u32 r);                                    /* -g: after ra_run */
+u32 ra_ranges(u32 d, u32 *start, u32 *end, u32 max);
 
 #endif

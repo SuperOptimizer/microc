@@ -594,8 +594,13 @@ static Sym *new_sym(u32 name, int kind, Type *ty)
     return s;
 }
 
+static int binding_params; /* -g: the parameters of the function being defined are bound */
+static int inl_on(void);
+
 static Sym *bind(Sym *s)
 {
+    if (opt_debug && s->local && s->kind == SK_VAR && s->name && F == fn_func && !inl_on() && !s->cv)
+        dwarf_var(F->sym, s->name, s->ty, s->slot, binding_params, s->byref, tok.loc);
     names_reserve(s->name);
     s->level = level;
     s->shadow = idents[s->name];
@@ -2388,6 +2393,11 @@ static struct Inl {
     int cx;     /* evaluating a constexpr function: branches on constants are followed, not compiled */
     Expr val;
 } inl;
+
+static int inl_on(void)
+{
+    return inl.on;
+}
 
 static Sym *cv_lvalue; /* the constant whose address the expression being read takes */
 static Expr *call_pre; /* arguments read before the function was known, for the next call() */
@@ -9823,7 +9833,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     cur_fn_name = F->name;
     F->sym = sym_obj(s);
     if (opt_debug)
-        dwarf_func_loc(F->sym, loc);
+        dwarf_func_loc(F->sym, loc, ty->base);
     ir_loc = loc;
     cur_fn_dev = opt_cuda && (s->aflags & (AT_GLOBAL | AT_DEVICE)) != 0;
     cur_fn_kernel = cur_fn_dev && (s->aflags & AT_GLOBAL) != 0;
@@ -9940,8 +9950,11 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             else
                 cur_named_gr++;
         }
-        if (p->name)
+        if (p->name) {
+            binding_params = 1;
             bind(p);
+            binding_params = 0;
+        }
     }
     expect(T_LBRACE);
     compound(0);

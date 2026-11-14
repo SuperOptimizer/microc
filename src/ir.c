@@ -66,6 +66,7 @@ u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b)
     i->prev = i->next = 0;
     i->aux = 0;
     i->loc = ir_loc;
+    i->var = 0;
     return f->nins++;
 }
 

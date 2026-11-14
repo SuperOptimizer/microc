@@ -244,6 +244,7 @@ extern int opt_level;
 extern int opt_fast_math;
 extern int opt_vec_report;
 extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
+extern int opt_x64_avx2;  /* opt_vec.c: 32-byte vectors in AVX functions */
 extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */
 extern Obj *opt_obj;    /* opt_vec.c: the object the functions being optimised go to (for the names of what they call) */
 extern int opt_math_errno; /* x64.c: sqrt is a call, for errno (-fno-math-errno, -ffast-math: in line) */

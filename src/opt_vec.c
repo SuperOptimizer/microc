@@ -36,6 +36,7 @@ static int mixed;  /* x86-64: elements of different sizes, all in lanes of four 
 #define MM_ON 1
 #define MM_MAX 2 /* else the minimum */
 #define MM_UNS 4 /* compared without sign */
+int opt_x64_avx2;  /* x86-64: AVX2 (256-bit integer lanes): opt_vec uses 32-byte vectors in AVX functions */
 int opt_x64_sse41; /* x86-64: SSE4.1 may be used (pmulld, pmaxsd, ...); -msse4.1, -mavx2, -march=native ... */
 Obj *opt_obj;
 /* -fvec-gather: loops that read through an index computed lane by lane. Off by default: with SSE4.1 the gather is four
@@ -706,7 +707,7 @@ static int try_loop(u32 l, u32 n0)
                 shift[v] = 0;
                 break;
             }
-            if (i->op == OP_SEXT32 && opt_arch == ARCH_X64 && opt_x64_sse41 && opt_vec_gather && !INV(i->a) && kind[i->a] != K_IVPHI &&
+            if (i->op == OP_SEXT32 && opt_arch == ARCH_X64 && opt_x64_sse41 && opt_vec_gather && !f->avx /* sel_avx: not yet */ && !INV(i->a) && kind[i->a] != K_IVPHI &&
                 f->ins[i->a].ty == IT_I32 && is_vec(i->a)) {
                 kind[v] = K_GIDX; /* an index computed lane by lane: the load it addresses gathers */
                 shift[v] = 0;
@@ -993,7 +994,7 @@ static int try_loop(u32 l, u32 n0)
             extra += iv_val[k] ? 2 : 0;
         for (v = f->blk[l].first; v; v = f->ins[v].next)
             extra += kind[v] == K_MASK && mmk[v];
-        if (vec_pressure(extra) > 14)
+        if (vec_pressure(extra) > (vw == 32 ? 13u : 14u)) /* AVX functions: xmm0-12 (xmm13 is a scratch there) */
             MISS("too many vector values at once for the x86-64 vector registers");
     }
     /* How many times does the loop run? Three ways of counting are known.
@@ -1356,6 +1357,9 @@ int opt_vectorise(Func *fn)
     u32 b, nblk = fn->nblk, n0 = fn->nins;
     int done = 0;
     f = fn;
+    /* x86-64 with AVX2: 32-byte vectors (the instructions are VEX's, x64.c's sel_avx) */
+    vw = opt_arch == ARCH_X64 && f->avx && opt_x64_avx2 ? 32 : 16;
+    vty = vw == 32 ? IT_V256 : IT_V128;
     ir_resolve_all(f);
     kind = (u8 *)xmalloc((size_t)n0 * 3);
     shift = kind + n0;

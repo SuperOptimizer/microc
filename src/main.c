@@ -429,6 +429,7 @@ static void target_macros(void)
         opt_avx = (x86_feat & XF_AVX) != 0;
         opt_f16c = (x86_feat & XF_F16C) != 0;
         opt_x64_sse41 = (x86_feat & XF_SSE41) != 0; /* the vectoriser may use it */
+        opt_x64_avx2 = (x86_feat & XF_AVX2) != 0;   /* 32-byte vectors in AVX functions */
     }
     if (opt_size)
         pp_define("__OPTIMIZE_SIZE__");

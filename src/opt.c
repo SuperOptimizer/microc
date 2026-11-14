@@ -131,6 +131,19 @@ static int dominates(u32 a, u32 b)
     return dom_pre[a] <= dom_pre[b] && dom_post[b] <= dom_post[a];
 }
 
+/* For the passes of opt_ssa.c: fn's dominator tree, which opt_dominates reads until the blocks change. A block
+   that cannot be reached is dominated by every other (it never runs). */
+void opt_dom(Func *fn)
+{
+    f = fn;
+    compute_dom();
+}
+
+int opt_dominates(u32 a, u32 b)
+{
+    return rpo_num[b] == 0xffffffffU || (rpo_num[a] != 0xffffffffU && dominates(a, b));
+}
+
 /* ---- value numbering, folding, memory forwarding ---- */
 
 static u32 *vn_tab;

@@ -227,7 +227,9 @@ extern u32 opt_promoted;
 int opt_split(Func *f);    /* local arrays and records read and written only at constant places: one slot for each place */
 void opt_dce(Func *f);
 void opt_cfg_clean(Func *f);
-int opt_param_fwd(Func *f); /* device code: fields of a record parameter read straight from its doublewords */
+int opt_param_fwd(Func *f);
+void opt_dom(Func *fn);
+int opt_dominates(u32 a, u32 b); /* device code: fields of a record parameter read straight from its doublewords */
 int opt_vectorise(Func *f); /* opt_vec.c; returns the number of loops rewritten */
 
 /* opt_inline.c */

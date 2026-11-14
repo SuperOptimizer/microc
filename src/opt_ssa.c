@@ -1219,15 +1219,16 @@ static u32 pf_extract(Func *f, u32 at, u32 s, u32 off, int mem, int ty)
 int opt_param_fwd(Func *f)
 {
     u32 b, v, k, n, s, nslots = f->nslots, done = 0, nw = 0, *ops, nsel;
-    u8 *rd; /* the slot has been read in the entry block */
+    u32 *wblk, *wpos, ord = 0; /* the block that writes the slot, and the place of its last write there */
     u8 *sel; /* by value: a choice between two slot places, used only as the address of loads (2), or not (1) */
     int changed;
     if (!nslots || f->nblk < 2)
         return 0;
     pf_bad = (u8 *)xmalloc(nslots);
     memset(pf_bad, 0, nslots);
-    rd = (u8 *)xmalloc(nslots);
-    memset(rd, 0, nslots);
+    wblk = (u32 *)xmalloc(2 * (size_t)nslots * sizeof(u32));
+    wpos = wblk + nslots;
+    memset(wblk, 0, 2 * (size_t)nslots * sizeof(u32));
     pf_base = (u32 *)xmalloc((nslots + 1) * sizeof(u32));
     for (s = 0; s < nslots; s++) {
         pf_base[s] = nw;
@@ -1286,6 +1287,7 @@ int opt_param_fwd(Func *f)
         for (phis = 1; phis >= 0; phis--)
             for (v = phis ? bb->phis : bb->first; v; v = f->ins[v].next) {
                 Ins *i = &f->ins[v];
+                ord++;
                 if (i->op == OP_COPY)
                     continue; /* seen through where it is read */
                 IR_OPS(f, i, ops, n);
@@ -1307,23 +1309,23 @@ int opt_param_fwd(Func *f)
                         pf_bad[s] = 1;
                         continue;
                     }
-                    if (i->op == OP_LOAD) {
-                        if (b == 1)
-                            rd[s] = 1;
+                    if (i->op == OP_LOAD)
+                        continue; /* (checked below, when the writes are known) */
+                    if (wblk[s] && wblk[s] != b) {
+                        pf_bad[s] = 1; /* written in two blocks */
                         continue;
                     }
-                    if (b != 1 || rd[s]) {
-                        pf_bad[s] = 1; /* written elsewhere, or after a read */
-                        continue;
-                    }
+                    wblk[s] = b;
+                    wpos[s] = ord;
                     if (i->op == OP_MEMZERO) {
-                        u32 w;
-                        if ((off & 7) || (i->c & 7) || (u32)off + i->c > f->slots[s].size) {
+                        /* (the doublewords it covers whole are zero; one it covers in part is no longer known) */
+                        u32 w, end = (u32)off + i->c;
+                        if (end > f->slots[s].size) {
                             pf_bad[s] = 1;
                             continue;
                         }
-                        for (w = (u32)off / 8; w < ((u32)off + i->c) / 8; w++)
-                            pf_word[pf_base[s] + w] = PF_ZERO;
+                        for (w = (u32)off / 8; w * 8 < end; w++)
+                            pf_word[pf_base[s] + w] = w * 8 >= (u32)off && (w * 8 + 8 <= end || w * 8 + 8 >= f->slots[s].size) ? PF_ZERO : 0;
                     } else {
                         u32 pv = ir_resolve(f, i->b);
                         u64 c;
@@ -1338,6 +1340,34 @@ int opt_param_fwd(Func *f)
             }
         if (bb->arg && f->ins[bb->arg].op == OP_SLOT)
             pf_bad[f->ins[bb->arg].a] = 1;
+    }
+    /* every read comes after the writes: in their block after the last, or in a block that it dominates (the
+       values written are the same each time the block runs) */
+    opt_dom(f);
+    ord = 0;
+    for (b = 1; b < f->nblk; b++) {
+        Block *bb = &f->blk[b];
+        for (v = bb->phis; v; v = f->ins[v].next)
+            ord++;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 a, two[2], nt = 0, j;
+            ord++;
+            if (i->op != OP_LOAD)
+                continue;
+            a = ir_resolve(f, i->a);
+            if (f->ins[a].op == OP_SLOT)
+                two[nt++] = f->ins[a].a;
+            else if (a < nsel && sel[a] == 2) {
+                two[nt++] = f->ins[ir_resolve(f, f->ins[a].b)].a;
+                two[nt++] = f->ins[ir_resolve(f, f->ins[a].c)].a;
+            }
+            for (j = 0; j < nt; j++) {
+                s = two[j];
+                if (wblk[s] && !(b == wblk[s] ? ord > wpos[s] : opt_dominates(wblk[s], b)))
+                    pf_bad[s] = 1;
+            }
+        }
     }
     /* a choice used otherwise lets both slots out */
     for (v = 1; v < nsel; v++)
@@ -1379,10 +1409,40 @@ int opt_param_fwd(Func *f)
             }
         }
     }
+    {
+        /* a slot no longer read (now, or after an earlier round): its writes go too (else they stay, as stores to
+           local memory) */
+        u8 *rdl = (u8 *)xmalloc(nslots);
+        memset(rdl, 0, nslots);
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            if (!i->blk || i->op == OP_COPY || i->op == OP_STORE || i->op == OP_MEMZERO)
+                continue; /* (a slot written as a value, or by a copy, is not one of these) */
+            IR_OPS(f, i, ops, n);
+            for (k = 0; k < n; k++) {
+                u32 o = ir_resolve(f, ops[k]);
+                if (f->ins[o].op == OP_SLOT)
+                    rdl[f->ins[o].a] = 1;
+            }
+        }
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            u32 o;
+            if (!i->blk || (i->op != OP_STORE && i->op != OP_MEMZERO))
+                continue;
+            o = ir_resolve(f, i->a);
+            if (f->ins[o].op == OP_SLOT && !pf_bad[f->ins[o].a] && !rdl[f->ins[o].a]) {
+                ir_remove(f, v);
+                f->ins[v].op = OP_NOP;
+                done++;
+            }
+        }
+        free(rdl);
+    }
     free(pf_bad);
     free(pf_base);
     free(pf_word);
-    free(rd);
+    free(wblk);
     free(sel);
     return (int)done;
 }

@@ -1159,17 +1159,41 @@ static void emit_call(u32 v)
 
 /* n bytes from src (0: zeros) to dst, in loads and stores no wider than al, which both addresses are known
    to be multiples of: a GPU faults on an access that is not aligned to its own width. */
+/* The base and the space ("local." or "global.", else "") of address a, for emit_copy: a place in the frame is
+   %SPL and its offset (*off), not the generic %SP. */
+static const char *copy_base(u32 a, char *buf, i64 *off, const char **space)
+{
+    Ins *i;
+    u32 r = RV(a);
+    *off = 0;
+    *space = "";
+    if (!opt_nolocal && remat) {
+        i64 o = 0;
+        if (addr_sum(r, &o))
+            r = RV(PF->ins[r].a);
+        i = &PF->ins[r];
+        if (i->op == OP_SLOT || (i->op == OP_ADDR && special_of(i->a) >= 0)) {
+            *off = o + (i64)(i->op == OP_SLOT ? slotoff[i->a] : special_off[special_of(i->a)]) + (i64)(i32)i->b;
+            *space = "local.";
+            strcpy(buf, "%SPL");
+            return buf;
+        }
+    }
+    if (gl_s && gl_s[RV(a)])
+        *space = "global.";
+    strcpy(buf, ropnd(a));
+    return buf;
+}
+
 static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
 {
-    const char *d, *s = 0, *t;
+    const char *d, *s = 0, *t, *dsp, *ssp = "";
     char dn[48], sn[48];
     u64 off = 0;
-    strcpy(dn, ropnd(dst));
-    d = dn;
-    if (src) {
-        strcpy(sn, ropnd(src));
-        s = sn;
-    }
+    i64 doff, soff = 0;
+    d = copy_base(dst, dn, &doff, &dsp);
+    if (src)
+        s = copy_base(src, sn, &soff, &ssp);
     if (n > 128) {
         /* too long to write out: a loop over the whole units, and the rest written out below */
         static u32 nloop;
@@ -1182,10 +1206,10 @@ static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
         t = temp(w == 8 ? 1 : 0);
         P("\tmov.u64 %s, 0;\nLM%u:\n", ix, nloop);
         if (s)
-            P("\tadd.u64 %s, %s, %s;\n\tld.%s %s, [%s];\n", ad, s, ix, ty, t, ad);
+            P("\tadd.u64 %s, %s, %s;\n\tld.%s%s %s, [%s%+ld];\n", ad, s, ix, ssp, ty, t, ad, (long)soff);
         else
             P("\t%s %s, 0;\n", w == 8 ? "mov.b64" : "mov.b32", t);
-        P("\tadd.u64 %s, %s, %s;\n\tst.%s [%s], %s;\n", ad, d, ix, ty, ad, t);
+        P("\tadd.u64 %s, %s, %s;\n\tst.%s%s [%s%+ld], %s;\n", ad, d, ix, dsp, ty, ad, (long)doff, t);
         P("\tadd.u64 %s, %s, %u;\n\tsetp.lt.u64 %%p0, %s, %lu;\n\t@%%p0 bra LM%u;\n", ix, ix, w, ix, (unsigned long)whole, nloop);
         nloop++;
         off = whole;
@@ -1195,10 +1219,10 @@ static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
         const char *ty = w == 8 ? "u64" : w == 4 ? "u32" : w == 2 ? "u16" : "u8";
         t = temp(w == 8 ? 1 : 0);
         if (s)
-            P("\tld.%s %s, [%s+%lu];\n", ty, t, s, (unsigned long)off);
+            P("\tld.%s%s %s, [%s%+ld];\n", ssp, ty, t, s, (long)(soff + (i64)off));
         else
             P("\t%s %s, 0;\n", w == 8 ? "mov.b64" : "mov.b32", t);
-        P("\tst.%s [%s+%lu], %s;\n", ty, d, (unsigned long)off, t);
+        P("\tst.%s%s [%s%+ld], %s;\n", dsp, ty, d, (long)(doff + (i64)off), t);
         off += w;
     }
 }

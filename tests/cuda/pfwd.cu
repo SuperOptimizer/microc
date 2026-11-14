@@ -38,6 +38,19 @@ __global__ void k_rec(int *out, rec_t r1, int n, rec_t r2, outer_t o, int flag) 
     const rec_t &w = (t & flag) ? o.r : z;
     out[t] = fields(q, t) * 3 + fields(w, t) + o.k + fields(r2, t + 1) * 5;
 }
+__host__ __device__ __forceinline__ static int dom(const rec_t &r, int t, int flag) {
+    rec_t z = {};
+    rec_t y = r;
+    if (t & 1)
+        y.i = 5; /* (written in a block that does not come before every read: y stays in memory) */
+    const rec_t &q = (t & flag) ? r : z;
+    return fields(q, t) + y.i + fields(z, t) + y.c;
+}
+__global__ void k_dom(int *out, rec_t r, int n, int flag) {
+    int t = threadIdx.x;
+    if (t >= n) return; /* (z and y are written after a branch, not in the first block) */
+    out[t] = dom(r, t, flag);
+}
 __global__ void k_loops(int *out, int n, int m) {
     int t = threadIdx.x;
     if (t < n) out[t] = unrolled(t, m) + carried(t, m + (t & 3));
@@ -68,6 +81,13 @@ int main(void) {
         rec_t z = {};
         const rec_t &w = (t & 1) ? o.r : z;
         int want = fields(r1, t) * 3 + fields(w, t) + o.k + fields(r2, t + 1) * 5;
+        bad += out[t] != want;
+        sum += out[t];
+    }
+    k_dom<<<1, N>>>(out, r2, N - 3, 2);
+    printf("%d\n", (int)cudaDeviceSynchronize());
+    for (int t = 0; t < N - 3; t++) {
+        int want = dom(r2, t, 2);
         bad += out[t] != want;
         sum += out[t];
     }

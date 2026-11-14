@@ -195,6 +195,10 @@ static int unsupported(const char *a)
 static int hosted;  /* --hosted: the POSIX flavour of the library on this machine */
 static int std_c99; /* -std names C99 or later: restrict is a keyword */
 static int force_cuda; /* -x cuda */
+/* x86-64 instruction set extensions asked for by name (-mavx2, ...): their macros, which select a program's SIMD paths through
+   <immintrin.h> (element by element for now: exact, not fast). -march=native is not such a request: it stays ignored. */
+static unsigned x86_ext;
+enum { XE_SSE41 = 1, XE_AVX = 2, XE_AVX2 = 4, XE_FMA = 8, XE_F16C = 16, XE_BMI2 = 32, XE_AVX512F = 64, XE_AVX512BW = 128 };
 const char *opt_ptx_out;
 char opt_cuda_target[24] = "sm_86"; /* CUDA: the .target of the PTX: the GPU of --cuda-arch */
 static int cuda_arch = 860; /* CUDA: the value of __CUDA_ARCH__; --cuda-arch=N or nvcc's -arch=sm_NN */
@@ -303,6 +307,33 @@ static void target_macros(void)
             pp_undef(no[k]);
         for (k = 0; yes[k]; k++)
             pp_define(yes[k]);
+        if (x86_ext) { /* the baseline the extensions build on */
+            pp_define("__MMX__");
+            pp_define("__SSE__");
+            pp_define("__SSE2__");
+            pp_define("__SSE3__");
+            pp_define("__SSSE3__");
+        }
+        if (x86_ext & XE_SSE41) {
+            pp_define("__SSE4_1__");
+            pp_define("__SSE4_2__");
+        }
+        if (x86_ext & XE_AVX)
+            pp_define("__AVX__");
+        if (x86_ext & XE_AVX2)
+            pp_define("__AVX2__");
+        if (x86_ext & XE_FMA)
+            pp_define("__FMA__");
+        if (x86_ext & XE_F16C)
+            pp_define("__F16C__");
+        if (x86_ext & XE_BMI2) {
+            pp_define("__BMI__");
+            pp_define("__BMI2__");
+        }
+        if (x86_ext & XE_AVX512F)
+            pp_define("__AVX512F__");
+        if (x86_ext & XE_AVX512BW)
+            pp_define("__AVX512BW__");
     }
     if (opt_size)
         pp_define("__OPTIMIZE_SIZE__");
@@ -557,6 +588,24 @@ static int cc_main(const char *argv0, int argc, char **argv)
             pp_system_dir(argv[++i]);
         else if (strcmp(a, "-include") == 0 && i + 1 < argc)
             pp_force_include(argv[++i]);
+        else if (strcmp(a, "-msse4.1") == 0 || strcmp(a, "-msse4.2") == 0)
+            x86_ext |= XE_SSE41;
+        else if (strcmp(a, "-mavx") == 0)
+            x86_ext |= XE_SSE41 | XE_AVX;
+        else if (strcmp(a, "-mavx2") == 0)
+            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2;
+        else if (strcmp(a, "-mfma") == 0)
+            x86_ext |= XE_FMA;
+        else if (strcmp(a, "-mf16c") == 0)
+            x86_ext |= XE_F16C;
+        else if (strcmp(a, "-mbmi2") == 0)
+            x86_ext |= XE_BMI2;
+        else if (strcmp(a, "-mavx512f") == 0)
+            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_AVX512F;
+        else if (strcmp(a, "-mavx512bw") == 0)
+            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_AVX512F | XE_AVX512BW;
+        else if (strcmp(a, "-march=x86-64-v3") == 0)
+            x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_BMI2;
         else if (strncmp(a, "-W", 2) == 0 || strncmp(a, "-f", 2) == 0 || strncmp(a, "-m", 2) == 0 ||
                  strncmp(a, "-g", 2) == 0 || strncmp(a, "-O", 2) == 0 || strncmp(a, "-Q", 2) == 0 ||
                  strcmp(a, "-pipe") == 0)

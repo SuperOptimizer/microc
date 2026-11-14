@@ -1146,12 +1146,16 @@ static int locals_fn(Str *o, const char *b, const char *e)
             if (L[i].slot >= 0 && S[L[i].slot].w <= 0)
                 L[i].slot = -1;
     }
-    /* a store and the load of it */
-    for (i = 0; i + 1 < nl; i++)
-        if (L[i].kind == 2 && L[i + 1].kind == 1 && L[i].slot < 0 && L[i + 1].slot < 0 && L[i].w == L[i + 1].w &&
-            L[i].ae - L[i].a == L[i + 1].ae - L[i + 1].a && !memcmp(L[i].a, L[i + 1].a, (size_t)(L[i].ae - L[i].a)) &&
-            reg_bytes(L[i].x, L[i].xe) == L[i].w && reg_bytes(L[i + 1].x, L[i + 1].xe) == L[i].w)
-            L[i + 1].fwd = 1;
+    /* a store and the load of it (with only line numbers, .loc, between them: code made with -g is the same) */
+    for (i = 0; i + 1 < nl; i++) {
+        long j = i + 1;
+        while (j < nl && starts(L[j].p, "\t.loc "))
+            j++;
+        if (j < nl && L[i].kind == 2 && L[j].kind == 1 && L[i].slot < 0 && L[j].slot < 0 && L[i].w == L[j].w &&
+            L[i].ae - L[i].a == L[j].ae - L[j].a && !memcmp(L[i].a, L[j].a, (size_t)(L[i].ae - L[i].a)) &&
+            reg_bytes(L[i].x, L[i].xe) == L[i].w && reg_bytes(L[j].x, L[j].xe) == L[i].w)
+            L[j].fwd = 1;
+    }
     for (i = 0; i < nl && !changed; i++)
         changed = L[i].slot >= 0 || L[i].fwd;
     if (changed) {
@@ -1761,15 +1765,22 @@ out:
 static int job_compile(Job *J, CUhandle *link, void **cubin, size_t *size)
 {
     char log[8192];
-    int opt[2], i, r;
-    void *val[2];
+    int opt[3], i, r, nopt = 2;
+    void *val[3];
     opt[0] = 5; /* CU_JIT_ERROR_LOG_BUFFER */
     val[0] = log;
     opt[1] = 6; /* CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES */
     val[1] = (void *)(size_t)sizeof log;
+    for (i = 0; i < J->ntext; i++)
+        if (J->texts[i].p && strstr(J->texts[i].p, "\n\t.loc ")) {
+            /* made with -g: the code keeps its source lines (nvcc's -lineinfo), for compute-sanitizer and cuda-gdb */
+            opt[nopt] = 13; /* CU_JIT_GENERATE_LINE_INFO */
+            val[nopt++] = (void *)(size_t)1;
+            break;
+        }
     log[0] = 0;
     *link = 0;
-    r = hw.LinkCreate(2, opt, val, link);
+    r = hw.LinkCreate((unsigned)nopt, opt, val, link);
     if (r)
         fprintf(stderr, "mcuda: %s: the driver's linker does not start (error %d)\n", J->kname, r);
     for (i = 0; !r && i < J->ntext; i++) {

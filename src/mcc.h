@@ -249,6 +249,8 @@ typedef struct SrcFile {
     u32 base;    /* location of data[0] */
     u32 guard;   /* include guard macro, if the whole file is wrapped in one */
     u32 once;
+    u32 *lines;  /* -g: offset of the start of each line, made when first needed (loc_line) */
+    u32 nlines;
     struct SrcFile *next;
 } SrcFile;
 
@@ -268,6 +270,7 @@ SrcFile *src_load(const char *path);                             /* cached; NULL
 SrcFile *src_buffer(const char *name, const char *text, size_t len);
 void src_set_line(u32 loc, u32 line, const char *name); /* #line */
 void loc_decode(u32 loc, const char **file, u32 *line, u32 *col);
+void loc_line(u32 loc, const char **file, u32 *line, u32 *col); /* the same, quickly: for line tables (-g) */
 void error_at(u32 loc, const char *fmt, ...);
 void warn_at(u32 loc, const char *fmt, ...);
 void lex_start(Lexer *lx, SrcFile *f);
@@ -396,6 +399,30 @@ u32 obj_find_sym(Obj *o, u32 name);
 u32 obj_named_sym(Obj *o, u32 name);
 void obj_bind_name(Obj *o, u32 sym, u32 name);
 int obj_section(Obj *o, u32 name, u32 flags);          /* the section of that name, made if new */
+
+/* ---- dwarf.c: debug information (-g) ---- */
+
+extern int opt_debug; /* -g: line tables, the functions of each unit, frame descriptions */
+/* a change of the frame, at an offset in a function's code (x86-64): */
+enum { CFI_PUSHFP,  /* rbp pushed: the frame is 16 bytes above rsp, rbp saved at its bottom */
+       CFI_SETFP,   /* rbp holds rsp: the frame is found from rbp from here on */
+       CFI_SAVE,    /* register reg (the processor's number) saved n * 8 bytes below the frame */
+       CFI_EPI,     /* the frame is gone (after leave): rsp + 8, until the next CFI_RESTORE */
+       CFI_RESTORE };
+typedef struct DwCfi {
+    u32 off;
+    u8 op, reg, n;
+} DwCfi;
+void dwarf_reset(const char *path);
+void dwarf_func_loc(u32 sym, u32 loc); /* where the definition of a function is */
+u32 dwarf_get_func_loc(u32 sym);
+u32 dwarf_file(const char *name);      /* its index in the unit's table of files */
+const char *dwarf_file_name(u32 k);
+u32 dwarf_nfiles(void);
+void dwarf_where(u32 loc, u32 *file, u32 *line, u32 *col);
+/* a function's code is final: size bytes; the source location from off[k] on is loc[k]; its frame changes */
+void dwarf_func(u32 sym, u32 size, const u32 *off, const u32 *loc, u32 n, const DwCfi *cf, u32 ncf, u32 prologue_end);
+void dwarf_finish(Obj *o); /* the unit's sections */
 
 /* ---- elf.c: ELF relocatable objects (aarch64) ---- */
 

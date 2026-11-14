@@ -1590,7 +1590,28 @@ static void slot_check(Func *fn, const char *when)
     }
 }
 
+static void run_passes(Func *fn);
+
+/* (what the passes make has no source location of its own: the line table carries on with the one before) */
 void opt_run(Func *fn)
+{
+    u32 saved = ir_loc;
+    ir_loc = 0;
+    run_passes(fn);
+    ir_loc = saved;
+}
+
+static void finish_passes(Func *fn);
+
+void opt_finish(Func *fn)
+{
+    u32 saved = ir_loc;
+    ir_loc = 0;
+    finish_passes(fn);
+    ir_loc = saved;
+}
+
+static void run_passes(Func *fn)
 {
     int round;
     f = fn;
@@ -1662,7 +1683,7 @@ void opt_run(Func *fn)
     inline_save(f);
 }
 
-void opt_finish(Func *fn)
+static void finish_passes(Func *fn)
 {
     /* what is still not known to be constant is taken not to be */
     u32 v, n = 0;

@@ -387,6 +387,7 @@ static void next(void)
     } else {
         fetch(&tok);
     }
+    ir_loc = tok.loc; /* what is made now is for this place in the source (-g) */
 }
 
 static Token *peek(void)
@@ -9821,6 +9822,9 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     F->name = intern_str(s->name);
     cur_fn_name = F->name;
     F->sym = sym_obj(s);
+    if (opt_debug)
+        dwarf_func_loc(F->sym, loc);
+    ir_loc = loc;
     cur_fn_dev = opt_cuda && (s->aflags & (AT_GLOBAL | AT_DEVICE)) != 0;
     cur_fn_kernel = cur_fn_dev && (s->aflags & AT_GLOBAL) != 0;
     opt_dev_parse = cur_fn_dev && ((s->aflags & AT_GLOBAL) || !(s->aflags & AT_HOST)); /* (not what is host code as well) */
@@ -10159,6 +10163,8 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
         gas_begin(o);
     if (opt_prof_gen)
         prof_begin(o);
+    if (opt_debug)
+        dwarf_reset(path);
     arena_reset(&A);
     type_init(&A);
     if (names_cap) {
@@ -10322,4 +10328,7 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     naliased = 0;
     if (opt_prof_gen)
         prof_end();
+    if (opt_debug && opt_target == TARGET_LINUX && !opt_dump_ir && !opt_syntax_only && !opt_lto)
+        dwarf_finish(O);
+    ir_loc = 0;
 }

@@ -110,6 +110,7 @@ typedef struct Ins {
     u32 blk; /* 0: not placed */
     u32 prev, next;
     u32 aux; /* scratch for passes */
+    u32 loc; /* source location it was made for (-g: line tables), 0 if none */
 } Ins;
 
 enum { TERM_NONE, TERM_JMP, TERM_BR, TERM_RET };
@@ -173,6 +174,7 @@ u32 ir_add_param(Func *f, int ty); /* returns the OP_PARAM value */
 int ir_is_const(Func *f, u32 v, u64 *val); /* integer constant */
 int ir_is_fconst(Func *f, u32 v, double *val);
 
+extern u32 ir_loc; /* the source location new instructions are given: the parser's token; 0 while optimising */
 u32 ir_raw(Func *f, int op, int ty, u32 a, u32 b); /* create, do not place */
 void ir_append(Func *f, u32 blk, u32 v);
 void ir_insert_before(Func *f, u32 pos, u32 v);

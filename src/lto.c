@@ -45,9 +45,11 @@ void lto_save(Func *f, Obj *o)
     stamp++;
     sym_slot(o, &syms, f->sym);
     memcpy(copy, f->ins, f->nins * sizeof(Ins));
-    for (v = 1; v < f->nins; v++)
+    for (v = 1; v < f->nins; v++) {
         if (copy[v].op == OP_ADDR)
             copy[v].a = sym_slot(o, &syms, copy[v].a);
+        copy[v].loc = 0; /* source locations mean nothing outside this compilation */
+    }
     nsym = (u32)(syms.len / sizeof(u32));
     for (b = 1; b < f->nblk; b++)
         npreds += f->blk[b].npreds;

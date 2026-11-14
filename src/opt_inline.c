@@ -413,10 +413,12 @@ static u32 inline_one(u32 b, u32 v)
             if (yi->op == OP_CALL) {
                 nv = ir_call(f, yi->ty, yi->c, y->xargs + yi->a, yi->b, y->xargs[yi->a - 1], yi->flags);
                 f->ins[nv].mem = yi->mem;
+                f->ins[nv].loc = yi->loc;
                 ir_remove(f, nv); /* ir_call may have placed it in f->cur */
             } else {
                 nv = ir_raw(f, yi->op, yi->ty, yi->a, yi->b);
                 f->ins[nv].mem = yi->mem;
+                f->ins[nv].loc = yi->loc;
                 f->ins[nv].flags = yi->flags;
                 f->ins[nv].c = yi->c;
             }

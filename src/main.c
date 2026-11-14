@@ -606,6 +606,11 @@ static int cc_main(const char *argv0, int argc, char **argv)
             x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_AVX512F | XE_AVX512BW;
         else if (strcmp(a, "-march=x86-64-v3") == 0)
             x86_ext |= XE_SSE41 | XE_AVX | XE_AVX2 | XE_FMA | XE_F16C | XE_BMI2;
+        else if (strncmp(a, "-g", 2) == 0 && strcmp(a, "-g0") != 0 && strncmp(a, "-gsplit", 7) != 0 &&
+                 strncmp(a, "-gno-", 5) != 0)
+            opt_debug = 1; /* -g, -g3, -ggdb, -gdwarf-5, -gline-tables-only ...: all the same here */
+        else if (strcmp(a, "-g0") == 0)
+            opt_debug = 0;
         else if (strncmp(a, "-W", 2) == 0 || strncmp(a, "-f", 2) == 0 || strncmp(a, "-m", 2) == 0 ||
                  strncmp(a, "-g", 2) == 0 || strncmp(a, "-O", 2) == 0 || strncmp(a, "-Q", 2) == 0 ||
                  strcmp(a, "-pipe") == 0)
@@ -1073,6 +1078,11 @@ int main(int argc, char **argv, char **envp)
                                 sprintf(archv, "--cuda-arch=%d%c", atoi(g) * 10, g[strspn(g, "0123456789")] == 'a' ? 'a' : 0);
                                 v[n++] = archv;
                             }
+                        }
+                        if (strcmp(a, "-lineinfo") == 0 || strcmp(a, "--generate-line-info") == 0 ||
+                            strcmp(a, "-G") == 0 || strcmp(a, "--device-debug") == 0) {
+                            v[n++] = (char *)"-g"; /* lines for device code (and host code) */
+                            continue;
                         }
                         if (strcmp(a, "-use_fast_math") == 0) {
                             v[n++] = (char *)"--cuda-fast-math";

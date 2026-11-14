@@ -443,6 +443,30 @@ static Buf *sec(int k)
     return &O->sec[k];
 }
 
+/* The place of function sym, as a symbol for relocations: an anonymous local at its section and offset (the
+   section's symbol in the ELF file, as GCC writes it). Not the function's own symbol: a weak function that
+   another object overrides would take the frame descriptions and the debug information along to that one's
+   code, and ld rejects the .eh_frame ("error in X.o(.eh_frame); no .eh_frame_hdr table will be created"). */
+static u32 *csym, ncsym;
+
+static u32 code_sym(u32 sym)
+{
+    ObjSym *s;
+    if (sym >= ncsym) {
+        u32 n = sym + 64;
+        csym = (u32 *)xrealloc(csym, n * sizeof(u32));
+        memset(csym + ncsym, 0, (n - ncsym) * sizeof(u32));
+        ncsym = n;
+    }
+    if (csym[sym])
+        return csym[sym] - 1;
+    s = &O->syms[sym];
+    if (!s->global && !s->weak && s->name)
+        return sym; /* (a local function: its own symbol stays put) */
+    csym[sym] = obj_add_sym(O, 0, s->sec, s->value, 0) + 1;
+    return csym[sym] - 1;
+}
+
 static void reloc_here(int k, int type, u32 sym, i64 addend, u32 size)
 {
     obj_add_reloc(O, k, (u32)sec(k)->len, type, sym, addend);
@@ -498,7 +522,7 @@ static void line_program(void)
         buf_u8(b, 0);
         buf_uleb(b, 9);
         buf_u8(b, 2); /* DW_LNE_set_address */
-        reloc_here(s_line, R_ABS64, fn->sym, 0, 8);
+        reloc_here(s_line, R_ABS64, code_sym(fn->sym), 0, 8);
         b = sec(s_line);
         for (r = fn->row0; r < fn->row0 + fn->nrows; r++) {
             DwRow *w = &rows[r];
@@ -986,7 +1010,7 @@ static void inline_ranges(void)
             Buf *b = sec(s_rng);
             uses[i].rng = (u32)b->len;
             buf_u8(b, 5); /* DW_RLE_base_address: the function */
-            reloc_here(s_rng, R_ABS64, fn->sym, 0, 8);
+            reloc_here(s_rng, R_ABS64, code_sym(fn->sym), 0, 8);
             b = sec(s_rng);
             for (j = 0; j < nr; j++)
                 if (ru[j] == i && re[j] > rs[j]) {
@@ -1016,7 +1040,7 @@ static void ranges(void)
     buf_u32(b, 0); /* offset entry count */
     for (k = 0; k < nfns; k++) {
         buf_u8(sec(s_rng), 7); /* DW_RLE_start_length */
-        reloc_here(s_rng, R_ABS64, fns[k].sym, 0, 8);
+        reloc_here(s_rng, R_ABS64, code_sym(fns[k].sym), 0, 8);
         buf_uleb(sec(s_rng), fns[k].size);
     }
     b = sec(s_rng);
@@ -1058,7 +1082,7 @@ static void info(const char *path)
         buf_uleb(b, fn->file);
         buf_uleb(b, fn->line);
         tref(ret);
-        reloc_here(s_info, R_ABS64, fn->sym, 0, 8);
+        reloc_here(s_info, R_ABS64, code_sym(fn->sym), 0, 8);
         b = sec(s_info);
         buf_u64(b, fn->size);
         buf_uleb(b, 1);
@@ -1114,7 +1138,7 @@ static void loclists(void)
             b = sec(s_loc);
             loc_off[v - 1] = (u32)b->len + 1;
             buf_u8(b, 6); /* DW_LLE_base_address: the function */
-            reloc_here(s_loc, R_ABS64, fsym, 0, 8);
+            reloc_here(s_loc, R_ABS64, code_sym(fsym), 0, 8);
             b = sec(s_loc);
             for (i = 0; i < n; i++) {
                 DwPlace *q = &places[ord[i]];
@@ -1191,7 +1215,7 @@ static void eh_frame(void)
         len_at = b->len;
         buf_u32(b, 0);
         buf_u32(b, (u32)(b->len - cie_at)); /* back to the CIE */
-        reloc_here(s_eh, R_X64_PC32, fn->sym, 0, 4);
+        reloc_here(s_eh, R_X64_PC32, code_sym(fn->sym), 0, 4);
         b = sec(s_eh);
         buf_u32(b, fn->size);
         buf_uleb(b, 0); /* no augmentation data */
@@ -1227,6 +1251,9 @@ void dwarf_finish(Obj *o)
     if (!nfns || opt_arch != ARCH_X64)
         return;
     O = o;
+    free(csym);
+    csym = 0;
+    ncsym = 0;
     if (!cwd)
         cwd = os_getcwd();
     s_line = obj_section(o, intern_cstr(".debug_line"), 0);

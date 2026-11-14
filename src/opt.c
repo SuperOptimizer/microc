@@ -138,6 +138,7 @@ static u32 vn_size;
 
 typedef struct MemEntry {
     u32 addr, val;
+    u32 join; /* nonzero: the ways into block join left different values here; val is not set (see mem_phi) */
     u8 mem;
     u8 from_store;
 } MemEntry;
@@ -234,19 +235,102 @@ static void mem_add(u32 addr, int mem, u32 val, int from_store)
     e = &mem_tab[nmem++];
     e->addr = addr;
     e->val = val;
+    e->join = 0;
     e->mem = (u8)mem;
     e->from_store = (u8)from_store;
 }
 
-/* What was known about memory at the end of a block that branches, kept
-   for its other successor and for the block where the two sides meet. */
-#define NSAVED 4
+/* What was known about memory at the end of each block already visited, by position in rpo: a block
+   entered one way starts from what its predecessor knew, a block entered several ways from what all of
+   them agree on. */
+static MemEntry *out_tab;
+static u32 *out_n;
+static u32 out_cap;
+
+/* Phis made by mem_phi, so that one is made once though many blocks carry the entry that asks for it. */
+#define NMEMPHI 8
 static struct {
-    u32 blk, n, kills;
-    MemEntry tab[MEM_CAP];
-} saved[NSAVED];
-static u32 saved_next;
-static u32 kills; /* stores and calls seen so far */
+    u32 join, addr, phi;
+    u8 mem;
+} mem_phis[NMEMPHI];
+static u32 nmem_phis;
+
+static MemEntry *out_find(u32 blk, u32 addr, int mem)
+{
+    MemEntry *t = out_tab + (size_t)rpo_num[blk] * MEM_CAP;
+    u32 j;
+    for (j = out_n[rpo_num[blk]]; j-- > 0;)
+        if (t[j].addr == addr && t[j].mem == mem)
+            return &t[j];
+    return 0;
+}
+
+/* The state of memory on entry to block b, the k-th in rpo. */
+static void mem_enter(u32 b, u32 k)
+{
+    Block *bb = &f->blk[b];
+    MemEntry *t;
+    u32 p, j, q;
+    nmem = 0;
+    if (!bb->npreds)
+        return;
+    for (p = 0; p < bb->npreds; p++)
+        if (rpo_num[bb->preds[p]] >= k)
+            return; /* a way in not yet visited (a loop), or one that cannot be reached */
+    q = rpo_num[bb->preds[0]];
+    t = out_tab + (size_t)q * MEM_CAP;
+    if (bb->npreds == 1) {
+        nmem = out_n[q];
+        memcpy(mem_tab, t, nmem * sizeof(MemEntry));
+        return;
+    }
+    for (j = 0; j < out_n[q]; j++) {
+        MemEntry e = t[j];
+        int differ = 0;
+        for (p = 1; p < bb->npreds; p++) {
+            MemEntry *o = out_find(bb->preds[p], e.addr, e.mem);
+            if (!o)
+                break;
+            if (o->val != e.val || o->join != e.join) {
+                /* a phi of the values can stand for what is there, if they are plain values of one type
+                   (a narrow stored value is not what a load would give) */
+                if (o->join || e.join || f->ins[o->val].ty != f->ins[e.val].ty)
+                    break;
+                differ = 1;
+            }
+            e.from_store |= o->from_store;
+        }
+        if (p < bb->npreds || (differ && e.from_store && e.mem < M_32))
+            continue;
+        if (differ) {
+            e.join = b;
+            e.val = 0;
+        }
+        mem_tab[nmem++] = e;
+    }
+}
+
+/* The value of an entry whose block had different values coming in: a phi there, made when first asked
+   for. Returns 0 if it is not of type ty. */
+static u32 mem_phi(const MemEntry *e, int ty)
+{
+    Block *jb = &f->blk[e->join];
+    u32 j, p, phi;
+    for (j = 0; j < NMEMPHI && j < nmem_phis; j++)
+        if (mem_phis[j].join == e->join && mem_phis[j].addr == e->addr && mem_phis[j].mem == e->mem)
+            return f->ins[mem_phis[j].phi].ty == ty ? mem_phis[j].phi : 0;
+    if (f->ins[out_find(jb->preds[0], e->addr, e->mem)->val].ty != ty)
+        return 0;
+    phi = ir_phi(f, e->join, ty);
+    for (p = 0; p < jb->npreds; p++)
+        f->xargs[f->ins[phi].a + p] = out_find(jb->preds[p], e->addr, e->mem)->val;
+    j = nmem_phis++ % NMEMPHI;
+    mem_phis[j].join = e->join;
+    mem_phis[j].addr = e->addr;
+    mem_phis[j].mem = e->mem;
+    mem_phis[j].phi = phi;
+    return phi;
+}
 
 /* What a branch already taken says about a value: in block blk and
    everything it dominates, x is known to be zero or known not to be. */
@@ -279,8 +363,12 @@ static void gvn(void)
     u32 k, v, nx, n, j, mask;
     compute_dom();
     nfacts = 0;
-    for (k = 0; k < NSAVED; k++)
-        saved[k].blk = 0;
+    nmem_phis = 0;
+    if (out_cap < nrpo) {
+        out_cap = nrpo * 2;
+        out_tab = (MemEntry *)xrealloc(out_tab, (size_t)out_cap * MEM_CAP * sizeof(MemEntry));
+        out_n = (u32 *)xrealloc(out_n, out_cap * sizeof(u32));
+    }
     n = 64;
     while (n < f->nins * 2)
         n *= 2;
@@ -308,34 +396,8 @@ static void gvn(void)
                 facts[j].nonzero = pb->succ[0] == b ? sense : !sense;
             }
         }
-        if (!(k > 0 && bb->npreds == 1 && bb->preds[0] == rpo[k - 1])) {
-            nmem = 0;
-            for (j = 0; j < NSAVED; j++) {
-                u32 x = saved[j].blk, p, q;
-                if (!x)
-                    continue;
-                if (bb->npreds == 1) {
-                    if (bb->preds[0] != x)
-                        continue;
-                } else {
-                    /* a join: every way in is the branching block itself or a
-                       block entered only from it, and nothing was stored since */
-                    if (saved[j].kills != kills)
-                        continue;
-                    for (p = 0; p < bb->npreds; p++) {
-                        q = bb->preds[p];
-                        if (q != x && !(f->blk[q].npreds == 1 && f->blk[q].preds[0] == x && rpo_num[q] < k &&
-                                        rpo_num[q] > rpo_num[x]))
-                            break;
-                    }
-                    if (p < bb->npreds || !bb->npreds)
-                        continue;
-                }
-                nmem = saved[j].n;
-                memcpy(mem_tab, saved[j].tab, nmem * sizeof(MemEntry));
-                break;
-            }
-        }
+        if (!(k > 0 && bb->npreds == 1 && bb->preds[0] == rpo[k - 1]))
+            mem_enter(b, k);
         /* phis whose arguments all agree are copies */
         link = &bb->phis;
         while ((v = *link) != 0) {
@@ -364,7 +426,7 @@ static void gvn(void)
         }
         for (v = bb->first; v; v = nx) {
             Ins *i = &f->ins[v];
-            u32 r, h;
+            u32 r, h, n0;
             nx = i->next;
             {
                 u32 *ops;
@@ -381,7 +443,17 @@ static void gvn(void)
                     MemEntry *e = &mem_tab[j];
                     if (e->addr != i->a)
                         continue;
-                    if (e->mem == i->mem && (!e->from_store || i->mem >= M_32) && f->ins[e->val].ty == i->ty) {
+                    if (e->mem != i->mem)
+                        break;
+                    if (e->join) {
+                        u32 phi = mem_phi(e, i->ty);
+                        if (!phi)
+                            break;
+                        i = &f->ins[v]; /* the instruction array may have moved */
+                        e->val = phi;
+                        e->join = 0;
+                    }
+                    if ((!e->from_store || i->mem >= M_32) && f->ins[e->val].ty == i->ty) {
                         ir_replace(f, v, e->val);
                         v = 0;
                     }
@@ -393,13 +465,11 @@ static void gvn(void)
             case OP_STORE:
                 mem_kill(i->a, i->mem);
                 mem_add(i->a, i->mem, i->b, 1);
-                kills++;
                 continue;
             case OP_CALL:
             case OP_MEMCPY:
             case OP_MEMZERO:
                 nmem = 0;
-                kills++;
                 continue;
             case OP_SELECT: {
                 u64 cv;
@@ -456,10 +526,19 @@ static void gvn(void)
             }
             if (!(i->op >= OP_ADD && i->op <= OP_ASMOUT))
                 continue;
+            n0 = f->nins;
             r = ir_fold_at(f, v);
             i = &f->ins[v]; /* the instruction array may have moved */
             if (r) {
+                u32 k;
                 ir_replace(f, v, r);
+                /* what the folder made stands where v stood and is numbered next: it may be a value that
+                   there is already */
+                for (k = n0; k < f->nins; k++)
+                    if (f->ins[k].blk == b && f->ins[k].op >= OP_ADD && f->ins[k].op <= OP_ASMOUT) {
+                        nx = k;
+                        break;
+                    }
                 continue;
             }
             if (!is_pure(i->op))
@@ -497,13 +576,8 @@ static void gvn(void)
                     break;
                 }
         }
-        if (bb->term == TERM_BR && nmem) {
-            j = saved_next++ % NSAVED;
-            saved[j].blk = b;
-            saved[j].n = nmem;
-            saved[j].kills = kills;
-            memcpy(saved[j].tab, mem_tab, nmem * sizeof(MemEntry));
-        }
+        out_n[k] = nmem;
+        memcpy(out_tab + (size_t)k * MEM_CAP, mem_tab, nmem * sizeof(MemEntry));
     }
     /* Every block was visited after the blocks that dominate it, and its
        operands were resolved then; only phi operands can still name a value
@@ -599,6 +673,36 @@ static void remove_edge(u32 from, u32 to)
     }
 }
 
+/* Device code: is the assembly statement of the call v arithmetic on registers alone (a conversion, an
+   approximated function, a shift), which can be done where its result is not wanted? */
+static int asm_arith(u32 v)
+{
+    static const char *const ok[] = {"tanh.", "ex2.", "lg2.", "rcp.", "sqrt.", "rsqrt.", "sin.", "cos.", "fma.", "cvt.",
+                                     "min.", "max.", "abs.", "neg.", "popc.", "clz.", "bfind.", "brev.", "shf.",
+                                     "mul.", "mad.", "add.", "sub.", "and.", "or.", "xor.", "shl.", "shr.", "mov.",
+                                     "selp.", "setp.", "prmt.", ".reg "};
+    u64 idx;
+    const char *t;
+    u32 k;
+    if (!ir_is_const(f, f->ins[v].c, &idx) || !asm_stmts[idx].dev)
+        return 0;
+    t = asm_stmts[idx].tmpl;
+    if (strchr(t, '['))
+        return 0; /* memory */
+    for (;;) {
+        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '{' || *t == '}' || *t == ';')
+            t++;
+        if (!*t)
+            return 1;
+        for (k = 0; k < sizeof ok / sizeof ok[0] && strncmp(t, ok[k], strlen(ok[k])); k++)
+            ;
+        if (k == sizeof ok / sizeof ok[0])
+            return 0;
+        while (*t && *t != ';')
+            t++;
+    }
+}
+
 /* Is block b empty, or one or two instructions that are safe and cheap to
    execute unconditionally? */
 static int cheap_block(u32 b)
@@ -607,8 +711,21 @@ static int cheap_block(u32 b)
     for (v = f->blk[b].first; v; v = f->ins[v].next) {
         int op = f->ins[v].op;
         if (opt_dev_fn && !getenv("MCC_NOIFC")) {
-            /* device code: a branch costs more than a few instructions done in vain */
-            if (!is_pure(op) || op == OP_FDIV || ++n > 6)
+            /* device code: a branch costs more than a few instructions done in vain, and one that the threads
+               of a warp take differently makes them take turns (MCC_IFC=n: how many instructions) */
+            if (op == OP_ASMOUT)
+                continue;
+            if (op == OP_CALL && (f->ins[v].flags & IF_ASM) && opt_ifc > 6 && asm_arith(v)) {
+                if ((n += 2) > (u32)opt_ifc)
+                    return 0;
+                continue;
+            }
+            if (op == OP_CALL && !opt_noifcall && ptx_pure_call(f, v)) {
+                if (++n > (u32)opt_ifc)
+                    return 0;
+                continue;
+            }
+            if ((!is_pure(op) && (op != OP_SELECT || opt_noifcall)) || op == OP_FDIV || ++n > (u32)opt_ifc)
                 return 0;
             continue;
         }
@@ -683,6 +800,33 @@ static int forward_phi_blocks(void)
         }
     } while (again);
     return changed;
+}
+
+/* How many times each value is used, as things stand now. */
+static u32 *count_uses(u32 *nuses)
+{
+    u32 *uses = (u32 *)xmalloc(f->nins * sizeof(u32)), bi, n, j, v, *ops;
+    *nuses = f->nins;
+    memset(uses, 0, f->nins * sizeof(u32));
+    for (bi = 1; bi < f->nblk; bi++) {
+        Block *ub = &f->blk[bi];
+        if (ub->term == TERM_NONE)
+            continue;
+        for (v = ub->phis; v; v = f->ins[v].next)
+            for (j = 0; j < f->ins[v].b; j++)
+                uses[ir_resolve(f, f->xargs[f->ins[v].a + j])]++;
+        for (v = ub->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            IR_OPS(f, i, ops, n);
+            for (j = 0; j < n; j++)
+                uses[f->ins[ops[j]].op == OP_COPY ? ir_resolve(f, ops[j]) : ops[j]]++;
+            if (i->op == OP_CALL)
+                uses[ir_resolve(f, i->c)]++;
+        }
+        if (ub->arg)
+            uses[ir_resolve(f, ub->arg)]++;
+    }
+    return uses;
 }
 
 static int simplify_cfg(void)
@@ -763,25 +907,7 @@ static int simplify_cfg(void)
                     }
                 }
                 if (ok && !uses) {
-                    u32 bi, n, j;
-                    nuses = f->nins;
-                    uses = (u32 *)xmalloc(f->nins * sizeof(u32));
-                    memset(uses, 0, f->nins * sizeof(u32));
-                    for (bi = 1; bi < f->nblk; bi++) {
-                        Block *ub = &f->blk[bi];
-                        if (ub->term == TERM_NONE)
-                            continue;
-                        for (v = ub->phis; v; v = f->ins[v].next)
-                            for (j = 0; j < f->ins[v].b; j++)
-                                uses[ir_resolve(f, f->xargs[f->ins[v].a + j])]++;
-                        for (v = ub->first; v; v = f->ins[v].next) {
-                            n = ir_opcount(f, v);
-                            for (j = 0; j < n; j++)
-                                uses[ir_resolve(f, *ir_opref(f, v, j))]++;
-                        }
-                        if (ub->arg)
-                            uses[ir_resolve(f, ub->arg)]++;
-                    }
+                    uses = count_uses(&nuses);
                     bb = &f->blk[b];
                 }
                 if (ok && p < nuses && uses[p] == 1 && (!cmp || (cmp < nuses && uses[cmp] == 1))) {
@@ -869,6 +995,23 @@ static int simplify_cfg(void)
                     j = e;
                 else if (e_empty && eb->succ[0] == t)
                     j = t;
+                if (j && j != b && j != 1 && f->blk[j].phis && !opt_dev_fn && !opt_size) {
+                    /* A test of something just loaded, used for nothing else: as a branch, what follows
+                       can start on a guess while the load is on its way; a select would make everything
+                       after it wait for the load. */
+                    Ins *ci = &f->ins[bb->arg];
+                    u32 ld = 0;
+                    if (ci->op == OP_LOAD)
+                        ld = bb->arg;
+                    else if (ci->op >= OP_EQ && ci->op <= OP_UGE)
+                        ld = f->ins[ci->a].op == OP_LOAD ? ci->a : f->ins[ci->b].op == OP_LOAD ? ci->b : 0;
+                    if (ld && !uses) {
+                        uses = count_uses(&nuses);
+                        bb = &f->blk[b];
+                    }
+                    if (ld && ld < nuses && uses[ld] == 1 && bb->arg < nuses && uses[bb->arg] == 1)
+                        j = 0;
+                }
                 if (j && j != b && j != 1 && f->blk[j].phis) {
                     Block *jb = &f->blk[j];
                     pt = pred_index(j, j == t ? b : t);

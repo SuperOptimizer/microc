@@ -227,6 +227,8 @@ extern int opt_level;
 extern int opt_fast_math;
 extern int opt_vec_report;
 extern int opt_size; /* prefer smaller code where it costs speed */
+extern int opt_fp_contract; /* -ffp-contract=fast: a * b + c is rounded once (arm64.c: fmadd) */
+extern int opt_no_jump_tables; /* -fno-jump-tables: a switch stays a tree of comparisons (arm64.c) */
 int inline_saved(u32 sym);
 void inline_restore(Func *f, u32 sym);
 void inline_save(Func *f);
@@ -243,6 +245,8 @@ void opt_finish(Func *f); /* last changes before code generation */
 /* opt.c */
 extern int arm64_text_sec;
 void opt_run(Func *f); /* the whole pipeline, from freshly parsed IR */
+int ptx_pure_call(Func *f, u32 v); /* ptx.c: a call that is an instruction of arithmetic in device code */
+extern Obj *ptx_obj;
 extern int opt_strict_aliasing;
 
 /* backend */
@@ -253,7 +257,7 @@ void x64_gen(Func *f, Obj *o); /* x64.c; arm64_gen hands over to it when opt_arc
 extern int opt_fmad; /* CUDA device code: a product and a sum become one fused operation (-fmad=false: never) */
 extern int opt_nounroll, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 extern u32 opt_automax, opt_aumax;
-extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
+extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc;
 extern int opt_dev_code, opt_dolicm; /* the function being read is device code only; MCC_LICM: its loops are hoisted from all the same */ /* debugging: MCC_NOUNROLL, MCC_NOSPLIT in the environment */
 extern int opt_dev_fn; /* the function being optimised is device code */
 extern int opt_fastmath; /* CUDA device code, nvcc's -use_fast_math: single precision flushes denormal numbers to zero

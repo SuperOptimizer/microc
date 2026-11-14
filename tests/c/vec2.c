@@ -128,6 +128,15 @@ static void plane(float *o, const float *a, unsigned long z, unsigned long m, un
 { unsigned long j; for (j = 0; j < n; j++) o[z * m + j] += 0.5f * a[(z + 1) * m + j] - a[j + 3]; }
 static void bplane(unsigned char *o, const unsigned char *a, long z, long n) { long j; for (j = 0; j < n; j++) o[z + j] = (unsigned char)(a[j + z * 2] + 1); }
 
+/* gathers through an index computed lane by lane (x86-64 with SSE4.1), the range read checked against what is written */
+static void clamprow(float *row, const unsigned char *src, int P, int r)
+{ int x; for (x = -r; x < P + r; x++) row[x + r] = src[x < 0 ? 0 : x >= P ? P - 1 : x]; }
+static void half(unsigned char *dst, const unsigned char *row, int o, int lo, int P)
+{ int x; for (x = 0; x < P; x++) dst[x] = row[((o + x + 1) >> 1) - lo]; }
+static void fgat(float *d, const float *a, int k, int n) { int i; for (i = 0; i < n; i++) d[i] = a[(i * 3 + k) >> 1] * 2.f + 1.f; }
+static void sgat(int *d, const short *a, int n) { int i; for (i = 0; i < n; i++) d[i] = a[n - 1 - i > i ? i : n - 1 - i] + d[i]; }
+static void selfgat(int *a, int n) { int i; for (i = 0; i < n; i++) a[i + 8] = a[(i >> 1) + 5] + 1; }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -185,6 +194,10 @@ int main(void)
         for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 41) * 0.7f - 13.f; da[i] = (double)((i * 11) % 23) * 0.9 - 9.0; }
         roots(fc, fa, n); droots(db, da, n);
         stencil(fb, fa, 3, n); shiftw(ib, ia, 5, n); fwd(ia, n); rec(ia + 2, n); rec2(ib, 2, n / 2); rec2(ib + 40, 9, n / 2);
+        clamprow(fc, ua, n / 2, 3); half(ub + 2, ua, n, 1, n / 2); fgat(fb, fc, 2, n / 2); sgat(ib, ha, n); selfgat(ia, n / 2);
+        selfgat(ia + 20, n / 3); half(ua, ua + 30, 3, 0, n / 3);
+        printf("   %lx %lx %lx %lx %lx\n", check(fc, sizeof fc), check(ub, sizeof ub), check(fb, sizeof fb), check(ib, sizeof ib),
+               check(ia, sizeof ia) ^ check(ua, sizeof ua));
         plane(fb, fa, 1, 20, (unsigned long)n / 3); plane(fc, fb, 0, 9, (unsigned long)n / 2); bplane(ua, ub, 3, n / 2); bplane(ub, ub, 1, n / 3);
         printf("   %lx %lx %lx %lx %lx\n", check(fb, sizeof fb), check(ia, sizeof ia), check(ib, sizeof ib), check(fc, sizeof fc),
                check(ua, sizeof ua) ^ check(ub, sizeof ub));

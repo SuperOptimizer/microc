@@ -1820,6 +1820,8 @@ static u32 *row_off, *row_loc, nrow, caprow;
 static DwCfi *cfi;
 static u32 ncfi, capcfi;
 
+static u32 *moff, capmoff; /* -g: where each machine instruction starts (moff[mf.n]: where the last ends) */
+
 static void cfi_event(int op, u32 reg, u32 n)
 {
     if (!opt_debug)
@@ -3209,8 +3211,119 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
             bi++;
         cfi[k].off -= cut[bi];
     }
+    if (opt_debug)
+        for (k = 0, bi = 0; k <= mf.n; k++) {
+            while (bi < nfixups && fx_start(&fixups[bi]) < moff[k])
+                bi++;
+            moff[k] -= cut[bi];
+        }
     free(cut);
     free(nb);
+}
+
+/* -g: a DWARF expression for where machine location l (a register or a spill slot) is; byref: the variable
+   is in memory at the address held there */
+static u32 place_expr(u8 *e, u32 l, int byref)
+{
+    u32 n = 0, dw;
+    i64 off;
+    if (l >= SPILL0) {
+        off = -(i64)(spill_base + 8 * (l - SPILL0 + 1)) - 16; /* rbp is the frame's address - 16 */
+        e[n++] = 0x91;                                        /* DW_OP_fbreg */
+        do {
+            u32 byte = (u32)(off & 0x7f);
+            off >>= 7;
+            if ((off == 0 && !(byte & 0x40)) || (off == -1 && (byte & 0x40))) {
+                e[n++] = (u8)byte;
+                break;
+            }
+            e[n++] = (u8)(byte | 0x80);
+        } while (1);
+        if (byref)
+            e[n++] = 0x06; /* DW_OP_deref */
+        return n;
+    }
+    if (l < 16) {
+        static const u8 dwreg[16] = {0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15};
+        dw = dwreg[l];
+    } else if (l >= XMM0 && l < XMM0 + 16) {
+        dw = 17 + l - XMM0;
+    } else {
+        return 0;
+    }
+    if (byref) {
+        e[n++] = (u8)(0x70 + dw); /* DW_OP_bregN 0 */
+        e[n++] = 0;
+    } else {
+        e[n++] = (u8)(0x50 + dw); /* DW_OP_regN */
+    }
+    return n;
+}
+
+/* -g: where the function's variables are. Those still in a stack slot are there throughout; for the others,
+   each value that was the variable's (opt_promote marked them) is where the allocator put it, wherever it is
+   live. Positions of the allocator are turned into code offsets through the instructions' offsets. */
+static void var_places(u32 start)
+{
+    u32 k, v, b, i, nslot = mf.n + mf.nblk + 1, *ss, *se, *byslot, cap = 64, *rs, *re;
+    if (!dwarf_vars(f->sym))
+        return;
+    byslot = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32));
+    memset(byslot, 0, (f->nslots + 1) * sizeof(u32));
+    for (k = dwarf_vars(f->sym); k; k = dwarf_var_next(k)) {
+        u32 sl = dwarf_var_slot(k);
+        if (sl >= f->nslots)
+            continue;
+        byslot[sl] = k;
+        if (f->slots[sl].size && has_frame)
+            dwarf_var_frame(k, f->slots[sl].off - 16);
+    }
+    ss = (u32 *)xmalloc(nslot * sizeof(u32));
+    se = (u32 *)xmalloc(nslot * sizeof(u32));
+    memset(ss, 0, nslot * sizeof(u32));
+    memset(se, 0, nslot * sizeof(u32));
+    for (b = 0; b < mf.nblk; b++) {
+        MBlock *mb = &mf.blk[b];
+        for (i = mb->first; i < mb->first + mb->n; i++) {
+            ss[i + b] = moff[i] - start;
+            se[i + b] = moff[i + 1] - start;
+        }
+        ss[mb->first + mb->n + b] = se[mb->first + mb->n + b] = moff[mb->first + mb->n] - start;
+    }
+    rs = (u32 *)xmalloc(cap * sizeof(u32));
+    re = (u32 *)xmalloc(cap * sizeof(u32));
+    for (v = 1; v < f->nins; v++) {
+        Ins *in = &f->ins[v];
+        u32 d, l, n, len, sl;
+        u8 e[12];
+        if (!in->var || !in->blk || (sl = in->var - 1) >= f->nslots || !byslot[sl])
+            continue;
+        d = ra_dense(v);
+        if (d == NOREG || (l = mf.loc[d]) == NOREG)
+            continue;
+        len = place_expr(e, l, dwarf_var_byref(byslot[sl]));
+        if (!len)
+            continue;
+        n = ra_ranges(d, rs, re, cap);
+        if (n > cap) {
+            cap = n;
+            rs = (u32 *)xrealloc(rs, cap * sizeof(u32));
+            re = (u32 *)xrealloc(re, cap * sizeof(u32));
+            ra_ranges(d, rs, re, cap);
+        }
+        for (i = 0; i < n; i++) {
+            /* a position: 2s + 2 reads in slot s, 2s + 3 writes there (so the value is there after it) */
+            u32 a = rs[i] & 1 ? (rs[i] - 1) / 2 : (rs[i] - 2) / 2, z = re[i] < 2 ? 0 : (re[i] - 2) / 2;
+            if (a >= nslot - 1 || z >= nslot - 1 || z < a)
+                continue;
+            dwarf_var_place(byslot[sl], ss[a], se[z], e, len);
+        }
+    }
+    free(rs);
+    free(re);
+    free(ss);
+    free(se);
+    free(byslot);
 }
 
 void x64_gen(Func *fn, Obj *o)
@@ -3270,22 +3383,33 @@ void x64_gen(Func *fn, Obj *o)
     body_at = (u32)text->len;
     blk_off = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));
     nfixups = 0;
+    if (opt_debug && capmoff < mf.n + 1) {
+        capmoff = mf.n + 1;
+        moff = (u32 *)xrealloc(moff, capmoff * sizeof(u32));
+    }
     for (k = 0; k < mf.nblk; k++) {
         MBlock *mb = &mf.blk[k];
         blk_off[k] = (u32)text->len;
         for (n = mb->first; n < mb->first + mb->n; n++) {
             if (mf.ins[n].op == X_ASM)
                 has_asm = 1;
-            if (opt_debug && mloc[n] && mloc[n] != last_loc) {
-                last_loc = mloc[n];
-                row_add(last_loc);
+            if (opt_debug) {
+                moff[n] = (u32)text->len;
+                if (mloc[n] && mloc[n] != last_loc) {
+                    last_loc = mloc[n];
+                    row_add(last_loc);
+                }
             }
             encode(&mf.ins[n]);
             text = &o->sec[arm64_text_sec];
         }
     }
+    if (opt_debug)
+        moff[mf.n] = (u32)text->len;
     relax(blk_off, first_rel, has_asm);
     o->syms[f->sym].size = text->len - start;
+    if (opt_debug)
+        var_places(start);
     if (opt_debug) {
         for (k = 0; k < nrow; k++)
             row_off[k] -= start;

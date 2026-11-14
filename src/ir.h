@@ -68,6 +68,7 @@ enum {
 enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
 
 #define PARAM_GLOBAL 1 /* OP_PARAM's mem: a kernel's pointer, the address of global memory */
+#define PARAM_GLOBAL_NC 2 /* ... a "const T *__restrict__" one: memory the kernel only reads (ld.global.nc) */
 #define IF_SRET 1 /* OP_CALL: first argument is the struct return pointer */
 #define IF_ALLOCA 4 /* OP_CALL: the one argument is a byte count, the result that much new stack */
 #define IF_ATOMIC 8 /* OP_CALL: an atomic operation done in line. The callee is a constant: ATOM_* kind,
@@ -77,6 +78,7 @@ enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
                        there before, zero-extended. */
 enum { ATOM_LOAD, ATOM_STORE, ATOM_XCHG, ATOM_ADD, ATOM_SUB, ATOM_AND, ATOM_OR, ATOM_XOR, ATOM_NAND, ATOM_CAS,
        ATOM_FENCE };
+#define IF_NC 0x40 /* OP_LOAD, device code: of global memory the kernel only reads (__ldg: ld.global.nc) */
 #define IF_SSE0 0x10 /* OP_CALL with IF_SRET and mem, x86-64: the first eight bytes come back in an xmm register, */
 #define IF_SSE1 0x20 /* the second eight; Func.has_sret says the same with 0x40 and 0x80 */
 #define IF_ASM 2  /* OP_CALL: inline assembly. The callee is the constant index of an AsmStmt; the
@@ -265,7 +267,7 @@ void x64_gen(Func *f, Obj *o); /* x64.c; arm64_gen hands over to it when opt_arc
 /* ptx.c: the backend for device code */
 extern int opt_fmad; /* CUDA device code: a product and a sum become one fused operation (-fmad=false: never) */
 extern int opt_noparamfwd;
-extern int opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+extern int opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 extern u32 opt_automax, opt_aumax;
 extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
 extern int opt_dev_code, opt_dolicm; /* the function being read is device code only; MCC_LICM: its loops are hoisted from all the same */ /* debugging: MCC_NOUNROLL, MCC_NOSPLIT in the environment */

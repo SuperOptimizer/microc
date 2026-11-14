@@ -824,6 +824,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         }
         opt_cuda = force_cuda || has_suffix(in, ".cu");
         opt_nounroll = getenv("MCC_NOUNROLL") != 0;
+        opt_nonc = getenv("MCC_NONC") != 0; /* PTX: no ld.global.nc through const restrict kernel pointers */
         opt_nolatch = getenv("MCC_NOLATCH") != 0; /* PTX: a loop's moves after its branch out, in a block of their own */
         opt_unrollpeel = getenv("MCC_UNROLLPEEL") != 0; /* #pragma unroll N: N copies, then a loop of one (before 11-14) */
         opt_nosplit = getenv("MCC_NOSPLIT") != 0;

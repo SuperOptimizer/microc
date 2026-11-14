@@ -37,6 +37,7 @@ struct Type {
     u8 variadic;
     u8 oldstyle; /* function declared without a prototype */
     u8 vkind;    /* a struct that is really 1: a GNU vector, 2: a complex number; base = element type, len = count */
+    u8 restr;    /* a pointer declared restrict (not a qualifier of the type: only kernel parameters look at it) */
     u32 align;
     u32 xalign; /* alignment given by an attribute, overriding the natural one */
     u32 vslot;  /* a variable length array: 1 + the stack slot that holds its size in bytes */
@@ -67,6 +68,7 @@ Type *type_array(Type *base, u64 len, int complete);
 Type *type_func(Type *ret, Type **params, u32 *pnames, u32 nparams, int variadic, int oldstyle);
 Type *type_record(int kind, u32 tag);
 Type *type_qual(Type *t, int quals);
+Type *type_restrict(Type *t);
 void type_layout(Type *t, Field *fields, int packed, u32 minalign); /* completes a struct or union */
 Field *type_field(Type *t, u32 name);
 Field *type_member(Type *t, u32 name, u64 *off); /* also looks inside unnamed members; *off from the start of t */

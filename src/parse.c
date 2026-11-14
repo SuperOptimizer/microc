@@ -3311,6 +3311,27 @@ static int builtin(Expr *e)
         expect(T_RPAREN);
         return 1;
     }
+    if (strcmp(b, "mcc_ldg") == 0) {
+        /* CUDA's __ldg(p): *p, from global memory that the kernel only reads (ld.global.nc) */
+        Type *t;
+        next();
+        expect(T_LPAREN);
+        assign_expr(e);
+        rvalue(e);
+        expect(T_RPAREN);
+        if (e->ty->kind != TY_PTR)
+            error_at(tok.loc, "__builtin_mcc_ldg wants a pointer");
+        t = e->ty->base;
+        if (cur_fn_dev && type_is_scalar(t) && t->kind != TY_FLOAT16 && t->kind != TY_BF16 && t->kind != TY_LDOUBLE && !(t->kind >= TY_INT128 && t->kind <= TY_UINT128)) {
+            u32 v = ir_load(F, type_ir(t), type_mem(t), e->v);
+            if (F->ins[v].op == OP_LOAD)
+                F->ins[v].flags |= IF_NC;
+            set_expr(e, unqual(t), v, 0);
+        } else {
+            set_expr(e, t, e->v, 1);
+        }
+        return 1;
+    }
     if (strcmp(b, "mcuda_device") == 0) {
         /* CUDA: is the code being made device code? */
         u32 id = intern_cstr("__mcuda_is_device");
@@ -6414,7 +6435,7 @@ enum { D_PTR, D_ARRAY, D_FUNC, D_REF };
 
 typedef struct DOp {
     u8 kind;
-    u8 quals;
+    u8 quals, restr;
     u8 complete, variadic, oldstyle;
     u64 len;
     Type **params;
@@ -6570,7 +6591,7 @@ static DOp *declarator_ops(u32 *name)
             else if (accept(KW(KW_ATOMIC)))
                 op->quals |= Q_ATOMIC;
             else if (accept(KW(KW_RESTRICT)))
-                ;
+                op->restr = 1;
             else if (tok.kind == KW(KW_ATTRIBUTE))
                 attributes(&dcl_attr); /* "void *__section(x) p": they are the variable's */
             else
@@ -6653,6 +6674,8 @@ static Type *declarator(Type *base, u32 *name)
             base = type_ptr(base);
             if (op->quals)
                 base = type_qual(base, op->quals);
+            if (op->restr && opt_cuda)
+                base = type_restrict(base);
             break;
         case D_REF:
             if (base->kind != TY_REF)
@@ -10009,7 +10032,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         } else {
             v = abi_extend(pt, ir_add_param(F, type_ir(pt)));
             if (cur_fn_kernel && pt->kind == TY_PTR && F->ins[v].op == OP_PARAM)
-                F->ins[v].mem = PARAM_GLOBAL;
+                F->ins[v].mem = pt->restr && (pt->base->quals & Q_CONST) ? PARAM_GLOBAL_NC : PARAM_GLOBAL;
             p->slot = ir_new_slot(F, type_size(pt), type_align(pt));
             store_val(pt, ir_slot_addr(F, p->slot, 0), v);
             if (type_is_float(pt))

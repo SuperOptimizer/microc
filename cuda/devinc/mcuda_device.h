@@ -252,7 +252,8 @@ __device__ static __forceinline__ unsigned __match_any_sync(unsigned mask, int v
 __device__ static __forceinline__ unsigned __match_any_sync(unsigned mask, unsigned long long v) { unsigned r; asm volatile("match.any.sync.b64 %0, %1, %2;" : "=r"(r) : "l"(v), "r"(mask)); return r; }
 
 /* memory */
-template <class T> __device__ static __forceinline__ T __ldg(const T *p) { return *p; }
+/* (ld.global.nc where T is a number or a pointer; mcc also reads "const T *__restrict__" kernel parameters so) */
+template <class T> __device__ static __forceinline__ T __ldg(const T *p) { return __builtin_mcc_ldg(p); }
 __device__ static __forceinline__ unsigned long __cvta_generic_to_shared(const void *p) { unsigned long r; asm("cvta.to.shared.u64 %0, %1;" : "=l"(r) : "l"(p)); return r; }
 
 /* warps */

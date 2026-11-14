@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
 u32 ptx_maxntid;
@@ -854,38 +854,73 @@ static u8 *gl_s; /* the value is such an address */
 
 static void gl_find(Func *f)
 {
-    u32 v, k;
+    u32 v, k, n, *p;
     int changed;
+    /* 2: also only read, through a "const T *__restrict__" parameter of the kernel (ld.global.nc, as nvcc) */
     for (v = 1; v < f->nins; v++) {
         Ins *i = &f->ins[v];
-        gl_s[v] = i->blk && i->ty == IT_I64 &&
-                  ((i->op == OP_PARAM && i->mem == PARAM_GLOBAL) || i->op == OP_ADD || i->op == OP_SUB || i->op == OP_PHI ||
-                   i->op == OP_SELECT);
+        gl_s[v] = 0;
+        if (!i->blk || i->ty != IT_I64)
+            continue;
+        if (i->op == OP_PARAM)
+            gl_s[v] = i->mem == PARAM_GLOBAL_NC && !opt_nonc ? 2 : i->mem ? 1 : 0;
+        else if (i->op == OP_ADD || i->op == OP_SUB || i->op == OP_PHI || i->op == OP_SELECT)
+            gl_s[v] = 2;
     }
     do {
         changed = 0;
         for (v = 1; v < f->nins; v++) {
             Ins *i = &f->ins[v];
-            int ok = 1;
+            u8 to;
             if (!gl_s[v] || i->op == OP_PARAM)
                 continue;
             if (i->op == OP_ADD) {
-                ok = gl_s[RV(i->a)] != gl_s[RV(i->b)];
+                u8 x = gl_s[RV(i->a)], y = gl_s[RV(i->b)];
+                to = !x != !y ? (x ? x : y) : 0;
             } else if (i->op == OP_SUB) {
-                ok = gl_s[RV(i->a)] && !gl_s[RV(i->b)];
+                to = !gl_s[RV(i->b)] ? gl_s[RV(i->a)] : 0;
             } else if (i->op == OP_SELECT) {
-                ok = gl_s[RV(i->b)] && gl_s[RV(i->c)];
+                u8 x = gl_s[RV(i->b)], y = gl_s[RV(i->c)];
+                to = x < y ? x : y;
             } else {
+                to = 2;
                 for (k = 0; k < i->b; k++)
-                    if (!gl_s[RV(f->xargs[i->a + k])])
-                        ok = 0;
+                    if (gl_s[RV(f->xargs[i->a + k])] < to)
+                        to = gl_s[RV(f->xargs[i->a + k])];
             }
-            if (!ok) {
-                gl_s[v] = 0;
+            if (to < gl_s[v]) {
+                gl_s[v] = to;
                 changed = 1;
             }
         }
     } while (changed);
+    /* written through after all (a cast takes the const away), or handed to what may write: plain global memory */
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        int w = 0;
+        if (!i->blk)
+            continue;
+        if (i->op == OP_STORE || i->op == OP_MEMZERO || i->op == OP_MEMCPY || i->op == OP_VSTORE) {
+            w = gl_s[RV(i->a)] == 2;
+        } else if (i->op == OP_CALL) {
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                if (gl_s[RV(p[k])] == 2)
+                    w = 1;
+            if (w && (i->flags & IF_ASM)) {
+                /* an assembly statement that only reads: a load, a copy into shared memory, a prefetch */
+                u64 idx;
+                const char *t = ir_is_const(f, i->c, &idx) ? asm_stmts[idx].tmpl : 0;
+                w = !t || strstr(t, "st.") || strstr(t, "atom") || strstr(t, "red.") || strstr(t, "sust") || strstr(t, "cp.reduce");
+            }
+        }
+        if (w) {
+            for (k = 1; k < f->nins; k++)
+                if (gl_s[k] == 2)
+                    gl_s[k] = 1;
+            return;
+        }
+    }
 }
 
 /* The template of an assembly statement, whose atomic operations on [%n] are told that the address is of
@@ -1367,7 +1402,8 @@ static void emit_ins(u32 v)
             return;
         }
         a = maddr(i->a);
-        P("\tld.%s%s %s, [%s];\n", gl_s && gl_s[RV(i->a)] ? "global." : "", lt[i->mem], reg(v), a);
+        P("\tld.%s%s %s, [%s];\n", (i->flags & IF_NC) && !opt_nonc ? "global.nc." : gl_s && gl_s[RV(i->a)] ? gl_s[RV(i->a)] == 2 ? "global.nc." : "global." : "",
+          lt[i->mem], reg(v), a);
         return;
     }
     case OP_STORE: {

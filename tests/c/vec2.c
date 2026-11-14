@@ -146,6 +146,12 @@ static float fsum2(const float *a, const float *b, int n) { int i; float s = 0.f
 static void taps(float *w, const float *e, float s, int r) { int k; for (k = 0; k <= 2 * r; k++) w[k] = e[k] / s; }
 static void ule(unsigned *d, const unsigned *a, unsigned lo, unsigned hi) { unsigned i; for (i = lo; i <= hi; i++) d[i] = a[i] * 5u + i; }
 
+/* two bounds: i < a && i < b is i < min (a, b) */
+static void tb1(unsigned char *o, const float *p, int s, int a, int b) { int i; for (i = s; i < a && i < b; i++) o[i] = p[i] > 0.5f; }
+static void tb2(int *o, const int *p, int s, int a, int b) { int i; for (i = s; i <= a && i <= b; i++) o[i] = p[i] * 3 + i; }
+static void tb3(unsigned *o, const unsigned *p, unsigned s, unsigned a, unsigned b) { unsigned i; for (i = s; i < a && i < b; i++) o[i] = p[i] ^ 0x5au; }
+static void tb4(float *o, const float *p, long s, long a, long b) { long i; for (i = s; i < a && i < b; i++) o[i] = p[i] * 2.f - 1.f; }
+
 static unsigned long check(const void *p, unsigned long n)
 {
     const unsigned char *b = p;
@@ -217,6 +223,11 @@ int main(void)
         printf("   %lx %lx %lu\n", check(fc, sizeof fc), check(db, sizeof db), lr(da, fa, n));
         printf("   %d %u %d %d %d %d %ld %g %g %lx\n", imx(ia, n), umn(qa, n), busum(ua, n), bssum(sa, n), wusum(wa, n), hssum(ha, n),
                lsum2(la, n), (double)fsum(fa, n), dsum(da, n), check(fb, sizeof fb));
+        tb1(ua, fa, 3, n, n / 2 + 5); tb1(ub, fb, 0, n - 7, -3); tb2(ia, ib, 1, n / 2, n - 2); tb2(ib, ia, -1 < n ? 0 : 1, n - 1, n / 3);
+        tb3(qa, qb, 2, (unsigned)n, (unsigned)n / 2 + 1); tb3(qb, qa, 0, 0xffffffffu, (unsigned)n);
+        tb4(fc, fa, 1, (long)n, (long)n * 2 / 3); tb4(fb, fc, -0L + 2, -5L, (long)n);
+        printf("   %lx %lx %lx %lx\n", check(ua, sizeof ua) ^ check(ub, sizeof ub), check(ia, sizeof ia) ^ check(ib, sizeof ib),
+               check(qa, sizeof qa) ^ check(qb, sizeof qb), check(fb, sizeof fb) ^ check(fc, sizeof fc));
     }
     return 0;
 }

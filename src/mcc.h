@@ -421,6 +421,8 @@ void dwarf_reset(const char *path);
 void dwarf_func_loc(u32 sym, u32 loc, struct Type *ret); /* where the definition of a function is, its result type */
 /* a parameter or local of function fsym, in stack slot slot (byref: the slot holds its address) */
 void dwarf_var(u32 fsym, u32 name, struct Type *ty, u32 slot, int param, int byref, u32 loc);
+void dwarf_scope_open(u32 fsym, u32 loc); /* a block of fsym's body begins at loc (its variables are in it) */
+void dwarf_scope_close(u32 loc);           /* ... and ends before loc */
 u32 dwarf_vars(u32 fsym);              /* the back end: 1 + its first variable, or 0 */
 u32 dwarf_var_next(u32 k);
 u32 dwarf_var_slot(u32 k);

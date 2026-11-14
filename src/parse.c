@@ -84,6 +84,7 @@ typedef struct Tag {
 typedef struct Scope {
     Sym *syms;
     Tag *tags;
+    int dw; /* -g: a block of the function's body (dwarf_scope_open) */
 } Scope;
 
 typedef struct Expr {
@@ -655,12 +656,17 @@ static Sym *bind(Sym *s)
     return s;
 }
 
+static u32 dw_fn_level; /* -g: the level of the parameters of the function being defined, 0 none */
+
 static void push_scope(void)
 {
     if (++level >= MAX_SCOPES)
         error_at(tok.loc, "blocks nested too deeply");
     scopes[level].syms = 0;
     scopes[level].tags = 0;
+    scopes[level].dw = opt_debug && dw_fn_level && level > dw_fn_level && F == fn_func && !inl_on();
+    if (scopes[level].dw)
+        dwarf_scope_open(F->sym, tok.loc);
 }
 
 static void pop_scope(void)
@@ -677,6 +683,9 @@ static void pop_scope(void)
             if (l->local == level && l->name)
                 l->name = 0; /* a local label goes out of scope */
     }
+    if (scopes[level].dw)
+        dwarf_scope_close(tok.loc);
+    scopes[level].dw = 0;
     level--;
 }
 
@@ -10709,7 +10718,7 @@ static void cgoto_tree(u32 val, const u32 *blks, u32 lo, u32 hi)
 
 static void func_def(Sym *s, Type *ty, u32 loc)
 {
-    u32 i, v;
+    u32 i, v, dw_fn_save;
     Label *l;
 
     if (s->defined)
@@ -10749,6 +10758,8 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     break_blk = cont_blk = 0;
     cur_switch = 0;
     push_scope();
+    dw_fn_save = dw_fn_level;
+    dw_fn_level = level;
 
     /* K&R parameter declarations */
     while (ty->oldstyle && tok.kind != T_LBRACE) {
@@ -10863,6 +10874,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     expect(T_LBRACE);
     compound(0);
     pop_scope();
+    dw_fn_level = dw_fn_save;
 
     if (F->cur) {
         if (cur_ret->kind == TY_VOID || type_is_record(cur_ret) || type_is_128(cur_ret))

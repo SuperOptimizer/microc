@@ -3151,6 +3151,27 @@ static void call(Expr *e)
         set_expr(e, ty_void, 0, 0);
         return;
     }
+    /* x86-64 host code: memcpy and memset (to 0) of a small constant size are block operations, as their builtins would be: the
+       memcpy(&bits, &x, 4) of a type pun then becomes a register move once the two locals are values (a call kept
+       both in memory, and cost a call: surfcomp's float_ulp, the f16 / volcomp bit readers) */
+    if (!flags && nargs == 3 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && F->ins[callee].op == OP_ADDR && !F->ins[callee].b && O->syms[F->ins[callee].a].name) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        u64 n, c0;
+        if (opt_target != TARGET_LINUX && cn[0] == '_')
+            cn++;
+        if (ir_is_const(F, args[2], &n) && n > 0 && n <= 64) {
+            if (strcmp(cn, "memcpy") == 0) {
+                emit_mem(OP_MEMCPY, args[0], args[1], n, 1);
+                set_expr(e, ret, args[0], 0);
+                return;
+            }
+            if (strcmp(cn, "memset") == 0 && ir_is_const(F, args[1], &c0) && (c0 & 255) == 0) {
+                emit_mem(OP_MEMZERO, args[0], 0, n, 1);
+                set_expr(e, ret, args[0], 0);
+                return;
+            }
+        }
+    }
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
     v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? (vec_mem(ret) == M_V256 ? IT_V256 : IT_V128) : type_ir(ret), callee, args, nargs,
                 ft->variadic ? ft->nparams + (flags ? 1 : 0) : opt_arch == ARCH_X64 && ft->oldstyle ? nargs : 0xffffffffU, flags);

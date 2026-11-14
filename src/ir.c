@@ -778,7 +778,10 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                         return ia->op == OP_ADDR ? ir_addr(f, ia->a, off) : ir_slot_addr(f, ia->a, off);
                 }
                 if (ia->op == OP_ADD && ir_is_const(f, ia->b, &x))
-                    return ir_ins(f, OP_ADD, ty, ia->a, ir_const(f, ty, x + y));
+                {
+                    u32 aa = ia->a, k2 = ir_const(f, ty, x + y); /* (ir_const may move f->ins: ia with it) */
+                    return ir_ins(f, OP_ADD, ty, aa, k2);
+                }
                 if (op == OP_SUB)
                     return ir_ins(f, OP_ADD, ty, a, ir_const(f, ty, y));
                 break;
@@ -790,7 +793,10 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                 if (y == 0)
                     return a;
                 if (op == OP_SHL && DEV_SUMS && !opt_nodist && ia->op == OP_ADD && ir_is_const(f, ia->b, &x) && y < 32)
-                    return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_SHL, ty, ia->a, b), ir_const(f, ty, x << y));
+                {
+                    u32 aa = ia->a, k2 = ir_const(f, ty, x << y);
+                    return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_SHL, ty, aa, b), k2);
+                }
                 break;
             case OP_MUL:
                 if (y == 1)
@@ -798,7 +804,10 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                 if (y == 0)
                     return b;
                 if (DEV_SUMS && !opt_nodist && ia->op == OP_ADD && ir_is_const(f, ia->b, &x)) /* (x + k) c is x c + k c */
-                    return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_MUL, ty, ia->a, b), ir_const(f, ty, x * y));
+                {
+                    u32 aa = ia->a, k2 = ir_const(f, ty, x * y);
+                    return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_MUL, ty, aa, b), k2);
+                }
                 if ((y & (y - 1)) == 0 && (ty == IT_I64 || y < 0x80000000UL))
                     return ir_ins(f, OP_SHL, ty, a, ir_const(f, ty, log2u64(y)));
                 {
@@ -987,8 +996,10 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                constant goes outside (and from there into an address) */
             u64 m = umax_of(f, ia->a, 10), k = x & 0xffffffffUL;
             if (m < 0x80000000UL && ((k & 0x80000000UL) || m + k < 0x80000000UL))
-                return ir_ins(f, OP_ADD, IT_I64, ir_ins(f, OP_SEXT32, IT_I64, ia->a, 0),
-                              ir_const(f, IT_I64, (u64)(i64)(i32)(u32)k));
+            {
+                u32 aa = ia->a, k2 = ir_const(f, IT_I64, (u64)(i64)(i32)(u32)k);
+                return ir_ins(f, OP_ADD, IT_I64, ir_ins(f, OP_SEXT32, IT_I64, aa, 0), k2);
+            }
         }
         /* a value that cannot be negative is zero-extended, which is often free */
         if (ia->op == OP_ZEXT8 || ia->op == OP_ZEXT16 || is_cmp(ia->op) ||

@@ -90,6 +90,16 @@ for src in tests/c/*.c; do
     { "$OUT/${name}_os"; echo "exit $?"; } >"$OUT/${name}_os.out" 2>/dev/null
     if cmp -s "$OUT/${name}_os.out" "tests/c/$name.expect"; then ok; else bad "$name (-Os output)"; fi
 done
+# --- Sums of products rounded once (fmadd), and switches without jump tables ---
+for t in "fma -ffp-contract=fast" "switch -fno-jump-tables"; do
+    name=${t%% *}; flags=${t#* }
+    if "$MCC" $flags -o "$OUT/${name}_fl" "tests/c/$name.c" 2>"$OUT/$name.err"; then
+        { "$OUT/${name}_fl"; echo "exit $?"; } >"$OUT/${name}_fl.out" 2>/dev/null
+        if cmp -s "$OUT/${name}_fl.out" "tests/c/$name.expect"; then ok; else bad "$name ($flags output)"; fi
+    else
+        bad "$name ($flags compile)"
+    fi
+done
 # --- Every C test again at -O3 (vectorisation, more optimisation rounds) ---
 for src in tests/c/*.c; do
     [ -f "$src" ] || continue

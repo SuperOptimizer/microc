@@ -341,8 +341,10 @@ int ir_is_bool(Func *f, u32 v, int depth)
     Ins *i = &f->ins[v];
     if ((i->op >= OP_EQ && i->op <= OP_UGE) || (i->op >= OP_FEQ && i->op <= OP_FGE))
         return 1;
-    if ((i->op == OP_AND || i->op == OP_OR) && depth)
-        return ir_is_bool(f, i->a, depth - 1) && ir_is_bool(f, i->b, depth - 1);
+    if (i->op == OP_AND && depth) /* (of 0 or 1 and anything) */
+        return ir_is_bool(f, i->b, depth - 1) || ir_is_bool(f, i->a, depth - 1);
+    if (i->op == OP_OR && depth)
+        return ir_is_bool(f, i->b, depth - 1) && ir_is_bool(f, i->a, depth - 1);
     return 0;
 }
 
@@ -553,6 +555,58 @@ static u32 div_const(Func *f, int sgn, int ty, u32 a, u64 c)
 #define DEV_SUMS ((opt_dev_fn || opt_dev_parse) && !opt_noselk && (ty == IT_I32 || ty == IT_I64))
 
 /* v is the low 16 bits of a 32-bit x, or (high) its high 16, as a whole number: x, or 0. */
+/* A bound of the 32-bit value v read as an unsigned number: v <= the result. */
+static u64 umax_of(Func *f, u32 v, int depth)
+{
+    Ins *i = &f->ins[v];
+    u64 c, m, n, full = 0xffffffffUL;
+    if (i->ty != IT_I32)
+        return full;
+    if (ir_is_const(f, v, &c))
+        return c & full;
+    if (is_cmp(i->op) || (i->op >= OP_FEQ && i->op <= OP_FGE))
+        return 1;
+    if (i->op == OP_ZEXT8 || (i->op == OP_LOAD && i->mem == M_8U))
+        return 255;
+    if (i->op == OP_ZEXT16 || (i->op == OP_LOAD && i->mem == M_16U))
+        return 65535;
+    if (!depth)
+        return full;
+    switch (i->op) {
+    case OP_AND:
+        m = umax_of(f, i->a, depth - 1);
+        n = umax_of(f, i->b, depth - 1);
+        return m < n ? m : n;
+    case OP_SHR:
+        return ir_is_const(f, i->b, &c) && c < 32 ? umax_of(f, i->a, depth - 1) >> c : full;
+    case OP_SAR: /* (of a number that is not negative) */
+        m = umax_of(f, i->a, depth - 1);
+        return ir_is_const(f, i->b, &c) && c < 32 && m < 0x80000000UL ? m >> c : full;
+    case OP_UDIV:
+        return ir_is_const(f, i->b, &c) && (c & full) ? umax_of(f, i->a, depth - 1) / (c & full) : full;
+    case OP_UREM:
+        return ir_is_const(f, i->b, &c) && (c & full) ? (c & full) - 1 : full;
+    case OP_SHL:
+        if (!ir_is_const(f, i->b, &c) || c >= 32)
+            return full;
+        m = umax_of(f, i->a, depth - 1) << c;
+        return m < full ? m : full;
+    case OP_MUL:
+        m = umax_of(f, i->a, depth - 1);
+        n = umax_of(f, i->b, depth - 1);
+        return m < 0x10000 && n < 0x10000 ? m * n : full; /* (the product of two bounds below 2^16 fits) */
+    case OP_ADD:
+        m = umax_of(f, i->a, depth - 1) + umax_of(f, i->b, depth - 1);
+        return m < full ? m : full;
+    case OP_SELECT:
+        m = umax_of(f, i->b, depth - 1);
+        n = umax_of(f, i->c, depth - 1);
+        return m > n ? m : n;
+    default:
+        return full;
+    }
+}
+
 static u32 half_of(Func *f, u32 v, int high)
 {
     Ins *i = &f->ins[v];
@@ -571,6 +625,40 @@ static u32 half_of(Func *f, u32 v, int high)
 }
 
 /* Returns a value equivalent to the operation, or 0 if none is known. */
+/* A comparison of some value with a constant, read as a bound on the value: returns 1 for "x >= *k",
+   2 for "x <= *k", 0 for neither. With below set the question is which values fail the test instead
+   (so "x < 5" is the bound x >= 5). *uns tells whether the order is the unsigned one. */
+static int bound_of(Func *f, u32 c, int below, u32 *x, u64 *k, int *uns)
+{
+    Ins *i = &f->ins[c];
+    int op = i->op, w, ty;
+    u64 v, top, bot;
+    if (op < OP_SLT || op > OP_UGE || !ir_is_const(f, i->b, &v))
+        return 0;
+    ty = f->ins[i->a].ty;
+    w = ty == IT_I64;
+    if (ty != IT_I32 && !w)
+        return 0;
+    *uns = op >= OP_ULT;
+    if (*uns) {
+        op -= OP_ULT - OP_SLT;
+        if (!w)
+            v = (u32)v;
+        bot = 0;
+        top = w ? ~(u64)0 : 0xffffffffUL;
+    } else {
+        bot = w ? (u64)1 << 63 : (u64)(i64)(-0x7fffffffL - 1);
+        top = w ? ~(u64)0 >> 1 : 0x7fffffffUL;
+    }
+    if (below) /* the test that fails where this one holds */
+        op = op == OP_SLT ? OP_SGE : op == OP_SLE ? OP_SGT : op == OP_SGT ? OP_SLE : OP_SLT;
+    if ((op == OP_SGT && v == top) || (op == OP_SLT && v == bot))
+        return 0;
+    *x = i->a;
+    *k = op == OP_SGT ? v + 1 : op == OP_SLT ? v - 1 : v;
+    return op == OP_SGT || op == OP_SGE ? 1 : 2;
+}
+
 static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
 {
     Ins *ia = &f->ins[a], *ib = &f->ins[b];
@@ -590,16 +678,36 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
         }
         if (ca && !cb && (op == OP_ADD || op == OP_MUL || op == OP_AND || op == OP_OR || op == OP_XOR))
             return ir_ins(f, op, ty, b, a);
+        if (op == OP_SUB && ca && !(ty == IT_I32 ? (u32)x : x))
+            return ir_ins(f, OP_NEG, ty, b, 0);
         if (a == b && !ca) {
             if (op == OP_SUB || op == OP_XOR)
                 return ir_const(f, ty, 0);
             if (op == OP_AND || op == OP_OR)
                 return a;
         }
+        if (op == OP_AND && ty == IT_I32 && !ca && !cb) {
+            /* x >= 0 && x < c, c a constant that is not negative: one unsigned comparison */
+            int k;
+            for (k = 0; k < 2; k++) {
+                Ins *lo = k ? ib : ia, *hi = k ? ia : ib;
+                u64 c0, c1;
+                int w64 = f->ins[lo->a].ty == IT_I64;
+                if (!((lo->op == OP_SGE && ir_is_const(f, lo->b, &c0) && c0 == 0) ||
+                      (lo->op == OP_SGT && ir_is_const(f, lo->b, &c0) && c0 == (w64 ? ~(u64)0 : 0xffffffffUL))))
+                    continue;
+                if ((hi->op != OP_SLT && hi->op != OP_SLE) || hi->a != lo->a || !ir_is_const(f, hi->b, &c1) ||
+                    (c1 >> (w64 ? 63 : 31)) != 0)
+                    continue;
+                return ir_ins(f, hi->op == OP_SLT ? OP_ULT : OP_ULE, IT_I32, hi->a, hi->b);
+            }
+        }
         if (op == OP_ADD && !ca && !cb && DEV_SUMS) {
             /* device code: (x + k) + y is (x + y) + k: sums that differ in a constant share the rest, and the
                constant goes into an address */
             int k;
+            if (a > b && !opt_nodist)
+                return ir_ins(f, op, ty, b, a); /* (one order, so that equal sums are seen to be equal) */
             for (k = 0; k < 2; k++) {
                 Ins *in = k ? ib : ia;
                 u32 o = k ? a : b, p;
@@ -607,6 +715,21 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                     p = in->a;
                     return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_ADD, ty, p < o ? p : o, p < o ? o : p), ir_const(f, ty, r));
                 }
+            }
+        }
+        if ((op == OP_AND || op == OP_OR) && ty == IT_I32 && !ca && !cb && !opt_dev_fn && !opt_dev_parse) {
+            /* lo <= x && x <= hi is x - lo <= hi - lo, unsigned: one comparison. Likewise
+               x < lo || x > hi, the values the first leaves out. */
+            u32 xa, xb;
+            u64 ka, kb;
+            int ua, ub, below = op == OP_OR;
+            int ba = bound_of(f, a, below, &xa, &ka, &ua), bb = bound_of(f, b, below, &xb, &kb, &ub);
+            if (ba && bb && ba != bb && xa == xb && ua == ub) {
+                u64 lo = ba == 1 ? ka : kb, hi = ba == 1 ? kb : ka;
+                int xt = f->ins[xa].ty;
+                if (ua ? lo <= hi : (i64)lo <= (i64)hi)
+                    return ir_ins(f, below ? OP_UGT : OP_ULE, IT_I32,
+                                  ir_ins(f, OP_SUB, xt, xa, ir_const(f, xt, lo)), ir_const(f, xt, hi - lo));
             }
         }
         if (op == OP_OR && ty == IT_I32 && !ca && !cb) {
@@ -647,12 +770,16 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
             case OP_SAR:
                 if (y == 0)
                     return a;
+                if (op == OP_SHL && DEV_SUMS && !opt_nodist && ia->op == OP_ADD && ir_is_const(f, ia->b, &x) && y < 32)
+                    return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_SHL, ty, ia->a, b), ir_const(f, ty, x << y));
                 break;
             case OP_MUL:
                 if (y == 1)
                     return a;
                 if (y == 0)
                     return b;
+                if (DEV_SUMS && !opt_nodist && ia->op == OP_ADD && ir_is_const(f, ia->b, &x)) /* (x + k) c is x c + k c */
+                    return ir_ins(f, OP_ADD, ty, ir_ins(f, OP_MUL, ty, ia->a, b), ir_const(f, ty, x * y));
                 if ((y & (y - 1)) == 0 && (ty == IT_I64 || y < 0x80000000UL))
                     return ir_ins(f, OP_SHL, ty, a, ir_const(f, ty, log2u64(y)));
                 {
@@ -709,6 +836,10 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                     return b;
                 if (y == ~(u64)0)
                     return a;
+                if ((ia->op == OP_ZEXT8 && (y & 0xff) == 0xff) || (ia->op == OP_ZEXT16 && (y & 0xffff) == 0xffff) ||
+                    ((y & 1) && ty == IT_I32 && ir_is_bool(f, a, 8)) ||
+                    (ia->op == OP_AND && ir_is_const(f, ia->b, &x) && (x & y) == x))
+                    return a; /* the bits taken away are zeros already */
                 if (ty == IT_I32 && ia->op == OP_SHR && ir_is_const(f, ia->b, &x) && x > 0 && x < 32 &&
                     (y & (0xffffffffUL >> x)) == 0xffffffffUL >> x)
                     return a; /* the bits taken away are zeros already */
@@ -756,7 +887,7 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
             }
             if (ia->op >= OP_FLT && ia->op <= OP_FGE && op == OP_NE)
                 return a;
-            if (op == OP_NE && ir_is_bool(f, a, 3))
+            if (op == OP_NE && ir_is_bool(f, a, 8))
                 return a;
         }
         return 0;
@@ -832,6 +963,14 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
     case OP_SEXT32:
         if (ir_is_const(f, a, &x))
             return ir_const(f, IT_I64, (u64)(i64)(i32)(u32)x);
+        if ((opt_dev_fn || opt_dev_parse) && !opt_nodist && ia->op == OP_ADD && ir_is_const(f, ia->b, &x)) {
+            /* device code: a sum of a number known to be small and a constant does not wrap, and the
+               constant goes outside (and from there into an address) */
+            u64 m = umax_of(f, ia->a, 10), k = x & 0xffffffffUL;
+            if (m < 0x80000000UL && ((k & 0x80000000UL) || m + k < 0x80000000UL))
+                return ir_ins(f, OP_ADD, IT_I64, ir_ins(f, OP_SEXT32, IT_I64, ia->a, 0),
+                              ir_const(f, IT_I64, (u64)(i64)(i32)(u32)k));
+        }
         /* a value that cannot be negative is zero-extended, which is often free */
         if (ia->op == OP_ZEXT8 || ia->op == OP_ZEXT16 || is_cmp(ia->op) ||
             (ia->op == OP_LOAD && (ia->mem == M_8U || ia->mem == M_16U)) ||
@@ -897,6 +1036,13 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
                 memcpy(&d, &nan, sizeof d);
             }
             return ir_fconst(f, ty, d);
+        }
+        if (op == OP_FMUL && !opt_dev_fn && !opt_dev_parse) {
+            /* twice x is x + x, exactly, and an addition is quicker */
+            if (ir_is_fconst(f, a, &dx) && dx == 2.0)
+                return ir_ins(f, OP_FADD, ty, b, b);
+            if (ir_is_fconst(f, b, &dy) && dy == 2.0)
+                return ir_ins(f, OP_FADD, ty, a, a);
         }
         return 0;
     case OP_FEQ:

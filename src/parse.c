@@ -187,7 +187,42 @@ static const char *cur_fn_name = "";
 static void nlazy_reset(void);
 static u32 shared_seq;
 static int cur_fn_dev;  /* CUDA: the function being read is device code */
-static u32 nsw_val, nsw_blk; /* the last sum or difference of ints, and the block it was worked out in */
+/* The sums and differences of ints worked out lately, and the blocks they were worked out in: such a one
+   did not wrap around where it stands (or nothing is promised), which lets an index be made wider part by
+   part. Only what the folder left as it was written is noted: of a sum it put in another order nothing is
+   known. */
+#define NNSW 16
+static u32 nsw_vals[NNSW], nsw_blks[NNSW], nsw_at;
+
+static int is_nsw(u32 v)
+{
+    int k;
+    for (k = 0; k < NNSW; k++)
+        if (nsw_vals[k] == v && nsw_blks[k] == F->cur)
+            return v != 0;
+    return 0;
+}
+
+/* p + sign * size * v, the int v made wider part by part where it is a sum that did not wrap. */
+static u32 add_index(u32 p, u32 v, int minus, u64 size, int depth)
+{
+    Ins *i = &F->ins[v];
+    u64 k;
+    u32 x;
+    if (ir_is_const(F, v, &k)) {
+        i64 off = (i64)(i32)(u32)k * (i64)size;
+        return ir_ins(F, OP_ADD, IT_I64, p, ir_const(F, IT_I64, (u64)(minus ? -off : off)));
+    }
+    if (depth && i->ty == IT_I32 && (i->op == OP_ADD || i->op == OP_SUB) && is_nsw(v)) {
+        u32 a = i->a, b = i->b;
+        int sub = i->op == OP_SUB;
+        p = add_index(p, a, minus, size, depth - 1);
+        return add_index(p, b, minus ^ sub, size, depth - 1);
+    }
+    x = ir_ins(F, OP_SEXT32, IT_I64, v, 0);
+    x = ir_ins(F, OP_MUL, IT_I64, x, ir_const(F, IT_I64, size));
+    return ir_ins(F, minus ? OP_SUB : OP_ADD, IT_I64, p, x);
+}
 static int cur_fn_kernel; /* CUDA: and a kernel, whose code is only ever PTX */
 static int launch_stop; /* CUDA: reading the <<<...>>> of a kernel launch, where >> ends an expression */
 static struct Launch {
@@ -1552,20 +1587,19 @@ static void binop(int op, Expr *l, Expr *r, u32 loc)
             }
             if (!type_is_int(r->ty))
                 error_at(loc, "invalid operands to pointer arithmetic");
+            /* p + (a + b), where a + b was an int's sum just now (one that does not wrap): p + a + b, each made
+               wider by itself: a constant goes into the address, what does not change in a loop is added
+               outside it, and a loop's counter is an index by itself. (Host code: only with MCC_WIDEN, the loops that
+                   gain being fewer than the indices that cost an addition more.) */
             {
-                /* device code: in p + (i + k), where i + k was an int's sum just now (one that does not wrap, or
-                   nothing is promised), the constant is taken out of the index, to go into the address */
-                Ins *ri = &F->ins[r->v];
-                u64 k;
-                if (opt_dev_parse && !opt_noselk && !vsize && r->ty->kind == TY_INT && r->v == nsw_val && nsw_blk == F->cur &&
-                    ri->op == OP_ADD && ri->ty == IT_I32 && ir_is_const(F, ri->b, &k)) {
-                    u32 x = ir_ins(F, OP_SEXT32, IT_I64, ri->a, 0);
-                    i64 off = (i64)(i32)(u32)k * (i64)size;
-                    x = ir_ins(F, OP_MUL, IT_I64, x, ir_const(F, IT_I64, size));
-                    l->v = ir_ins(F, op == T_PLUS ? OP_ADD : OP_SUB, IT_I64, l->v, x);
-                    l->v = ir_ins(F, OP_ADD, IT_I64, l->v, ir_const(F, IT_I64, (u64)(op == T_PLUS ? off : -off)));
+                u64 nk = 0;
+                if (opt_nowiden != 1 && !vsize && r->ty->kind == TY_INT && is_nsw(r->v) &&
+                    (F->ins[r->v].op == OP_ADD || F->ins[r->v].op == OP_SUB) && F->ins[r->v].ty == IT_I32 &&
+                    (opt_dev_parse ? ir_is_const(F, F->ins[r->v].b, &nk) : opt_nowiden == 2)) {
+                    l->v = add_index(l->v, r->v, op != T_PLUS, size, opt_dev_parse ? 1 : 4);
                     return;
                 }
+                (void)nk;
             }
             convert(r, ty_long);
             r->v = ir_ins(F, OP_MUL, IT_I64, r->v, vsize ? vsize : ir_const(F, IT_I64, size));
@@ -1638,10 +1672,19 @@ static void binop(int op, Expr *l, Expr *r, u32 loc)
         l->v = ir_ins(F, irop, IT_I32, l->v, r->v);
         l->ty = ty_int;
     } else {
-        l->v = ir_ins(F, irop, it, l->v, r->v);
-        if (irop == OP_ADD || irop == OP_SUB) {
-            nsw_val = t->kind == TY_INT ? l->v : 0;
-            nsw_blk = F->cur;
+        {
+            u32 la = l->v, rb = r->v;
+            Ins *ni;
+            u64 c1, c2;
+            l->v = ir_ins(F, irop, it, l->v, r->v);
+            ni = &F->ins[l->v];
+            if ((irop == OP_ADD || irop == OP_SUB) && t->kind == TY_INT &&
+                ((ni->op == irop && ((ni->a == la && ni->b == rb) || (irop == OP_ADD && ni->a == rb && ni->b == la))) ||
+                 (irop == OP_SUB && ni->op == OP_ADD && ni->a == la && ir_is_const(F, rb, &c1) && ir_is_const(F, ni->b, &c2) &&
+                  (u32)c2 == (u32)(0 - c1) && (u32)c1 != 0x80000000UL))) {
+                nsw_vals[nsw_at % NNSW] = l->v;
+                nsw_blks[nsw_at++ % NNSW] = F->cur;
+            }
         }
         if (t->kind == TY_FLOAT16)
             l->v = rt_call("__mcc_fround16", ty_float, ty_float, l->v);
@@ -2204,6 +2247,27 @@ static u32 x64_arg(Expr *a, u32 *args, u32 nargs, u32 *ngr, u32 *nfr)
 }
 
 /* The parameter p of type pt, a record or a 128-bit integer, of the function being started. */
+/* Is the doubleword at off of an object of type t a pointer? (A kernel's parameters come from the host, and
+   the pointers among them, also those inside its structures, are to global memory.) */
+static int ptr_word(Type *t, u64 off)
+{
+    Field *fl;
+    if (t->kind == TY_PTR)
+        return off == 0;
+    if (t->kind == TY_ARRAY) {
+        u64 es = type_size(t->base);
+        return es && off < es * t->len ? ptr_word(t->base, off % es) : 0;
+    }
+    if (t->kind != TY_STRUCT)
+        return 0;
+    if (t->canon)
+        t = t->canon;
+    for (fl = t->fields; fl; fl = fl->next)
+        if (!fl->bitwidth && off >= fl->off && off < fl->off + type_size(fl->ty))
+            return ptr_word(fl->ty, off - fl->off);
+    return 0;
+}
+
 static void x64_param(Sym *p, Type *pt)
 {
     int sse[2];
@@ -2222,8 +2286,10 @@ static void x64_param(Sym *p, Type *pt)
         p->slot = ir_new_slot(F, 8 * words, type_align(pt) > 8 ? type_align(pt) : 8);
         for (k = 0; k < words; k++) {
             int it = !sse[k] ? IT_I64 : size - 8 * k >= 8 ? IT_F64 : IT_F32;
-            ir_store(F, it == IT_I64 ? M_64 : it == IT_F64 ? M_F64 : M_F32, ir_slot_addr(F, p->slot, 8 * k),
-                     ir_add_param(F, it));
+            v = ir_add_param(F, it);
+            if (cur_fn_kernel && it == IT_I64 && type_is_record(pt) && ptr_word(pt, 8 * (u64)k) && F->ins[v].op == OP_PARAM)
+                F->ins[v].mem = PARAM_GLOBAL;
+            ir_store(F, it == IT_I64 ? M_64 : it == IT_F64 ? M_F64 : M_F32, ir_slot_addr(F, p->slot, 8 * k), v);
         }
         cur_named_gr += gr;
         cur_named_fr += fr;
@@ -2240,6 +2306,8 @@ static void x64_param(Sym *p, Type *pt)
                 F->param_ty[F->nparams - 1] = 0x40;
             else
                 F->param_ty[F->nparams - 1] |= 0x80 | (type_align(pt) > 8 ? 0x20 : 0);
+            if (type_is_record(pt) && ptr_word(pt, 8 * (u64)k) && F->ins[v].op == OP_PARAM)
+                F->ins[v].mem = PARAM_GLOBAL;
             ir_store(F, M_64, ir_slot_addr(F, p->slot, 8 * k), v);
         }
         return;
@@ -10021,6 +10089,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         F = const_func;
         return;
     }
+    ptx_obj = O;
     opt_run(F);
     if (opt_dump_ir) {
         ir_dump(F);
@@ -10162,6 +10231,7 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
 {
     Sym *s;
     O = o;
+    ptx_obj = o;
     opt_obj = o;
     opt_dump_ir = dump_ir;
     nasm_stmts = 0; /* the texts and operand lists of the last file are not reclaimed */

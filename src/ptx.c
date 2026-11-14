@@ -36,7 +36,7 @@ extern char opt_cuda_target[24];
 int opt_dev_fn;
 int opt_nounroll, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
-int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noselk, opt_noglobal, opt_premat;
+int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
 u32 ptx_maxntid;
 static u32 *byoff;     /* of an OP_BYVAL: where in the frame its copy is */
 static u32 *hostsyms;  /* host objects the device code addresses */
@@ -55,6 +55,9 @@ static u32 nreg[4];
 static const char *special_load(u32 v);
 static u8 *cuse; /* how many of the readers of a value read it as a condition */
 static u8 *used;
+static u8 *ptree; /* a sum or product of truth values that is worked out in predicate registers: 1; 2: and has no register */
+static u8 *xrem; /* a 32-bit number made wider, read in another block than it is made in: made wider again where it is
+                      read, so that it is the 32-bit number that stays in a register (one, not two) on the way */
 static u8 *nuse;  /* how many times a value is read, up to 255 */
 static u8 *fuse;  /* see fuse_find */
 static u8 *fused; /* a product that became part of a fused operation: not computed by itself */
@@ -291,6 +294,11 @@ static const char *reg(u32 v)
         return addr_const(v);
     if (remat && premat && PF->ins[v].op == OP_PARAM)
         return param_const(v);
+    if (remat && xrem && xrem[v]) {
+        const char *t = temp(cls_of(IT_I64)), *a = reg(PF->ins[v].a);
+        P("\tcvt.%s %s, %s;\n", PF->ins[v].op == OP_SEXT32 ? "s64.s32" : "u64.u32", t, a);
+        return t;
+    }
     s = obuf();
     c = cls_of(PF->ins[v].ty);
     if (!regno[v])
@@ -746,8 +754,8 @@ static int is_compare(int op)
     return (op >= OP_EQ && op <= OP_UGE) || (op >= OP_FEQ && op <= OP_FGE);
 }
 
-/* Sets %p0 from the comparison v. */
-static void set_pred(u32 v)
+/* Sets %p<n> from the comparison v. */
+static void set_pred_n(u32 v, int n)
 {
     Ins *i = &PF->ins[v];
     int oty = PF->ins[RV(i->a)].ty;
@@ -770,7 +778,63 @@ static void set_pred(u32 v)
     case OP_FGT: c = "gt"; t = fty(oty); break;
     default: c = "ge"; t = fty(oty); break;
     }
-    P("\tsetp.%s.%s %%p0, %s, %s;\n", c, t, ropnd(i->a), opnd(i->b));
+    P("\tsetp.%s.%s %%p%d, %s, %s;\n", c, t, n, ropnd(i->a), opnd(i->b));
+}
+
+static void set_pred(u32 v)
+{
+    set_pred_n(v, 0);
+}
+
+/* "and" and "or" of truth values, in predicate registers as nvcc has them: a tree whose leaves are
+   comparisons (done where the tree is wanted, like a lone comparison) and numbers that are 0 or 1.
+   pred_need: the predicate registers a tree takes when the operand that takes more goes first. */
+static int pred_need(u32 v, int root)
+{
+    Ins *i;
+    int l, r;
+    v = RV(v);
+    i = &PF->ins[v];
+    if ((is_compare(i->op) && i->blk) || !(ptree[v] == 2 || (root && ptree[v])))
+        return 1;
+    l = pred_need(i->a, 0);
+    r = pred_need(i->b, 0);
+    return l == r ? l + 1 : l > r ? l : r;
+}
+
+static void pred_into(u32 v, int n, int root)
+{
+    Ins *i;
+    v = RV(v);
+    i = &PF->ins[v];
+    if (is_compare(i->op) && i->blk) {
+        set_pred_n(v, n);
+    } else if (ptree[v] == 2 || (root && ptree[v])) {
+        u32 a = i->a, b = i->b;
+        if (pred_need(b, 0) > pred_need(a, 0)) {
+            a = i->b;
+            b = i->a;
+        }
+        if (n >= 14)
+            die("ptx: %s: a condition too deep", fname);
+        pred_into(a, n, 0);
+        pred_into(b, n + 1, 0);
+        P("\t%s.pred %%p%d, %%p%d, %%p%d;\n", i->op == OP_AND ? "and" : "or", n, n, n + 1);
+    } else {
+        P("\tsetp.ne.%s %%p%d, %s, 0;\n", ity(i->ty, 'b'), n, ropnd(v));
+    }
+}
+
+/* Is v the result of a comparison, or an "and" or "or" of such? */
+static int pred_bool(u32 v, int depth)
+{
+    Ins *i;
+    v = RV(v);
+    i = &PF->ins[v];
+    if (is_compare(i->op) && i->blk)
+        return 1;
+    return (i->op == OP_AND || i->op == OP_OR) && i->ty == IT_I32 && i->blk && depth && pred_bool(i->a, depth - 1) &&
+           pred_bool(i->b, depth - 1);
 }
 
 /* Sets %p0 to "v is not zero"; a comparison is done over again here, its operands being still at hand. */
@@ -779,6 +843,8 @@ static void cond_pred(u32 v)
     v = RV(v);
     if (is_compare(PF->ins[v].op) && PF->ins[v].blk)
         set_pred(v);
+    else if (ptree[v] == 2)
+        pred_into(v, 0, 0);
     else
         P("\tsetp.ne.%s %%p0, %s, 0;\n", ity(PF->ins[v].ty, 'b'), ropnd(v));
 }
@@ -816,6 +882,34 @@ static const Intrin intrins[] = {
     {0, 0}
 };
 
+/* Is the call v one that becomes an instruction or two of arithmetic (see intrins)? Asked while the
+   function is optimised: such a call may be made where its result is not wanted (if-conversion). */
+Obj *ptx_obj;
+
+int ptx_pure_call(Func *f, u32 v)
+{
+    Ins *i = &f->ins[v], *c;
+    const Intrin *in;
+    const char *name;
+    PSig *s;
+    u32 callee = i->c;
+    if (i->op != OP_CALL || (i->flags & (IF_ASM | IF_ALLOCA)) || !ptx_obj)
+        return 0;
+    while (f->ins[callee].op == OP_COPY)
+        callee = f->ins[callee].a;
+    c = &f->ins[callee];
+    if (c->op != OP_ADDR || c->b || !ptx_obj->syms[c->a].name)
+        return 0;
+    s = sig_find(c->a);
+    if (s && (s->defined || s->entry))
+        return 0;
+    name = intern_str(ptx_obj->syms[c->a].name);
+    for (in = intrins; in->name; in++)
+        if (strcmp(in->name, name) == 0)
+            return 1;
+    return 0;
+}
+
 /* Writes a template, with $d, $0.. or %0.. replaced by operands. */
 static void expand(const char *t, char mark, const char *dst, const char **ops, u32 nops)
 {
@@ -852,16 +946,126 @@ static void expand(const char *t, char mark, const char *dst, const char **ops, 
    MCC_NOGLOBAL turns this off. */
 static u8 *gl_s; /* the value is such an address */
 
+/* The addresses that are of the function's own stack whichever way they are reached: a local object's, and
+   what is computed from one. Read and written as local memory (ld.local, st.local), as nvcc does. */
+static u8 *lc_s;
+
+static void lc_find(Func *f)
+{
+    u32 v, k;
+    int changed;
+    memset(lc_s, 0, f->nins + 1);
+    do {
+        changed = 0;
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            int is = 0;
+            if (lc_s[v] || i->ty != IT_I64)
+                continue;
+            if (i->op == OP_SLOT)
+                is = 1;
+            else if (!i->blk)
+                continue;
+            else if (i->op == OP_BYVAL)
+                is = 1;
+            else if (i->op == OP_ADD)
+                is = lc_s[RV(i->a)] || lc_s[RV(i->b)];
+            else if (i->op == OP_SUB)
+                is = lc_s[RV(i->a)];
+            else if (i->op == OP_SELECT)
+                is = lc_s[RV(i->b)] || lc_s[RV(i->c)];
+            else if (i->op == OP_PHI)
+                for (k = 0; k < i->b; k++)
+                    is |= lc_s[RV(f->xargs[i->a + k])];
+            if (is) {
+                lc_s[v] = 1;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    do {
+        changed = 0;
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            int ok = 1;
+            if (!lc_s[v] || i->op == OP_SLOT || i->op == OP_BYVAL)
+                continue;
+            if (i->op == OP_ADD) {
+                ok = lc_s[RV(i->a)] != lc_s[RV(i->b)];
+            } else if (i->op == OP_SUB) {
+                ok = lc_s[RV(i->a)] && !lc_s[RV(i->b)];
+            } else if (i->op == OP_SELECT) {
+                ok = lc_s[RV(i->b)] && lc_s[RV(i->c)];
+            } else {
+                for (k = 0; k < i->b; k++)
+                    if (!lc_s[RV(f->xargs[i->a + k])])
+                        ok = 0;
+            }
+            if (!ok) {
+                lc_s[v] = 0;
+                changed = 1;
+            }
+        }
+    } while (changed);
+}
+
+/* The address a (a register, perhaps with a constant) of local memory, as local memory wants it. */
+static const char *lc_addr(const char *a)
+{
+    static char out[96];
+    const char *plus = strchr(a, '+'), *t;
+    if (strncmp(a, "%SP", 3) == 0 && (a[3] == '+' || !a[3])) {
+        sprintf(out, "%%SPL%s", a + 3);
+        return out;
+    }
+    t = temp(cls_of(IT_I64));
+    if (plus) {
+        char r[48];
+        size_t n = (size_t)(plus - a);
+        memcpy(r, a, n);
+        r[n] = 0;
+        P("\tcvta.to.local.u64 %s, %s;\n", t, r);
+        sprintf(out, "%s%s", t, plus);
+    } else {
+        P("\tcvta.to.local.u64 %s, %s;\n", t, a);
+        sprintf(out, "%s", t);
+    }
+    return out;
+}
+
+/* (a pointer that is one of several is of global memory when the others are, or are null) */
+#define GL_OR_NULL(x) (gl_s[x] || (f->ins[x].op == OP_CONST && !f->ins[x].a && !f->ins[x].b))
 static void gl_find(Func *f)
 {
     u32 v, k;
     int changed;
-    for (v = 1; v < f->nins; v++) {
-        Ins *i = &f->ins[v];
-        gl_s[v] = i->blk && i->ty == IT_I64 &&
-                  ((i->op == OP_PARAM && i->mem == PARAM_GLOBAL) || i->op == OP_ADD || i->op == OP_SUB || i->op == OP_PHI ||
-                   i->op == OP_SELECT);
-    }
+    /* first what is computed from a pointer parameter at all (the least such set: a number that is counted
+       up from 0 is not in it), then, among those, what is so computed whichever way it is reached */
+    memset(gl_s, 0, f->nins + 1);
+    do {
+        changed = 0;
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            int is = 0;
+            if (gl_s[v] || !i->blk || i->ty != IT_I64)
+                continue;
+            if (i->op == OP_PARAM)
+                is = i->mem == PARAM_GLOBAL;
+            else if (i->op == OP_ADD)
+                is = gl_s[RV(i->a)] || gl_s[RV(i->b)];
+            else if (i->op == OP_SUB)
+                is = gl_s[RV(i->a)];
+            else if (i->op == OP_SELECT)
+                is = gl_s[RV(i->b)] || gl_s[RV(i->c)];
+            else if (i->op == OP_PHI)
+                for (k = 0; k < i->b; k++)
+                    is |= gl_s[RV(f->xargs[i->a + k])];
+            if (is) {
+                gl_s[v] = 1;
+                changed = 1;
+            }
+        }
+    } while (changed);
     do {
         changed = 0;
         for (v = 1; v < f->nins; v++) {
@@ -874,10 +1078,10 @@ static void gl_find(Func *f)
             } else if (i->op == OP_SUB) {
                 ok = gl_s[RV(i->a)] && !gl_s[RV(i->b)];
             } else if (i->op == OP_SELECT) {
-                ok = gl_s[RV(i->b)] && gl_s[RV(i->c)];
+                ok = GL_OR_NULL(RV(i->b)) && GL_OR_NULL(RV(i->c));
             } else {
                 for (k = 0; k < i->b; k++)
-                    if (!gl_s[RV(f->xargs[i->a + k])])
+                    if (!GL_OR_NULL(RV(f->xargs[i->a + k])))
                         ok = 0;
             }
             if (!ok) {
@@ -952,7 +1156,9 @@ static void emit_asm(u32 v)
             if (!r)
                 r = temp(cls_of(o->ty));
             if (o->out == 2) {
-                P("\t%s %s, %s;\n", mov_of(o->ty), r, opnd(PF->xargs[i->a + a]));
+                const char *from = opnd(PF->xargs[i->a + a]);
+                if (strcmp(from, r))
+                    P("\t%s %s, %s;\n", mov_of(o->ty), r, from);
                 a++;
             }
             if (o->cls == 'h') {
@@ -1035,6 +1241,8 @@ static void emit_call(u32 v)
     if (!s || (!s->defined && !s->entry)) {
         for (in = intrins; in->name; in++)
             if (strcmp(in->name, name) == 0) {
+                if (!used[v])
+                    return; /* arithmetic that nothing reads */
                 for (k = 0; k < i->b; k++)
                     args[k] = opnd(PF->xargs[i->a + k]);
                 expand(opt_fastmath && strcmp(name, "sqrtf") == 0 ? "sqrt.approx.ftz.f32 $d, $0;" : in->tmpl, '$',
@@ -1252,8 +1460,19 @@ static void emit_ins(u32 v)
             return;
         P("\trem.%s %s, %s, %s;\n", ity(ty, 'u'), reg(v), ropnd(i->a), opnd(i->b));
         return;
-    case OP_AND: P("\tand.%s %s, %s, %s;\n", ity(ty, 'b'), reg(v), ropnd(i->a), opnd(i->b)); return;
-    case OP_OR: P("\tor.%s %s, %s, %s;\n", ity(ty, 'b'), reg(v), ropnd(i->a), opnd(i->b)); return;
+    case OP_AND: case OP_OR:
+        if (ptree[v] == 2)
+            return;
+        if (ptree[v]) {
+            pred_into(v, 0, 1);
+            P("\tselp.b32 %s, 1, 0, %%p0;\n", reg(v));
+            return;
+        }
+        if (i->op == OP_AND) {
+            P("\tand.%s %s, %s, %s;\n", ity(ty, 'b'), reg(v), ropnd(i->a), opnd(i->b));
+            return;
+        }
+        P("\tor.%s %s, %s, %s;\n", ity(ty, 'b'), reg(v), ropnd(i->a), opnd(i->b)); return;
     case OP_XOR: P("\txor.%s %s, %s, %s;\n", ity(ty, 'b'), reg(v), ropnd(i->a), opnd(i->b)); return;
     case OP_SHL:
     case OP_SHR:
@@ -1305,8 +1524,11 @@ static void emit_ins(u32 v)
     case OP_ZEXT8: P("\tand.%s %s, %s, 255;\n", ity(ty, 'b'), reg(v), ropnd(i->a)); return;
     case OP_ZEXT16: P("\tand.%s %s, %s, 65535;\n", ity(ty, 'b'), reg(v), ropnd(i->a)); return;
     case OP_BITCAST: P("\tmov.b%d %s, %s;\n", ty == IT_I64 || ty == IT_F64 ? 64 : 32, reg(v), ropnd(i->a)); return;
-    case OP_SEXT32: P("\tcvt.s64.s32 %s, %s;\n", reg(v), ropnd(i->a)); return;
-    case OP_ZEXT32: P("\tcvt.u64.u32 %s, %s;\n", reg(v), ropnd(i->a)); return;
+    case OP_SEXT32: case OP_ZEXT32:
+        if (xrem && xrem[v])
+            return;
+        P("\tcvt.%s %s, %s;\n", i->op == OP_SEXT32 ? "s64.s32" : "u64.u32", reg(v), ropnd(i->a));
+        return;
     case OP_TRUNC: P("\tcvt.u32.u64 %s, %s;\n", reg(v), ropnd(i->a)); return;
     case OP_SITOF:
     case OP_UITOF:
@@ -1367,6 +1589,11 @@ static void emit_ins(u32 v)
             return;
         }
         a = maddr(i->a);
+        if (lc_s && lc_s[RV(i->a)]) {
+            a = lc_addr(a);
+            P("\tld.local.%s %s, [%s];\n", lt[i->mem], reg(v), a);
+            return;
+        }
         P("\tld.%s%s %s, [%s];\n", gl_s && gl_s[RV(i->a)] ? "global." : "", lt[i->mem], reg(v), a);
         return;
     }
@@ -1379,6 +1606,11 @@ static void emit_ins(u32 v)
         }
         a = maddr(i->a);
         b = ropnd(i->b);
+        if (lc_s && lc_s[RV(i->a)]) {
+            a = lc_addr(a);
+            P("\tst.local.%s [%s], %s;\n", stt[i->mem], a, b);
+            return;
+        }
         P("\tst.%s%s [%s], %s;\n", gl_s && gl_s[RV(i->a)] ? "global." : "", stt[i->mem], a, b);
         return;
     }
@@ -1456,6 +1688,12 @@ static void edge_moves(u32 p, u32 s, u32 nth)
             continue;
         if (PF->ins[src].op == OP_PHI && PF->ins[src].blk == s && src != v)
             clash = 1;
+        if (regno[src] && PF->ins[src].op == OP_ASMOUT && regno[src] != regno[v]) {
+            u32 u; /* a result that took over a phi's register (coalesce_asm) */
+            for (u = sb->phis; u; u = PF->ins[u].next)
+                if (u != v && used[u] && regno[u] == regno[src] && cls_of(PF->ins[u].ty) == cls_of(PF->ins[src].ty))
+                    clash = 1;
+        }
     }
     for (v = sb->phis; v; v = PF->ins[v].next) {
         u32 src = RV(PF->xargs[PF->ins[v].a + pi]);
@@ -1742,7 +1980,7 @@ static void coalesce(const u8 *live)
                 READ_BY(f->xargs[f->ins[v].a + k], NOSHARE);
         for (v = bb->first; v; v = f->ins[v].next) {
             Ins *i = &f->ins[v];
-            u32 where = is_compare(i->op) || fused[v] || i->op == OP_SELECT || (sh_s && sh_t32[v] && sh_ext(v)) || xlate[v] ? NOSHARE : ++at;
+            u32 where = is_compare(i->op) || ptree[v] || (xrem && xrem[v]) || fused[v] || i->op == OP_SELECT || (sh_s && sh_t32[v] && sh_ext(v)) || xlate[v] ? NOSHARE : ++at;
             pos[v] = ++at;
             if (special_load(v))
                 continue;
@@ -1793,6 +2031,115 @@ static void coalesce(const u8 *live)
 #undef READ_BY
 #undef NOSHARE
     free(pos);
+}
+
+/* An assembly statement's operand that is read and written ("+f": a tensor product's running sums) is
+   given its value by a move before the statement. Where the value read is itself such a result or a phi, of
+   the statement's own block, and nothing else reads it, the result takes its register and there is no move;
+   a sum that a loop carries round then stays in one register all the way. */
+static void coalesce_asm(const u8 *live)
+{
+    Func *f = PF;
+    u32 nb = f->nblk, b, v, k, n, *p;
+    u8 *cnt;
+    if (opt_noasmco)
+        return;
+    cnt = (u8 *)xmalloc(f->nins + 1);
+    memset(cnt, 0, f->nins + 1);
+#define COUNT(x) \
+    do { \
+        u32 x_ = RV(x); \
+        if (x_ && cnt[x_] < 2) \
+            cnt[x_]++; \
+    } while (0)
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                if (RV(f->xargs[f->ins[v].a + k]) != v)
+                    COUNT(f->xargs[f->ins[v].a + k]);
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                COUNT(p[k]);
+            if (i->op == OP_CALL)
+                COUNT(i->c);
+        }
+        if (bb->arg)
+            COUNT(bb->arg);
+    }
+#undef COUNT
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v], *ai;
+            AsmStmt *st;
+            u64 idx;
+            u32 a = 0, x;
+            if (i->op != OP_ASMOUT || regno[v] || !used[v])
+                continue;
+            ai = &f->ins[i->a];
+            if (ai->op != OP_CALL || !(ai->flags & IF_ASM) || ai->blk != b || !ir_is_const(f, ai->c, &idx))
+                continue;
+            st = &asm_stmts[idx];
+            if (i->b >= st->nops || st->ops[i->b].out != 2 || st->ops[i->b].cls == 'h')
+                continue;
+            for (k = 0; k < i->b; k++)
+                if (st->ops[k].kind != 'i' && (!st->ops[k].out || st->ops[k].out == 2))
+                    a++;
+            x = RV(f->xargs[ai->a + a]);
+            if (!x || cnt[x] != 1 || f->ins[x].blk != b || (f->ins[x].op != OP_PHI && f->ins[x].op != OP_ASMOUT) ||
+                cls_of(f->ins[x].ty) != cls_of(i->ty) || !used[x])
+                continue;
+            (void)reg(x);
+            regno[v] = regno[x];
+        }
+    }
+    free(cnt);
+}
+
+/* The name of the function that the call v calls, if it is a plain call of a named function. */
+static const char *callee_name(u32 v)
+{
+    Ins *i = &PF->ins[v], *c;
+    if (i->op != OP_CALL || !i->blk || (i->flags & (IF_ASM | IF_ALLOCA)) || i->b != 1)
+        return 0;
+    c = &PF->ins[RV(i->c)];
+    if (c->op != OP_ADDR || c->b || !PO->syms[c->a].name)
+        return 0;
+    return intern_str(PO->syms[c->a].name);
+}
+
+/* A float that was rounded to a 16-bit float and is then stored as one, or rounded again, is rounded once:
+   the conversion for the store does it (the front end rounds where the type changes and converts where
+   the value is stored). */
+static void round_once(void)
+{
+    Func *f = PF;
+    u32 v;
+    int any = 0;
+    for (v = 1; v < f->nins; v++) {
+        const char *n = callee_name(v), *m;
+        u32 x;
+        if (!n || strncmp(n, "__mcc_f", 7))
+            continue;
+        x = RV(f->xargs[f->ins[v].a]);
+        m = callee_name(x);
+        if (!m)
+            continue;
+        if (((!strcmp(n, "__mcc_f2bf") || !strcmp(n, "__mcc_froundbf")) && !strcmp(m, "__mcc_froundbf")) ||
+            ((!strcmp(n, "__mcc_f2h") || !strcmp(n, "__mcc_fround16")) && !strcmp(m, "__mcc_fround16"))) {
+            f->xargs[f->ins[v].a] = f->xargs[f->ins[x].a];
+            any = 1;
+        }
+    }
+    if (any)
+        opt_dce(f);
 }
 
 /* The place among the PTX parameters of the function's parameter k. */
@@ -1848,6 +2195,42 @@ static void proto(Buf *b, PSig *s, const char *name, int with_names)
 }
 
 /* Writes function f, a kernel (entry) or a device function. */
+/* The thread's and the block's numbers (threadIdx.x and the like) are read once, in the first block: reading
+   one is a slow instruction, a register holds it for nothing, and a load where the source reads it is done
+   again after every store and in every trip around a loop. Only with MCC_SPECIAL1: it measured the same. */
+static void special_once(Func *f)
+{
+    char names[24][48]; /* (copies: the name given is held only while an instruction is written) */
+    u32 first[24], n = 0, v, k, n0 = f->nins, any = 0;
+    if (!f->blk[1].first)
+        return;
+    for (v = 1; v < n0; v++) {
+        const char *nm;
+        if (f->ins[v].op != OP_LOAD || !f->ins[v].blk || (nm = special_load(v)) == 0)
+            continue;
+        for (k = 0; k < n && strcmp(names[k], nm); k++)
+            ;
+        if (k == n) {
+            u32 l;
+            if (n == 24)
+                continue;
+            l = ir_raw(f, OP_LOAD, f->ins[v].ty, f->ins[v].a, 0);
+            f->ins[l].mem = f->ins[v].mem;
+            ir_insert_before(f, f->blk[1].first, l);
+            if (strlen(nm) >= sizeof names[0])
+                continue;
+            strcpy(names[n], nm);
+            first[n++] = l;
+        }
+        ir_replace(f, v, first[k]);
+        any = 1;
+    }
+    if (any) {
+        f->copies = 1;
+        ir_resolve_all(f);
+    }
+}
+
 void ptx_gen(Func *f, Obj *o, int entry)
 {
     u32 b, v, k, n, *p, frame = 0, nb = f->nblk, last_loc = 0;
@@ -1862,6 +2245,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
     PF = f;
     name = pname(f->sym);
     fname = name;
+    if (entry && opt_nospecial1)
+        special_once(f);
     if (entry) {
         if (nkern == capkern) {
             capkern = capkern ? capkern * 2 : 32;
@@ -1874,13 +2259,14 @@ void ptx_gen(Func *f, Obj *o, int entry)
     memset(regno, 0, (f->nins + 1) * sizeof(u32));
     used = (u8 *)xmalloc(f->nins + 1);
     memset(used, 0, f->nins + 1);
-    nuse = (u8 *)xmalloc(6 * (size_t)(f->nins + 1));
-    memset(nuse, 0, 6 * (size_t)(f->nins + 1));
+    nuse = (u8 *)xmalloc(7 * (size_t)(f->nins + 1));
+    memset(nuse, 0, 7 * (size_t)(f->nins + 1));
     fuse = nuse + f->nins + 1;
     fused = fuse + f->nins + 1;
     cuse = fused + f->nins + 1;
     ause = cuse + f->nins + 1;
     xlate = ause + f->nins + 1;
+    ptree = xlate + f->nins + 1;
     slotoff = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32));
     memset(nreg, 0, sizeof nreg);
     sh_s = 0;
@@ -1926,6 +2312,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
             }
     }
     narrow_sums();
+    if (!opt_noifcall)
+        round_once();
     /* the values that are read */
     for (b = 1; b < nb; b++) {
         Block *bb = &f->blk[b];
@@ -1958,6 +2346,60 @@ void ptx_gen(Func *f, Obj *o, int entry)
         if (bb->term == TERM_BR)
             mark_cond(bb->arg);
     }
+    xrem = 0;
+    if (!opt_noxrem) {
+        xrem = (u8 *)xmalloc((size_t)f->nins + 1);
+        memset(xrem, 0, (size_t)f->nins + 1);
+        for (b = 1; b < nb; b++) {
+            Block *bb = &f->blk[b];
+            if (!live[b])
+                continue;
+#define XREM(x) \
+    do { \
+        u32 x_ = RV(x); \
+        Ins *xi_ = &f->ins[x_]; \
+        if (x_ && (xi_->op == OP_SEXT32 || xi_->op == OP_ZEXT32) && xi_->blk && xi_->blk != b && used[x_] && !xlate[x_] && \
+            !(sh_s && sh_t32[x_]) && f->ins[RV(xi_->a)].op != OP_CONST) \
+            xrem[x_] = 1; \
+    } while (0)
+            for (v = bb->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                IR_OPS(f, i, p, n);
+                for (k = 0; k < n; k++)
+                    XREM(p[k]);
+            }
+            if (bb->arg)
+                XREM(bb->arg);
+#undef XREM
+        }
+    }
+    /* the trees of truth values; a tree that is only read as a condition, in one or two places, is done
+       over again there and has no register (pass one: readers before what they read) */
+    for (v = f->nins - 1; v >= 1 && !opt_nopred; v--) {
+        Ins *i = &f->ins[v];
+        if (!used[v] || !i->blk || !live[i->blk] || (i->op != OP_AND && i->op != OP_OR) || !pred_bool(v, 8))
+            continue;
+        ptree[v] = nuse[v] < 255 && nuse[v] == cuse[v] && cuse[v] <= 2 ? 2 : 1;
+        mark_cond(i->a);
+        mark_cond(i->b);
+    }
+    /* one that has a register and reads nothing but comparisons and numbers that have registers is as well
+       done on the numbers */
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        u32 a, b;
+        if (ptree[v] != 1)
+            continue;
+        a = RV(i->a);
+        b = RV(i->b);
+        if (ptree[a] == 2 || ptree[b] == 2 || (is_compare(f->ins[a].op) && is_compare(f->ins[b].op)))
+            continue;
+        ptree[v] = 0;
+        if (cuse[a] && cuse[a] < 255)
+            cuse[a]--;
+        if (cuse[b] && cuse[b] < 255)
+            cuse[b]--;
+    }
     for (v = 1; v < f->nins; v++)
         if (f->ins[v].op == OP_PHI && f->ins[v].blk && live[f->ins[v].blk])
             used[v] = 1; /* kept simple: every phi of a live block is given its moves */
@@ -1975,6 +2417,11 @@ void ptx_gen(Func *f, Obj *o, int entry)
     }
     if (sh_s)
         sh_find(live);
+    lc_s = 0;
+    if (!opt_nolocal) {
+        lc_s = (u8 *)xmalloc((size_t)f->nins + 1);
+        lc_find(f);
+    }
     gl_s = 0;
     if (entry && !opt_noglobal) {
         gl_s = (u8 *)xmalloc((size_t)f->nins + 1);
@@ -1989,6 +2436,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
         }
     }
     coalesce(live);
+    coalesce_asm(live);
 
     /* the frame */
     for (k = 0; k < f->nslots; k++)
@@ -2129,7 +2577,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     for (k = 0; k < 4; k++)
         if (nreg[k])
             BP(&head, "\t.reg %s %s<%u>;\n", cls_reg[k], cls_stem[k], nreg[k]);
-    BP(&head, "\t.reg .pred %%p<2>;\n\t.reg .b16 %%h<12>;\n");
+    BP(&head, "\t.reg .pred %%p<16>;\n\t.reg .b16 %%h<12>;\n");
     if (frame)
         BP(&head, "\t.reg .b64 %%SP;\n\t.reg .b64 %%SPL;\n\t.local .align 16 .b8 __local_depot[%u];\n", frame);
     buf_put(&body, head.p, head.len);
@@ -2145,6 +2593,10 @@ void ptx_gen(Func *f, Obj *o, int entry)
         sh_s = 0;
     }
     free(gl_s);
+    free(xrem);
+    xrem = 0;
+    free(lc_s);
+    lc_s = 0;
     gl_s = 0;
     free(slotoff);
     free(byoff);

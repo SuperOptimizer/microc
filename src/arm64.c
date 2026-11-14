@@ -26,6 +26,8 @@ enum {
     A_DEFREG, /* no code: d is written by the inline assembly before */
     A_ALLOCA, /* d = s0 more bytes of stack */
     A_BRK,
+    A_BFM,    /* a bit field of s0: imm = immr | imms << 6; cc: sign-extended (sbfm) or not (ubfm) */
+    A_SWITCH, /* jump through the table imm (see find_switches) on the value s0 */
     A_TLS,    /* d = the thread pointer plus the offset of sym + imm from it */
     A_LDAR,   /* d = [s0], acquiring; cc = log2 of the size */
     A_STLR,   /* [s0] = s1, releasing; cc = log2 of the size */
@@ -35,6 +37,7 @@ enum {
     A_CMP, A_CMPI, A_FCMP, A_CCMP, A_CSET, A_CSEL, A_FCSEL,
     A_LDR, A_STR,
     A_FADD, A_FSUB, A_FMUL, A_FDIV, A_FNEG,
+    A_FMADD, /* s0 * s1 and s2 in one rounding; cc: 0 s2 + product, 1 s2 - product, 2 product - s2 */
     A_SCVTF, A_UCVTF, A_FCVTZS, A_FCVTZU, A_FCVT,
     A_B, A_BCC, A_CBZ, A_CBNZ, A_TBZ, A_TBNZ, A_BL, A_BLR, A_TAIL, A_RET,
     /* 128-bit vectors; cc = lane kind (a memory access kind) */
@@ -70,6 +73,7 @@ static u32 *uses;      /* per IR value: number of uses */
 #define FUSE_ALIAS 7 /* truncation or extension that is its operand's register, unchanged */
 #define FUSE_COND 6 /* and/or of comparisons used only as a condition: a chain of conditional compares */
 #define FUSE_NOT 0x80 /* while counting uses: the value is used as a value */
+#define FUSE_BF 11 /* shift or mask that is half of a bit-field extract: its user does both */
 #define FUSE_MOV 5 /* extension made redundant by changing the load it reads */
 static u8 *fused;      /* per IR value: folded into its user */
 static u32 *cache_reg; /* per floating IR value: register holding it ... */
@@ -900,6 +904,78 @@ static void sel_vec(u32 v)
     m->cc = i->mem;
 }
 
+/* Is v a field of bits taken out of another value (shift and mask, shift up and back down), or put
+   somewhere else in an empty word (mask and shift up)? One instruction does these. Gives the source and
+   the two numbers of the instruction; *sig is set if the field is sign-extended. */
+static int bitfield_of(u32 v, u32 *src, u32 *immr, u32 *imms, int *sig)
+{
+    Ins *i = &f->ins[v], *y;
+    u32 bits = i->ty == IT_I64 ? 64 : 32, k;
+    u64 c, n, top = bits == 64 ? ~(u64)0 : 0xffffffffUL;
+    if (i->op != OP_AND && i->op != OP_SHL && i->op != OP_SHR && i->op != OP_SAR && i->op != OP_NEG)
+        return 0; /* (of other instructions, a need not even be a value) */
+    y = &f->ins[i->a];
+    if (y->ty != i->ty || !y->blk || (fused[i->a] && fused[i->a] != FUSE_BF))
+        return 0;
+    /* the source has to be a value in a register of its own, not something folded into the operand */
+    if (fused[y->a] && fused[y->a] != FUSE_ALIAS && fused[y->a] != FUSE_MOV)
+        return 0;
+    *src = y->a;
+    *sig = 0;
+    switch (i->op) {
+    case OP_AND: /* (x >> n) & ones */
+        if (y->op != OP_SHR || !ir_is_const(f, i->b, &c) || !ir_is_const(f, y->b, &n))
+            return 0;
+        c &= top;
+        for (k = 0; c >> k & 1; k++)
+            ;
+        if (!k || k == 64 || c >> k || n >= bits || n + k > bits)
+            return 0;
+        *immr = (u32)n;
+        *imms = (u32)n + k - 1;
+        return 1;
+    case OP_SHL: /* (x & ones) << n */
+        if (y->op != OP_AND || !ir_is_const(f, y->b, &c) || !ir_is_const(f, i->b, &n))
+            return 0;
+        c &= top;
+        for (k = 0; c >> k & 1; k++)
+            ;
+        if (!k || k == 64 || c >> k || !n || n >= bits || n + k > bits)
+            return 0;
+        *immr = bits - (u32)n;
+        *imms = k - 1;
+        return 1;
+    case OP_SHR:
+    case OP_SAR: /* (x << a) >> b */
+        if (y->op != OP_SHL || !ir_is_const(f, i->b, &n) || !ir_is_const(f, y->b, &c) || n >= bits || c > n)
+            return 0;
+        *immr = (u32)(n - c);
+        *imms = bits - 1 - (u32)c;
+        *sig = i->op == OP_SAR;
+        return 1;
+    case OP_NEG: /* -(x & 1): the lowest bit, everywhere */
+        if (y->op != OP_AND || !ir_is_const(f, y->b, &c) || (c & top) != 1)
+            return 0;
+        *immr = *imms = 0;
+        *sig = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int sel_bitfield(u32 v, u32 d, int w)
+{
+    u32 src, immr, imms;
+    int sig;
+    MIns *m;
+    if (!bitfield_of(v, &src, &immr, &imms, &sig))
+        return 0;
+    m = emit(A_BFM, w, d, reg_of(src), NOREG);
+    m->imm = (i64)(immr | imms << 6);
+    m->cc = (u8)sig;
+    return 1;
+}
+
 static void sel_ins(u32 v)
 {
     Ins *i = &f->ins[v];
@@ -966,9 +1042,27 @@ static void sel_ins(u32 v)
     case OP_UDIV: op = A_UDIV; goto binary;
     case OP_UMULH: op = A_UMULH; goto binary;
     case OP_SMULH: op = A_SMULH; goto binary;
-    case OP_FADD: op = A_FADD; goto binary;
-    case OP_FSUB: op = A_FSUB; goto binary;
-    case OP_FMUL: op = A_FMUL; goto binary;
+    case OP_FADD:
+    case OP_FSUB: {
+        /* a product used only here is not rounded by itself (-ffp-contract=fast) */
+        u32 p = fused[i->a] == FUSE_OPND ? i->a : fused[i->b] == FUSE_OPND ? i->b : 0;
+        op = i->op == OP_FADD ? A_FADD : A_FSUB;
+        if (!p)
+            goto binary;
+        {
+            /* (all three are in registers before the instruction is made: a constant is put in one here) */
+            u32 ra = reg_of(f->ins[p].a), rb = reg_of(f->ins[p].b), rc = reg_of(p == i->b ? i->a : i->b);
+            m = emit(A_FMADD, w, d, ra, rb);
+            m->s2 = rc;
+            m->cc = (u8)(i->op == OP_FADD ? 0 : p == i->b ? 1 : 2);
+        }
+        return;
+    }
+    case OP_FMUL:
+        if (fused[v] == FUSE_OPND)
+            return;
+        op = A_FMUL;
+        goto binary;
     case OP_FDIV: op = A_FDIV; goto binary;
     binary:
         emit(op, w, d, reg_of(i->a), reg_of(i->b));
@@ -988,6 +1082,10 @@ static void sel_ins(u32 v)
         if (fused[v] == FUSE_COND || fused[v] == FUSE_BIT)
             return;
         op = i->op == OP_AND ? A_AND : i->op == OP_OR ? A_ORR : A_EOR;
+        if (fused[v] == FUSE_BF)
+            return;
+        if (i->op == OP_AND && !fused[v] && sel_bitfield(v, d, w))
+            return;
         if (ir_is_const(f, i->b, &c) && logical_imm(w ? c : (u64)(u32)c, w, &enc)) {
             m = emit(op + (A_ANDI - A_AND), w, d, reg_of(i->a), NOREG);
             m->imm = enc;
@@ -1014,7 +1112,7 @@ static void sel_ins(u32 v)
     case OP_SHL:
     case OP_SHR:
     case OP_SAR:
-        if (fused[v])
+        if (fused[v] || sel_bitfield(v, d, w))
             return;
         op = i->op == OP_SHL ? A_LSL : i->op == OP_SHR ? A_LSR : A_ASR;
         if (ir_is_const(f, i->b, &c)) {
@@ -1023,7 +1121,11 @@ static void sel_ins(u32 v)
             return;
         }
         goto binary;
-    case OP_NEG: op = A_NEG; goto unary;
+    case OP_NEG:
+        if (sel_bitfield(v, d, w))
+            return;
+        op = A_NEG;
+        goto unary;
     case OP_ASMOUT:
         return; /* moved out of its register where the assembly is */
     case OP_CLZ: op = A_CLZ; goto unary;
@@ -1591,10 +1693,295 @@ static void estimate_freq(void)
     free(fr);
 }
 
+/* A phi x and the value y that comes round to it can share a register if x is no longer wanted once y is
+   made. Where y is worked out while x is still to be used again in the same block (p + 1 before the load
+   in *p++; t in "t = f(a, b); b = g(a); a = t"), it moves down to behind the last such use; otherwise the
+   two overlap, and the variable is copied back to its place each time round the loop. */
+static void sink_steps(void)
+{
+    u32 b, x, k, w, last, n, j, dist;
+    for (b = 1; b < f->nblk; b++) {
+        for (x = f->blk[b].phis; x; x = f->ins[x].next) {
+            for (k = 0; k < f->ins[x].b; k++) {
+                u32 y = f->xargs[f->ins[x].a + k], yb;
+                Ins *i = &f->ins[y];
+                if (!i->blk || i->op < OP_ADD || i->op > OP_SMULH || (i->op >= OP_SDIV && i->op <= OP_UREM))
+                    continue;
+                yb = i->blk;
+                last = 0;
+                for (w = i->next, dist = 0; w && dist < 24; w = f->ins[w].next, dist++) {
+                    Ins *u = &f->ins[w];
+                    u32 *ops, hit = 0;
+                    IR_OPS(f, u, ops, n);
+                    for (j = 0; j < n; j++) {
+                        if (ops[j] == y)
+                            break;
+                        hit |= ops[j] == x;
+                    }
+                    if (j < n || (u->op == OP_CALL && u->c == y))
+                        break; /* y itself is wanted here */
+                    if (hit || (u->op == OP_CALL && u->c == x))
+                        last = w;
+                }
+                if (!last || f->blk[yb].arg == x)
+                    continue;
+                ir_remove(f, y);
+                f->ins[y].blk = yb;
+                f->ins[y].prev = last;
+                f->ins[y].next = f->ins[last].next;
+                if (f->ins[last].next)
+                    f->ins[f->ins[last].next].prev = y;
+                else
+                    f->blk[yb].last = y;
+                f->ins[last].next = y;
+            }
+        }
+    }
+}
+
+/* ---- jump tables ----
+   A switch reaches the back end as a tree of blocks, each comparing the same value with a constant.
+   Where the constants lie close together, the block at the top of such a tree jumps through a table
+   instead. The blocks below it stay where they are, empty, so the paths between the top and the places
+   the tree led to are still there for register allocation to follow. */
+typedef struct SwTab {
+    u32 first, n; /* sw_targets[first .. first + n): the blocks for the values lo .. lo + n - 1 */
+    u32 dflt;     /* the block for every other value */
+    u32 val;      /* the value switched on */
+    u64 lo;
+} SwTab;
+
+#define SW_NODE 1     /* sw_of[b]: b is a block below the top of a tree; 2 + n: the top, with table n */
+#define SW_MIN_TESTS 5 /* fewer comparisons than this are quicker than an indirect jump */
+#define SW_MAX_SPAN 1024
+int opt_no_jump_tables;
+int opt_fp_contract;
+static SwTab *sw_tabs;
+static u32 nsw_tabs, cap_sw_tabs;
+static u32 *sw_targets;
+static u32 nsw_targets, cap_sw_targets;
+static u32 *sw_of; /* per IR block */
+
+/* An integer constant, also where a loop keeps it in a register. */
+static int sw_const(u32 v, u64 *c)
+{
+    if (f->ins[v].op == OP_PIN)
+        v = f->ins[v].a;
+    return ir_is_const(f, v, c);
+}
+
+/* Does block b end by testing an integer against a constant? Gives the comparison (*op) of the value
+   (*val) with *k; OP_SUB stands for (value - *k) <= *span, unsigned, the test of a range of cases. If
+   *val is not zero on entry, the test has to be of that value. */
+static int sw_test(u32 b, u32 *val, int *op, u64 *k, u64 *span)
+{
+    Block *bb = &f->blk[b];
+    Ins *c = &f->ins[bb->arg], *a;
+    if (bb->term != TERM_BR || bb->succ[0] == bb->succ[1] || !bb->arg)
+        return 0;
+    if (c->op >= OP_EQ && c->op <= OP_UGE && sw_const(c->b, k)) {
+        a = &f->ins[c->a];
+        if (*val && c->a != *val) {
+            if (c->op != OP_ULE || a->op != OP_SUB || a->a != *val || uses[c->a] != 1 || a->blk != b)
+                return 0;
+            *span = *k;
+            if (!sw_const(a->b, k))
+                return 0;
+            *op = OP_SUB;
+            return 1;
+        }
+        *val = c->a;
+        *op = c->op;
+        return 1;
+    }
+    if ((c->ty != IT_I32 && c->ty != IT_I64) || (*val && bb->arg != *val) || c->op == OP_CONST)
+        return 0;
+    *val = bb->arg; /* the value itself: is it not zero? */
+    *op = OP_NE;
+    *k = 0;
+    return 1;
+}
+
+/* May b be a block below the top of a tree on val: entered one way, with nothing in it but the test? */
+static int sw_node(u32 b, u32 val)
+{
+    Block *bb = &f->blk[b];
+    u64 k, span;
+    u32 v;
+    int op;
+    if (bb->npreds != 1 || bb->phis || sw_of[b] || b == 1 || !sw_test(b, &val, &op, &k, &span))
+        return 0;
+    for (v = bb->first; v; v = f->ins[v].next)
+        if (!((v == bb->arg && uses[v] == 1) || (op == OP_SUB && v == f->ins[bb->arg].a)))
+            return 0;
+    return 1;
+}
+
+/* Where the tree with b at its top sends the value x. */
+static u32 sw_walk(u32 b, u32 val, u64 x)
+{
+    int w = f->ins[val].ty == IT_I64, first = 1;
+    while (first || sw_of[b] == SW_NODE) {
+        u64 k = 0, span = 0, xu = w ? x : (u32)x, ku;
+        i64 xs = w ? (i64)x : (i64)(i32)(u32)x, ks;
+        int op = 0, yes = 0;
+        sw_test(b, &val, &op, &k, &span);
+        ku = w ? k : (u32)k;
+        ks = w ? (i64)k : (i64)(i32)(u32)k;
+        switch (op) {
+        case OP_EQ: yes = xu == ku; break;
+        case OP_NE: yes = xu != ku; break;
+        case OP_SLT: yes = xs < ks; break;
+        case OP_SLE: yes = xs <= ks; break;
+        case OP_SGT: yes = xs > ks; break;
+        case OP_SGE: yes = xs >= ks; break;
+        case OP_ULT: yes = xu < ku; break;
+        case OP_ULE: yes = xu <= ku; break;
+        case OP_UGT: yes = xu > ku; break;
+        case OP_UGE: yes = xu >= ku; break;
+        case OP_SUB: yes = (w ? xu - ku : (u32)(xu - ku)) <= (w ? span : (u32)span); break;
+        }
+        b = f->blk[b].succ[yes ? 0 : 1];
+        first = 0;
+    }
+    return b;
+}
+
+/* The use of v as the condition that ended a block is gone; an instruction nothing else uses goes too. */
+static void sw_drop(u32 v)
+{
+    Ins *i = &f->ins[v];
+    if (--uses[v] || !i->blk || i->op < OP_ADD || i->op > OP_UGE)
+        return;
+    uses[i->b]--;
+    ir_remove(f, v);
+    sw_drop(f->ins[v].a);
+}
+
+static void find_switches(void)
+{
+    u32 *nodes = 0, cap = 0, k;
+    nsw_tabs = nsw_targets = 0;
+    sw_of = (u32 *)xmalloc(f->nblk * sizeof(u32));
+    memset(sw_of, 0, f->nblk * sizeof(u32));
+    if (opt_no_jump_tables)
+        return;
+    for (k = 0; k < nlayout; k++) {
+        u32 top = layout[k], val = 0, n = 0, done, j, live = 0, dflt = 0, at;
+        u64 c, span, bias, lo = 0, hi = 0, klo = 0, khi = 0, top_key, cnt;
+        int op, w, sig = 0, uns = 0;
+        SwTab *t;
+        if (sw_of[top] || !sw_test(top, &val, &op, &c, &span))
+            continue;
+        /* a block that the tree of its predecessor would take in is not the top of one */
+        if (f->blk[top].npreds == 1 && sw_node(top, val)) {
+            u32 pv = val;
+            if (sw_test(f->blk[top].preds[0], &pv, &op, &c, &span))
+                continue;
+        }
+        w = f->ins[val].ty == IT_I64;
+        if (f->ins[val].ty != IT_I32 && !w)
+            continue;
+        /* the blocks of the tree, and the least and greatest constant in the order its tests use */
+        if (cap < 8)
+            nodes = (u32 *)xrealloc(nodes, (cap = 64) * sizeof(u32));
+        nodes[n++] = top;
+        for (done = 0; done < n; done++) {
+            for (j = 0; j < 2; j++) {
+                u32 s = f->blk[nodes[done]].succ[j];
+                if (!sw_node(s, val))
+                    continue;
+                if (n == cap)
+                    nodes = (u32 *)xrealloc(nodes, (cap *= 2) * sizeof(u32));
+                sw_of[s] = SW_NODE;
+                nodes[n++] = s;
+            }
+            sw_test(nodes[done], &val, &op, &c, &span);
+            sig |= op >= OP_SLT && op <= OP_SGE;
+            uns |= (op >= OP_ULT && op <= OP_UGE) || op == OP_SUB;
+        }
+        bias = uns ? 0 : w ? (u64)1 << 63 : (u64)1 << 31; /* x + bias, in the width of the value, orders x */
+        top_key = w ? ~(u64)0 : 0xffffffffUL;
+        for (done = 0; done < n; done++) {
+            u64 key[2];
+            sw_test(nodes[done], &val, &op, &c, &span);
+            key[0] = (c + bias) & top_key;
+            key[1] = (c + (op == OP_SUB ? span : 0) + bias) & top_key;
+            if (key[1] < key[0])
+                sig = uns = 1; /* a range that wraps round */
+            for (j = 0; j < 2; j++) {
+                if (!done || key[j] < klo)
+                    klo = key[j];
+                if ((!done && !j) || key[j] > khi)
+                    khi = key[j];
+            }
+        }
+        cnt = khi - klo + 1;
+        if (n < SW_MIN_TESTS || (sig && uns) || khi - klo >= SW_MAX_SPAN || (opt_size && cnt * 4 + 28 > (u64)n * 8))
+            goto fail;
+        lo = (klo - bias) & top_key;
+        hi = (khi - bias) & top_key;
+        /* every value outside the constants must go the same way */
+        if (klo > 0)
+            dflt = sw_walk(top, val, lo - 1);
+        if (khi < top_key) {
+            u32 d2 = sw_walk(top, val, hi + 1);
+            if (dflt && d2 != dflt)
+                goto fail;
+            dflt = d2;
+        }
+        if (nsw_targets + cnt > cap_sw_targets) {
+            cap_sw_targets = (nsw_targets + (u32)cnt) * 2;
+            sw_targets = (u32 *)xrealloc(sw_targets, cap_sw_targets * sizeof(u32));
+        }
+        at = nsw_targets;
+        for (j = 0; j < cnt; j++) {
+            sw_targets[at + j] = sw_walk(top, val, lo + j);
+            live += sw_targets[at + j] != dflt;
+        }
+        while (cnt && sw_targets[at + cnt - 1] == dflt)
+            cnt--;
+        while (cnt && sw_targets[at] == dflt) {
+            at++;
+            lo++;
+            cnt--;
+        }
+        if (live < 4 || cnt > (u64)live * 3)
+            goto fail;
+        if (nsw_tabs == cap_sw_tabs) {
+            cap_sw_tabs = cap_sw_tabs ? cap_sw_tabs * 2 : 8;
+            sw_tabs = (SwTab *)xrealloc(sw_tabs, cap_sw_tabs * sizeof(SwTab));
+        }
+        t = &sw_tabs[nsw_tabs];
+        t->first = at;
+        t->n = (u32)cnt;
+        t->dflt = dflt ? dflt : sw_targets[at];
+        t->val = val;
+        t->lo = lo;
+        nsw_targets = at + (u32)cnt;
+        /* the tests go; the blocks keep their two ways out */
+        uses[val]++;
+        fused[val] = FUSE_NOT;
+        for (done = 0; done < n; done++) {
+            Block *bb = &f->blk[nodes[done]];
+            sw_drop(bb->arg);
+            bb->arg = 0;
+        }
+        sw_of[top] = 2 + nsw_tabs++;
+        continue;
+    fail:
+        for (done = 1; done < n; done++)
+            sw_of[nodes[done]] = 0;
+    }
+    free(nodes);
+}
+
 static void prepare(void)
 {
     u32 b, v, k, n;
     split_critical_edges();
+    if (!opt_size)
+        sink_steps();
     layout = (u32 *)xmalloc(f->nblk * sizeof(u32));
     blk_index = (u32 *)xmalloc(f->nblk * sizeof(u32));
     rpo_n = 0;
@@ -1629,6 +2016,36 @@ static void prepare(void)
         }
         layout[k] = h;
         blk_index[h] = k;
+        /* If both ways on from h stay in the loop, one is the block that now starts the loop. The
+           blocks reached only through the other (the other arm of an if, up to where the two meet)
+           move to behind h: h falls into them, and the first arm falls into the meeting place where
+           it had to jump over them. */
+        {
+            u32 a = blk_index[f->blk[h].succ[0]], c = blk_index[f->blk[h].succ[1]], j, e, p, len;
+            if (a == c || (a != hk && c != hk) || a >= k || c >= k)
+                continue;
+            j = a == hk ? c : a;
+            if (j <= hk || f->blk[layout[j]].npreds != 1)
+                continue;
+            for (e = j + 1; e < k; e++) {
+                Block *xb = &f->blk[layout[e]];
+                for (p = 0; p < xb->npreds; p++)
+                    if (blk_index[xb->preds[p]] < j || blk_index[xb->preds[p]] >= k)
+                        break;
+                if (p < xb->npreds || !xb->npreds)
+                    break;
+            }
+            len = e - j;
+            if (e < k) {
+                u32 *tmp = (u32 *)xmalloc(len * sizeof(u32));
+                memcpy(tmp, layout + j, len * sizeof(u32));
+                memmove(layout + j, layout + e, (k + 1 - e) * sizeof(u32));
+                memcpy(layout + k + 1 - len, tmp, len * sizeof(u32));
+                free(tmp);
+                for (n = j; n <= k; n++)
+                    blk_index[layout[n]] = n;
+            }
+        }
     }
 
     uses = (u32 *)xmalloc(f->nins * sizeof(u32));
@@ -1669,6 +2086,7 @@ static void prepare(void)
                 fused[bb->arg] = FUSE_NOT;
         }
     }
+    find_switches();
     /* a comparison used only as the condition of branches and selects is
        never made into a value: each of them sets the flags again */
     b = 0;
@@ -1814,6 +2232,33 @@ static void prepare(void)
             }
         }
     }
+    /* -ffp-contract=fast: a product used once, by a sum or difference, becomes part of it */
+    for (k = 0; opt_fp_contract && k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 t;
+            if ((i->op != OP_FADD && i->op != OP_FSUB) || (i->ty != IT_F32 && i->ty != IT_F64))
+                continue;
+            for (t = 0; t < 2; t++) {
+                u32 y = t ? i->b : i->a;
+                if (f->ins[y].op == OP_FMUL && f->ins[y].blk && uses[y] == 1 && !fused[y] && i->a != i->b) {
+                    fused[y] = FUSE_OPND;
+                    break;
+                }
+            }
+        }
+    }
+    /* the first half of a bit-field extract, used for nothing else, is not computed by itself */
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        for (v = bb->first; v; v = f->ins[v].next) {
+            u32 src, immr, imms;
+            int sig;
+            if (!fused[v] && bitfield_of(v, &src, &immr, &imms, &sig) && !fused[f->ins[v].a] && uses[f->ins[v].a] == 1)
+                fused[f->ins[v].a] = FUSE_BF;
+        }
+    }
     memset(cache_reg, 0, f->nins * sizeof(u32));
 }
 
@@ -1930,7 +2375,13 @@ static void select_all(void)
         }
         for (v = bb->first; v; v = f->ins[v].next)
             sel_ins(v);
-        sel_term(b, k + 1 < nlayout ? layout[k + 1] : 0);
+        if (sw_of[b] >= 2) {
+            SwTab *t = &sw_tabs[sw_of[b] - 2];
+            MIns *m = emit(A_SWITCH, f->ins[t->val].ty == IT_I64, NOREG, reg_of(t->val), NOREG);
+            m->imm = sw_of[b] - 2;
+        } else if (sw_of[b] != SW_NODE) {
+            sel_term(b, k + 1 < nlayout ? layout[k + 1] : 0);
+        }
         mb->n = mf.n - mb->first;
         mb->nsucc = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
         for (n = 0; n < mb->nsucc; n++)
@@ -1943,7 +2394,7 @@ static void select_all(void)
 typedef struct Fixup {
     u32 off;
     u32 target; /* layout index */
-    u8 kind;    /* 0: b, 1: b.cond / cbz / cbnz */
+    u8 kind;    /* 0: b, 1: b.cond / cbz / cbnz, 2: tbz / tbnz, 3: a jump table entry */
 } Fixup;
 
 static Buf *text;
@@ -2254,12 +2705,42 @@ static void encode(MIns *i)
     if (i->d != NOREG)
         dloc = i->d < VREG0 ? i->d : mf.loc[i->d - VREG0];
 
+    if (i->op == A_FMADD) {
+        /* three operands may all be in memory, and there are two scratch registers */
+        u32 l2 = i->s2 < VREG0 ? i->s2 : mf.loc[i->s2 - VREG0], n = 0;
+        for (k = 0; k < 3; k++)
+            n += src[k] >= VREG0 && mf.loc[src[k] - VREG0] >= SPILL0;
+        if (n == 3) {
+            MIns t = *i;
+            scache_clear();
+            if (dloc != NOREG && dloc < SPILL0) {
+                /* the result register holds the third on the way in */
+                ldst(M_F64, 0, dloc, fbase, fbias + (i64)spill_base + 8 * (l2 - SPILL0), 17);
+                t.s2 = dloc;
+                encode(&t);
+            } else {
+                /* nowhere to put it: the product and the sum are made one after the other */
+                t.op = A_FMUL;
+                t.d = FSCRATCH0 + 1;
+                t.s2 = NOREG;
+                encode(&t);
+                t = *i;
+                t.op = (u16)(i->cc ? A_FSUB : A_FADD);
+                t.s0 = i->cc == 2 ? FSCRATCH0 + 1 : i->s2;
+                t.s1 = i->cc == 2 ? i->s2 : FSCRATCH0 + 1;
+                t.s2 = NOREG;
+                encode(&t);
+            }
+            return;
+        }
+    }
+
     /* register-to-register copy: spilled operands move directly */
     if (i->op == A_MOV) {
         u32 sloc = i->s0 < VREG0 ? i->s0 : mf.loc[i->s0 - VREG0];
         int fp = i->d >= VREG0 ? mf.vclass[i->d - VREG0] : i->d >= R_V0;
-        if (dloc == NOREG)
-            return; /* dead definition */
+        if (dloc == NOREG || dloc == sloc)
+            return; /* dead definition, or both in one place */
         if (dloc >= SPILL0 && sloc >= SPILL0) {
             u32 t = fp ? FSCRATCH0 : SCRATCH0;
             for (k = 0; k < 3 && !fp; k++)
@@ -2439,6 +2920,10 @@ static void encode(MIns *i)
         put(op | (immr << 16) | (imms << 10) | (rn << 5) | rd);
         break;
     }
+    case A_BFM:
+        put((i->cc ? 0x13000000U : 0x53000000U) | (i->w ? 0x80400000U : 0) | (((u32)i->imm & 63) << 16) |
+            (((u32)i->imm >> 6 & 63) << 10) | (rn << 5) | rd);
+        break;
     case A_MSUB: put(sf | 0x1b008000 | (rm << 16) | ((s[2] & 31) << 10) | (rn << 5) | rd); break;
     case A_MADD: put(sf | 0x1b000000 | (rm << 16) | ((s[2] & 31) << 10) | (rn << 5) | rd); break;
     case A_SMULH: put(0x9b407c00 | (rm << 16) | (rn << 5) | rd); break;
@@ -2446,6 +2931,34 @@ static void encode(MIns *i)
     case A_NEG: put(sf | 0x4b0003e0 | (rn << 16) | rd); break;
     case A_CLZ: put(sf | 0x5ac01000 | (rn << 5) | rd); break;
     case A_BRK: put(0xd4210000); break; /* brk #0x800 */
+    case A_SWITCH: {
+        /* index = value - lowest case; out of the table: the default; else jump to the table's own
+           address plus the entry, which is the distance from there to the block. The table follows. */
+        const SwTab *t = &sw_tabs[i->imm];
+        u32 t1 = SCRATCH0, t2, idx = s[0], j;
+        while (t1 == s[0])
+            t1++;
+        t2 = t1 + 1;
+        while (t2 == s[0])
+            t2++;
+        scache_clear();
+        if (t->lo) {
+            add_imm(t1, s[0], -(i64)(i->w ? t->lo : (u64)(i64)(i32)(u32)t->lo), t2);
+            idx = t1;
+        }
+        put((i->w ? 0xf100001fU : 0x7100001fU) | ((t->n - 1) << 10) | (idx << 5)); /* cmp idx, #n - 1 */
+        add_fixup(blk_index[t->dflt], 1);
+        put(0x54000000 | CC_HI);
+        put(0x10000080 | t2); /* adr t2, the table */
+        put((i->w ? 0xb8a07800U : 0xb8a05800U) | (idx << 16) | (t2 << 5) | t1); /* ldrsw t1, [t2, idx, lsl 2] */
+        put(0x8b000000 | (t1 << 16) | (t2 << 5) | t2);
+        put(0xd61f0000 | (t2 << 5)); /* br t2 */
+        for (j = 0; j < t->n; j++) {
+            add_fixup(blk_index[sw_targets[t->first + j]], 3);
+            put(4 * j);
+        }
+        break;
+    }
     case A_TLS:
         put(0xd53bd040 | rd); /* mrs xd, tpidr_el0 */
         obj_add_reloc(obj, arm64_text_sec, (u32)text->len, R_TPREL_HI12, i->sym, i->imm);
@@ -2566,6 +3079,10 @@ static void encode(MIns *i)
         }
         break;
     }
+    case A_FMADD: /* fmadd, fmsub, fnmsub */
+        put((i->cc == 0 ? 0x1f000000U : i->cc == 1 ? 0x1f008000U : 0x1f208000U) | fsz | (rm << 16) | ((s[2] & 31) << 10) |
+            (rn << 5) | rd);
+        break;
     case A_FADD: put(0x1e202800 | fsz | (rm << 16) | (rn << 5) | rd); break;
     case A_FSUB: put(0x1e203800 | fsz | (rm << 16) | (rn << 5) | rd); break;
     case A_FMUL: put(0x1e200800 | fsz | (rm << 16) | (rn << 5) | rd); break;
@@ -2963,7 +3480,8 @@ static void merge_tails(const u32 *fwd, int skip_first)
     for (k = 0; k < mf.nblk; k++) {
         MBlock *mb = &mf.blk[k];
         MIns *last = &mf.ins[mb->first + mb->n - 1];
-        u32 key, h, best = 0, bh = 0, bg = 0, tries = 0;
+        u32 key, h, best = 0, bh = 0, bg = 0, best_h = 0, tries = 0;
+        int falls = 0;
         tm_cut[k] = NOREG;
         if ((mb->nsucc & 16) || mb->n < 2 || (k == 0 && skip_first))
             continue;
@@ -2976,6 +3494,7 @@ static void merge_tails(const u32 *fwd, int skip_first)
                    !(mf.blk[k + 1].nsucc & 16)) {
             key = fwd[k + 1]; /* falls into the next block */
             tm_end[k] = mb->first + mb->n;
+            falls = 1;
         } else {
             continue;
         }
@@ -2985,7 +3504,25 @@ static void merge_tails(const u32 *fwd, int skip_first)
                 best = n;
                 bh = hp;
                 bg = gp;
+                best_h = h;
             }
+        }
+        if (best >= 2 && falls && !opt_size) {
+            /* Cutting this block would put a jump where it now runs straight on. The other block
+               ends in a jump as it is, so that one gives up its tail and jumps into this one, if no
+               third block already joins it there; else both keep their code. */
+            u32 n, *link;
+            for (n = bh; n < tm_end[best_h] && !lab_at[n]; n++)
+                ;
+            if (n == tm_end[best_h]) {
+                lab_at[bg] = mf.nblk + 1 + nlab++;
+                tm_lab[best_h] = lab_at[bg];
+                tm_cut[best_h] = bh;
+                for (link = &tm_head[key]; *link != best_h; link = &tm_next[*link])
+                    ;
+                *link = tm_next[best_h];
+            }
+            best = 0;
         }
         if (best >= 2) {
             if (!lab_at[bh])
@@ -3330,7 +3867,10 @@ void arm64_gen(Func *fn, Obj *o)
         Fixup *fx = &fixups[k];
         i64 delta = ((i64)blk_off[fwd[fx->target]] - (i64)fx->off) / 4;
         u32 insn = get_u32le(text->p + fx->off);
-        if (fx->kind == 0) {
+        if (fx->kind == 3) {
+            /* a jump table entry, holding its own distance from the start of the table */
+            insn = (u32)(delta * 4 + (i64)insn);
+        } else if (fx->kind == 0) {
             insn |= (u32)delta & 0x3ffffff;
         } else if (fx->kind == 2) {
             if (delta < -0x2000 || delta >= 0x2000)
@@ -3350,4 +3890,5 @@ void arm64_gen(Func *fn, Obj *o)
     free(fused);
     free(cache_reg);
     free(cache_blk);
+    free(sw_of);
 }

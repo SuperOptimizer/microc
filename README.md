@@ -15,6 +15,8 @@ compiler, assembler, linker, archiver and C library. Target: arm64 macOS.
     build/stage0/mcc -flto a.c b.c -o prog         see "Link-time optimisation" below
     build/stage0/mcc -finline-limit=N file.c       inline functions of up to N instructions (default 12; 0 turns it off)
     build/stage0/mcc -Os file.c                    prefer small code: less inlining, loops tested once at the top
+    build/stage0/mcc -fno-jump-tables file.c       a switch stays a tree of comparisons
+    build/stage0/mcc -ffp-contract=fast file.c     a * b + c is rounded once (fmadd); off by default
     build/stage0/mcc -jN a.c b.c c.c               compile up to N files at once (default: one per processor; -j1 for none)
     build/stage0/mcc as file.s -o file.o  assemble
     build/stage0/mcc ld a.o b.o lib.a     link
@@ -35,11 +37,11 @@ and `lib/libc.a` next to its own binary, or under `$MCC_HOME`.
 | `src/type.c`, `src/parse.c` | types and a one-pass parser that builds IR directly (no syntax tree) |
 | `src/ir.c`, `src/ir.h` | target-independent SSA IR, constant folding, printer |
 | `src/opt_ssa.c` | stack slots to SSA values, dead code elimination |
-| `src/opt.c` | value numbering, memory forwarding, control-flow simplification (jump threading, if-conversion to selects), loop-invariant code motion |
+| `src/opt.c` | value numbering, memory forwarding (what is known about memory is carried across branches and joined where they meet), control-flow simplification (jump threading, if-conversion to selects), loop-invariant code motion |
 | `src/opt_inline.c` | inlining of small functions |
 | `src/lto.c` | link-time optimisation: IR in object files, whole-program inlining, removal of unused functions |
-| `src/mir.h`, `src/ra.c` | machine IR and a target-independent linear-scan allocator with lifetime holes and loop-weighted spill costs |
-| `src/arm64.c` | instruction selection (addressing modes, shifted and inverted operands, rotates, conditional-compare chains, bit-test branches), frames, tail calls, early returns ahead of the frame, tail merging, encoding |
+| `src/mir.h`, `src/ra.c` | machine IR and a target-independent linear-scan allocator with lifetime holes, loop-weighted spill costs and coalescing of copies |
+| `src/arm64.c` | instruction selection (addressing modes, shifted and inverted operands, rotates, bit-field extracts, conditional-compare chains, bit-test branches, jump tables), frames, tail calls, early returns ahead of the frame, tail merging, encoding |
 | `src/arm64_asm.c` | assembler |
 | `src/obj.c`, `src/macho.c`, `src/link.c`, `src/macho_exe.c`, `src/sha256.c` | objects, archives, linker, executable writer with ad-hoc code signature |
 | `libc/` | C89 library; `libc/sys/darwin_arm64.s` is the only OS-specific file |
@@ -47,6 +49,23 @@ and `lib/libc.a` next to its own binary, or under `$MCC_HOME`.
 The IR and everything above it know nothing about arm64 or Mach-O. A new
 target supplies instruction selection and encoding (`arm64.c`), a register
 description for `ra.c`, and an object/executable format.
+
+## Speed of the generated code
+
+`sh bench/cmp.sh [runs]` builds the kernels of `bench/bench.c` with mcc, with `mcc -O3` and with
+`clang -O2`, checks that all three print the same checksums, and prints the least time of each kernel
+and the ratios to clang; then it builds mcc's own source into a compiler both ways and compares the
+two compiling that source (cycles, least of the runs). Decisions about the optimiser are made from
+this table, not from instruction counts.
+
+A switch whose case values lie close together (at least five tests, at least a third of the range in
+use) jumps through a table of offsets that sits in the code right behind the jump. A branch on a value
+that was just loaded and is used for nothing else stays a branch where it could have been a select:
+the processor guesses it and carries on, where a select would make everything after it wait for the
+load. `lo <= x && x <= hi` is one unsigned comparison of `x - lo`. Variables that change in a loop
+keep one register all the way round: copies whose two sides are never alive together are joined
+before registers are handed out, and an increment written ahead of the last use of the old value
+(`*p++`) is computed after it.
 
 ## Debug information
 
@@ -569,17 +588,29 @@ and how much of its state stays in memory, so device code is treated differently
   in a sum goes to the outside of it, and out of an `int` index of a pointer (`p[i + k]`: an `int` sum does not
   wrap), where it becomes part of the address;
 - the pair of halves (`__half2`) is multiplied and added as the pair it is (`fma.rn.f16x2` and the like);
+- pointers inside a kernel's structure parameters are of global memory too, and the inference starts at the
+  pointer parameters, so that a number counted up from 0 is never taken for one; `__ldg` is the read of memory
+  that nothing writes (`ld.global.nc`, of two and four numbers at once for the vector types), and a local
+  object's memory is read and written as local (`ld.local`, `st.local`);
+- a branch whose arms hold only arithmetic becomes selects also when the arithmetic is a call that is one PTX
+  instruction (`fmaf` and the like) or is itself a select, so `c ? (g ? fma(...) : x) : 0` is two selects and
+  no branch; `and`/`or` of comparisons stay in predicate registers (`and.pred`) and are not made numbers first;
+- what is known about how large a number can be (`umax_of`: masks, shifts, small products) lets
+  `(long)(x + k)` be `(long)x + k`, with `(x + k) * c` multiplied out, so addresses that differ by a constant
+  share one sum and the constant is part of the address; sums are kept in one operand order, and the value
+  numbering also numbers what its own folding creates;
+- a float rounded to a 16-bit float and then stored as one is rounded once.
 - `extern template` is honoured, so a unit does not instantiate again the kernels another unit provides.
 
 `MCC_NOUNROLL`, `MCC_NOAUTO`, `MCC_NOSPLIT`, `MCC_NOSH32`, `MCC_NOIFC`, `MCC_NOCHAIN`, `MCC_NOWIDE`, `MCC_NOMINMAX`,
-`MCC_NOSELK`, `MCC_NOGLOBAL`, `MCC_LICM` (`=2`: all but what costs nothing in the loop) in the environment turn these
+`MCC_NOSELK`, `MCC_NOGLOBAL`, `MCC_NOLOCAL`, `MCC_NOIFCALL`, `MCC_NOPRED`, `MCC_NODIST`, `MCC_NOASMCO`, `MCC_LICM` (`=2`: all but what costs nothing in the loop) in the environment turn these
 off (or the hoisting on) for experiments; `MCC_SLOTCHECK` checks after the passes that no instruction addresses a local that was
 given up. `ptxas -v` on a `--ptx-out` file shows the spills per kernel without a GPU. On the pipeline fixture
-(150 training steps, RTX PRO 4000 Blackwell) ufsm built by mcc trains at about 475 samples a second, nvcc's
+(150 training steps, RTX PRO 4000 Blackwell) ufsm built by mcc trains at about 490 samples a second, nvcc's
 build at about 555; without these changes it was 86. The launch itself costs the same in both (3 us). ufsm's
 own `bench_f4conv` times each convolution kernel by itself and prints a hash of what it wrote, the same in both
-builds: the forward convolutions are level with nvcc's, the weight-gradient and stride-2 kernels 1.2 to 1.5
-times slower, the sum over all of it 1.19 times at 64 voxels a side.
+builds: the forward convolutions are level with nvcc's, the weight-gradient and stride-2 kernels 1.2 to 1.4
+times slower, the sum over all of it 1.14 times at 64 voxels a side (1.09 at 16).
 
 ## x86-64 Linux
 

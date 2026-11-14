@@ -520,6 +520,10 @@ static int cc_main(const char *argv0, int argc, char **argv)
             dump_ir = 1;
         else if (strcmp(a, "-fno-strict-aliasing") == 0)
             opt_strict_aliasing = 0;
+        else if (strcmp(a, "-fno-jump-tables") == 0)
+            opt_no_jump_tables = 1;
+        else if (strncmp(a, "-ffp-contract=", 14) == 0)
+            opt_fp_contract = strcmp(a + 14, "off") != 0;
         else if (strcmp(a, "-flto") == 0)
             opt_lto = 1;
         else if (strcmp(a, "-fprofile-generate") == 0)
@@ -834,8 +838,18 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_nosh32 = getenv("MCC_NOSH32") != 0;
         opt_nominmax = getenv("MCC_NOMINMAX") != 0;
         opt_noselk = getenv("MCC_NOSELK") != 0;
+        opt_noasmco = getenv("MCC_NOASMCO") != 0;
+        opt_nopred = getenv("MCC_NOPRED") != 0;
+        opt_nodist = getenv("MCC_NODIST") != 0;
+        opt_noifcall = getenv("MCC_NOIFCALL") != 0;
+        opt_nolocal = getenv("MCC_NOLOCAL") != 0;
+        opt_noxrem = getenv("MCC_NOXREM") != 0;
+        opt_nowiden = getenv("MCC_NOWIDEN") ? 1 : getenv("MCC_WIDEN") ? 2 : 0;
         opt_noglobal = getenv("MCC_NOGLOBAL") != 0;
         opt_premat = getenv("MCC_PREMAT") != 0;
+        opt_nospecial1 = getenv("MCC_SPECIAL1") != 0; /* (on, despite the name) */
+        if (getenv("MCC_IFC"))
+            opt_ifc = atoi(getenv("MCC_IFC"));
         opt_plaindiv = getenv("MCC_PLAINDIV") != 0;
         opt_nowide = getenv("MCC_NOWIDE") != 0;
         opt_nochain = getenv("MCC_NOCHAIN") != 0;

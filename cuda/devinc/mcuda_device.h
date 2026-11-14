@@ -252,7 +252,36 @@ __device__ static __forceinline__ unsigned __match_any_sync(unsigned mask, int v
 __device__ static __forceinline__ unsigned __match_any_sync(unsigned mask, unsigned long long v) { unsigned r; asm volatile("match.any.sync.b64 %0, %1, %2;" : "=r"(r) : "l"(v), "r"(mask)); return r; }
 
 /* memory */
-template <class T> __device__ static __forceinline__ T __ldg(const T *p) { return *p; }
+template <class T> __host__ __device__ static __forceinline__ T __ldg(const T *p) { return *p; }
+/* (the types NVIDIA's __ldg has are read with ld.global.nc: a read of memory that nothing writes while the kernel runs) */
+#define MCUDA_LDG1(T, R, pt, c) \
+    __host__ __device__ static __forceinline__ T __ldg(const T *p) { \
+        if (__builtin_mcuda_device()) { R r; asm volatile("ld.global.nc." pt " %0, [%1];" : "=" c(r) : "l"(p)); return (T)r; } \
+        return *p; }
+#define MCUDA_LDG2(T, pt, c) \
+    __host__ __device__ static __forceinline__ T __ldg(const T *p) { \
+        if (__builtin_mcuda_device()) { T r; asm volatile("ld.global.nc.v2." pt " {%0,%1}, [%2];" : "=" c(r.x), "=" c(r.y) : "l"(p)); return r; } \
+        return *p; }
+#define MCUDA_LDG4(T, pt, c) \
+    __host__ __device__ static __forceinline__ T __ldg(const T *p) { \
+        if (__builtin_mcuda_device()) { T r; asm volatile("ld.global.nc.v4." pt " {%0,%1,%2,%3}, [%4];" : "=" c(r.x), "=" c(r.y), "=" c(r.z), "=" c(r.w) : "l"(p)); return r; } \
+        return *p; }
+MCUDA_LDG1(unsigned char, unsigned, "u8", "r")
+MCUDA_LDG1(signed char, int, "s8", "r")
+MCUDA_LDG1(unsigned short, unsigned, "u16", "r")
+MCUDA_LDG1(short, int, "s16", "r")
+MCUDA_LDG1(unsigned, unsigned, "u32", "r")
+MCUDA_LDG1(int, int, "s32", "r")
+MCUDA_LDG1(unsigned long long, unsigned long long, "u64", "l")
+MCUDA_LDG1(long long, long long, "s64", "l")
+MCUDA_LDG1(float, float, "f32", "f")
+MCUDA_LDG1(double, double, "f64", "d")
+MCUDA_LDG2(uint2, "u32", "r")
+MCUDA_LDG2(int2, "s32", "r")
+MCUDA_LDG2(float2, "f32", "f")
+MCUDA_LDG4(uint4, "u32", "r")
+MCUDA_LDG4(int4, "s32", "r")
+MCUDA_LDG4(float4, "f32", "f")
 __device__ static __forceinline__ unsigned long __cvta_generic_to_shared(const void *p) { unsigned long r; asm("cvta.to.shared.u64 %0, %1;" : "=l"(r) : "l"(p)); return r; }
 
 /* warps */

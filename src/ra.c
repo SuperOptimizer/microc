@@ -102,6 +102,25 @@ static int lowest_bit(u64 m)
     return n + !(m & 1);
 }
 
+/* Two range lists that do not intersect, as one. */
+static u32 ranges_join(u32 a, u32 b)
+{
+    u32 h = 0, *link = &h;
+    while (a && b) {
+        if (rg_start[a] < rg_start[b]) {
+            *link = a;
+            link = &rg_next[a];
+            a = *link;
+        } else {
+            *link = b;
+            link = &rg_next[b];
+            b = *link;
+        }
+    }
+    *link = a ? a : b;
+    return h;
+}
+
 /* Do the remaining ranges of a (from ra) and b (from rb) intersect? */
 static int intersects(u32 ra, u32 rb)
 {
@@ -175,7 +194,9 @@ void ra_run(MFunc *m, const MTarget *t)
     u32 *bucket, *bnext, npos;
     u32 *weight; /* per interval: uses and definitions, weighted by loop depth */
     u8 *depth, *xcall; /* xcall: the interval is live across a call */
-    int changed;
+    u32 *same;         /* a register that shares the interval of another: which (itself if none) */
+    u32 *copies, ncopy; /* register-to-register copies still to look at: instruction, depth in the top two bits */
+    int changed, dp;
 
     m->nspill = 0;
     m->used = 0;
@@ -444,24 +465,6 @@ void ra_run(MFunc *m, const MTarget *t)
         }
     }
 
-    /* order the intervals by start position (then by number): a bucket sort */
-    npos = 2 * nslot + 4;
-    bucket = NEW(u32, npos);
-    bnext = NEW(u32, nv);
-    memset(bucket, 0xff, npos * sizeof(u32));
-    for (v = nv; v-- > 0;) {
-        m->loc[v] = NOREG;
-        cursor[v] = head[v];
-        if (head[v]) {
-            u32 p = rg_start[head[v]];
-            bnext[v] = bucket[p];
-            bucket[p] = v;
-        }
-    }
-    for (i = 0; i < npos; i++)
-        for (v = bucket[i]; v != NOREG; v = bnext[v])
-            order[norder++] = v;
-
     /* a call strictly inside a live range rules out caller-saved registers */
     xcall = NEW(u8, nv);
     for (v = 0; v < nv; v++) {
@@ -480,6 +483,79 @@ void ra_run(MFunc *m, const MTarget *t)
             xcall[v] = cc[hi] > cc[lo];
         }
     }
+
+    /* Coalescing: the two sides of a copy whose lifetimes do not overlap become one interval, and the
+       copy goes away. The copies in the innermost loops are looked at first. Phis leave such copies at
+       the ends of blocks; without this, each trip round a loop moves its variables from where the
+       body left them to where it expects them. */
+    same = NEW(u32, nv);
+    for (v = 0; v < nv; v++)
+        same[v] = v;
+    copies = NEW(u32, m->n + 1);
+    ncopy = 0;
+    for (dp = 3; dp >= 0 && (dp == 3 || ncopy); dp--) {
+        u32 n = 0;
+        for (b = 0; b < m->nblk && dp == 3; b++) {
+            MBlock *mb = &m->blk[b];
+            for (i = mb->first; i < mb->first + mb->n; i++) {
+                MIns *in = &m->ins[i];
+                if (in->op == t->move_op && in->d != NOREG && in->d >= VREG0 && in->s0 != NOREG && in->s0 >= VREG0)
+                    copies[ncopy++] = i | (u32)depth[b] << 30;
+            }
+        }
+        for (k = 0; k < ncopy; k++) {
+            MIns *in = &m->ins[copies[k] & 0x3fffffff];
+            u32 x, y;
+            if ((int)(copies[k] >> 30) != dp) {
+                copies[n++] = copies[k]; /* for a later round */
+                continue;
+            }
+            x = in->d - VREG0;
+            y = in->s0 - VREG0;
+            while (same[x] != x)
+                x = same[x] = same[same[x]];
+            while (same[y] != y)
+                y = same[y] = same[same[y]];
+            if (x == y || m->vclass[x] != m->vclass[y] || (m->vclass[x] & 2) || !head[x] || !head[y] ||
+                xcall[x] != xcall[y] || intersects(head[x], head[y]))
+                continue;
+            head[x] = ranges_join(head[x], head[y]);
+            head[y] = 0;
+            same[y] = x;
+            if (iv_end[y] > iv_end[x])
+                iv_end[x] = iv_end[y];
+            weight[x] += weight[y];
+            if (hint[y] != NOREG && hint[y] < VREG0 && (hint[x] == NOREG || hint[x] >= VREG0))
+                hint[x] = hint[y];
+        }
+        ncopy = n;
+    }
+    for (v = 0; v < nv; v++) {
+        if (hint[v] != NOREG && hint[v] >= VREG0) {
+            u32 h = hint[v] - VREG0;
+            while (same[h] != h)
+                h = same[h];
+            hint[v] = h == v ? NOREG : VREG0 + h;
+        }
+    }
+
+    /* order the intervals by start position (then by number): a bucket sort */
+    npos = 2 * nslot + 4;
+    bucket = NEW(u32, npos);
+    bnext = NEW(u32, nv);
+    memset(bucket, 0xff, npos * sizeof(u32));
+    for (v = nv; v-- > 0;) {
+        m->loc[v] = NOREG;
+        cursor[v] = head[v];
+        if (head[v]) {
+            u32 p = rg_start[head[v]];
+            bnext[v] = bucket[p];
+            bucket[p] = v;
+        }
+    }
+    for (i = 0; i < npos; i++)
+        for (v = bucket[i]; v != NOREG; v = bnext[v])
+            order[norder++] = v;
 
     /* class bit 1: a 128-bit value, which has no spill slot to go to */
     for (v = 0; v < nv; v++)
@@ -589,6 +665,13 @@ void ra_run(MFunc *m, const MTarget *t)
         m->loc[cur] = (u32)reg;
         m->used |= (u64)1 << reg;
         active[nactive++] = cur;
+    }
+
+    for (v = 0; v < nv; v++) {
+        u32 r = v;
+        while (same[r] != r)
+            r = same[r];
+        m->loc[v] = m->loc[r];
     }
 
 #undef BIT

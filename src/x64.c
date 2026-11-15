@@ -2755,6 +2755,19 @@ static u32 idx_base(u32 v)
     return x;
 }
 
+/* A comparison with an operand made where it is used (a constant, an address) other than a small constant on the
+   right: as a leaf of a BR2 tree that operand would be put in its register only on the way to the leaf. */
+static int br2_lazy(u32 v)
+{
+    Ins *i = &f->ins[v];
+    u64 c;
+    if (is_floating(i->a))
+        return 1;
+    if (!is_floating(i->b))
+        return 0;
+    return !(f->ins[i->b].op == OP_CONST && ir_is_const(f, i->b, &c) && (i64)c == (i64)(i32)c);
+}
+
 /* Is v a shift that an address can have as the scale of its index? */
 static int is_scale(u32 v)
 {
@@ -2792,7 +2805,9 @@ static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk)
         return n + 1;
     }
     /* a leaf used elsewhere only as a condition (a later if on the same test): those set the flags again */
-    if (!is_compare(i->op) || vuses[v] != 1 || (fused[v] && fused[v] != FUSE_CMP) || n >= BR2_MAX || i->blk != blk)
+    /* (a constant left operand would be put in its register only on the way to this leaf: its later users would find
+       it unset) */
+    if (!is_compare(i->op) || br2_lazy(v) || vuses[v] != 1 || (fused[v] && fused[v] != FUSE_CMP) || n >= BR2_MAX || i->blk != blk)
         return 0xffffffffU;
     lv[n] = v;
     return n + 1;

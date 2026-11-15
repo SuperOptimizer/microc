@@ -829,6 +829,24 @@ static int asm_arith(u32 v)
     }
 }
 
+/* one MUFU instruction (tanh.approx and the like: ufsm act_ab's SiLU behind its "if (!G)"): taken at the default MCC_IFC; the
+   rest of asm_arith only above it (MCC_IFC 12 / 24 cost spills in lp_s2) */
+static int asm_mufu(u32 v)
+{
+    static const char *const ok[] = {"tanh.", "ex2.", "lg2.", "rcp.", "sqrt.", "rsqrt.", "sin.", "cos."};
+    u64 idx;
+    const char *t;
+    u32 k;
+    if (!ir_is_const(f, f->ins[v].c, &idx) || !asm_stmts[idx].dev)
+        return 0;
+    for (t = asm_stmts[idx].tmpl; *t == ' ' || *t == '\t' || *t == '\n'; t++)
+        ;
+    for (k = 0; k < sizeof ok / sizeof ok[0]; k++)
+        if (!strncmp(t, ok[k], strlen(ok[k])))
+            return !strchr(strchr(t, ';') ? strchr(t, ';') + 1 : t + strlen(t), ';') && !strchr(t, '{');
+    return 0;
+}
+
 /* Is block b empty, or one or two instructions that are safe and cheap to
    execute unconditionally? */
 static int cheap_block(u32 b)
@@ -841,7 +859,7 @@ static int cheap_block(u32 b)
                of a warp take differently makes them take turns (MCC_IFC=n: how many instructions) */
             if (op == OP_ASMOUT)
                 continue;
-            if (op == OP_CALL && (f->ins[v].flags & IF_ASM) && opt_ifc > 6 && asm_arith(v)) {
+            if (op == OP_CALL && (f->ins[v].flags & IF_ASM) && (opt_ifc > 6 || (!opt_noifasm && asm_mufu(v))) && asm_arith(v)) {
                 if ((n += 2) > (u32)opt_ifc)
                     return 0;
                 continue;

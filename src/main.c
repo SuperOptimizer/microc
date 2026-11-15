@@ -934,6 +934,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_shsym = getenv("MCC_SHSYM") != 0; /* PTX: shared symbols in a register set once (sh_syms; opt-in: ptxas then unrolls lp_s2 tap loops into their z-step loops) */
         opt_nocondrec = getenv("MCC_NOCONDREC") != 0; /* device code: a record chosen by ?: by its address (cond_expr) */
         opt_nodivcse = getenv("MCC_NODIVCSE") != 0; /* device code: integer divisions not numbered in gvn (as on the host) */
+        opt_noifasm = getenv("MCC_NOIFASM") != 0; /* device code: no if-conversion of arithmetic inline asm (tanh.approx ...) at the default MCC_IFC */
         opt_nohoist = getenv("MCC_NOHOIST") != 0; /* device code: no common values of sibling blocks moved up (gvn, hoist_to) */
         opt_nofastcall = getenv("MCC_NOFASTCALL") != 0; /* PTX: math calls under -use_fast_math as without it (fast_tmpl) */ /* PTX: keep the sign corrections of divisions by a constant (range_fold) */ /* PTX: a loop's moves after its branch out, in a block of their own */
         opt_unrollpeel = getenv("MCC_UNROLLPEEL") != 0; /* #pragma unroll N: N copies, then a loop of one (before 11-14) */

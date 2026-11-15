@@ -602,6 +602,17 @@ static u64 umax_of(Func *f, u32 v, int depth)
         m = umax_of(f, i->b, depth - 1);
         n = umax_of(f, i->c, depth - 1);
         return m > n ? m : n;
+    case OP_PHI: { /* (an argument that is the phi itself, round a loop, adds nothing) */
+        u32 k;
+        if (i->b > 8)
+            return full;
+        for (k = 0, m = 0; k < i->b && m < full; k++) {
+            u32 x = ir_resolve(f, f->xargs[i->a + k]);
+            n = x == v ? 0 : umax_of(f, x, depth - 1);
+            m = n > m ? n : m;
+        }
+        return m;
+    }
     default:
         return full;
     }
@@ -610,6 +621,12 @@ static u64 umax_of(Func *f, u32 v, int depth)
 u64 ir_umax32(Func *f, u32 v)
 {
     return umax_of(f, v, 4);
+}
+
+/* v (I32) is known not to be negative (a byte or halfword loaded unsigned, a mask ...) */
+int ir_nonneg(Func *f, u32 v)
+{
+    return f->ins[v].ty == IT_I32 && umax_of(f, v, 4) < 0x80000000UL;
 }
 
 static u32 half_of(Func *f, u32 v, int high)
@@ -984,6 +1001,9 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
         if (ir_is_const(f, a, &x))
             return ir_const(f, ty, x & 0xff);
         if ((ia->op == OP_LOAD && ia->mem == M_8U) || ia->op == OP_ZEXT8 || is_cmp(ia->op))
+            return a;
+        /* (a phi of truth values, from a bool function inlined: the zext8 of its result) */
+        if (!opt_dev_fn && !opt_dev_parse && ty == ia->ty && ia->op == OP_PHI && umax_of(f, a, 4) <= 0xff)
             return a;
         return 0;
     case OP_ZEXT16:

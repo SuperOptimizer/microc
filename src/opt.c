@@ -1339,6 +1339,108 @@ static u32 *count_uses(u32 *nuses)
     return uses;
 }
 
+/* Is block u reached only through s (a chain of blocks with one predecessor each, up to s)? */
+static int only_through(u32 u, u32 s)
+{
+    int n;
+    for (n = 0; n < 16; n++) {
+        if (u == s)
+            return 1;
+        if (f->blk[u].npreds != 1)
+            return 0;
+        u = f->blk[u].preds[0];
+    }
+    return 0;
+}
+
+/* The uses of x but skip: bit s set when all are beyond successor s of b (reached only through it, and it only
+   from b). */
+static int uses_beyond(u32 b, u32 x, u32 skip)
+{
+    Block *bb = &f->blk[b];
+    u32 c, v, k, n, *ops, s[2];
+    int res = 0, side;
+    if (f->nins > 200000)
+        return 0;
+    s[0] = bb->succ[0];
+    s[1] = bb->succ[1];
+    for (side = 0; side < 2; side++) {
+        int good = s[side] != b && s[0] != s[1] && f->blk[s[side]].npreds == 1;
+        for (c = 1; c < f->nblk && good; c++) {
+            Block *cb = &f->blk[c];
+            if (cb->term == TERM_NONE)
+                continue;
+            for (v = cb->phis; v && good; v = f->ins[v].next)
+                for (k = 0; k < f->ins[v].b && good; k++)
+                    if (ir_resolve(f, f->xargs[f->ins[v].a + k]) == x && (v == x || !only_through(cb->preds[k], s[side])))
+                        good = 0;
+            for (v = cb->first; v && good; v = f->ins[v].next) {
+                if (v == skip)
+                    continue;
+                IR_OPS(f, &f->ins[v], ops, n);
+                for (k = 0; k < n && good; k++)
+                    if (ir_resolve(f, ops[k]) == x && !only_through(c, s[side]))
+                        good = 0;
+                if (f->ins[v].op == OP_CALL && ir_resolve(f, f->ins[v].c) == x && !only_through(c, s[side]))
+                    good = 0;
+            }
+            if (good && cb->arg && ir_resolve(f, cb->arg) == x && !only_through(c, s[side]))
+                good = 0;
+        }
+        if (good)
+            res |= 1 << side;
+    }
+    return res;
+}
+
+/* The phis of block b other than p: bit s set when all their uses are beyond successor s of b (reached only through
+   it, and it only from b), so that a predecessor sent past b to the other successor needs none of them. */
+static int phis_under(u32 b, u32 p)
+{
+    Block *bb = &f->blk[b];
+    u32 c, v, k, n, *ops, s[2];
+    int res = 0, side;
+    if (f->nins > 200000)
+        return 0;
+    s[0] = bb->succ[0];
+    s[1] = bb->succ[1];
+    for (side = 0; side < 2; side++) {
+        int good = s[side] != b && s[0] != s[1] && f->blk[s[side]].npreds == 1;
+        for (c = 1; c < f->nblk && good; c++) {
+            Block *cb = &f->blk[c];
+            if (cb->term == TERM_NONE)
+                continue;
+            for (v = cb->phis; v && good; v = f->ins[v].next)
+                for (k = 0; k < f->ins[v].b && good; k++) {
+                    u32 x = ir_resolve(f, f->xargs[f->ins[v].a + k]);
+                    if (x != p && f->ins[x].op == OP_PHI && f->ins[x].blk == b && (x == v || !only_through(cb->preds[k], s[side])))
+                        good = 0;
+                }
+            for (v = cb->first; v && good; v = f->ins[v].next) {
+                IR_OPS(f, &f->ins[v], ops, n);
+                for (k = 0; k < n && good; k++) {
+                    u32 x = ir_resolve(f, ops[k]);
+                    if (x != p && f->ins[x].op == OP_PHI && f->ins[x].blk == b && !only_through(c, s[side]))
+                        good = 0;
+                }
+                if (f->ins[v].op == OP_CALL) {
+                    u32 x = ir_resolve(f, f->ins[v].c);
+                    if (x != p && f->ins[x].op == OP_PHI && f->ins[x].blk == b && !only_through(c, s[side]))
+                        good = 0;
+                }
+            }
+            if (good && cb->arg) {
+                u32 x = ir_resolve(f, cb->arg);
+                if (x != p && f->ins[x].op == OP_PHI && f->ins[x].blk == b && !only_through(c, s[side]))
+                    good = 0;
+            }
+        }
+        if (good)
+            res |= 1 << side;
+    }
+    return res;
+}
+
 static int simplify_cfg(void)
 {
     u32 b, v, k;
@@ -1403,10 +1505,25 @@ static int simplify_cfg(void)
                block: each predecessor can decide the branch itself. One that
                supplies a constant goes straight to the right successor; one
                that ends in a jump gets its own copy of the branch. */
-            if (bb->term == TERM_BR && bb->phis && !f->ins[bb->phis].next) {
-                u32 p = bb->phis, cmp = 0;
-                int inv = 0, ok = 0;
-                if (!bb->first && bb->arg == p) {
+            if (bb->term == TERM_BR && bb->phis && (!f->ins[bb->phis].next || (!opt_dev_fn && opt_level >= 2))) {
+                u32 p = bb->phis, cmp = 0, cop = OP_NE, nphi = 0, q, np;
+                int inv = 0, ok = 0, under = 3, pside; /* pside: see below */ /* under: bit s, the other phis are used only beyond successor s */
+                u64 ck = 0;
+                for (q = bb->phis; q; q = f->ins[q].next)
+                    nphi++;
+                if (nphi > 1) {
+                    /* several phis (a bool function inlined that also wrote through a pointer): the branch's own is
+                       found from the branch */
+                    u32 x = ir_resolve(f, bb->arg);
+                    if (bb->first && bb->first == bb->last && x == bb->first)
+                        x = ir_resolve(f, f->ins[x].a);
+                    p = f->ins[x].op == OP_PHI && f->ins[x].blk == b ? x : 0;
+                    under = p && nphi <= 5 ? phis_under(b, p) : 0;
+                    if (!under)
+                        p = 0;
+                }
+                if (!p) {
+                } else if (!bb->first && bb->arg == p) {
                     ok = 1;
                 } else if (bb->first && bb->first == bb->last && bb->arg == bb->first) {
                     Ins *ci = &f->ins[bb->first];
@@ -1416,32 +1533,57 @@ static int simplify_cfg(void)
                         ok = 1;
                         cmp = bb->first;
                         inv = ci->op == OP_EQ;
+                    } else if (!opt_dev_fn && ci->op >= OP_SLT && ci->op <= OP_UGE && ir_resolve(f, ci->a) == p &&
+                               (f->ins[p].ty == IT_I32 || f->ins[p].ty == IT_I64) && ir_is_const(f, ir_resolve(f, ci->b), &z)) {
+                        /* x < k and the like (a function returning -1 for failure, inlined: its result < 0) */
+                        ok = 1;
+                        cmp = bb->first;
+                        cop = ci->op;
+                        ck = z;
                     }
                 }
                 if (ok && !uses) {
                     uses = count_uses(&nuses);
                     bb = &f->blk[b];
                 }
-                if (ok && p < nuses && uses[p] == 1 && (!cmp || (cmp < nuses && uses[cmp] == 1))) {
+                /* the phi used beyond the branch too (the symbol a decoder's function returned, -1 for failure): only
+                   when all those uses are beyond one successor; a predecessor sent there gets a phi of its own value
+                   there, one sent to the other needs none */
+                pside = -1;
+                np = 0;
+                if (ok && cmp && p < nuses && uses[p] > 1 && cmp < nuses && uses[cmp] == 1 && !opt_dev_fn && opt_level >= 2) {
+                    int u = uses_beyond(b, p, cmp);
+                    pside = u & 1 ? 0 : u & 2 ? 1 : -1;
+                    if (pside < 0)
+                        ok = 0;
+                }
+                if (ok && p < nuses && (uses[p] == 1 || pside >= 0) && (!cmp || (cmp < nuses && uses[cmp] == 1))) {
                     u32 s0 = bb->succ[0], s1 = bb->succ[1];
                     int pty = f->ins[p].ty;
                     for (k = 0; k < bb->npreds && f->ins[p].op == OP_PHI;) {
                         u32 pr = bb->preds[k], target, j, tv;
                         Block *pb = &f->blk[pr], *tb;
-                        u32 arg = ir_resolve(f, f->xargs[f->ins[p].a + k]);
+                        u32 arg = ir_resolve(f, f->xargs[f->ins[p].a + k]), arg0 = arg;
                         if (pr == b) {
                             k++;
                             continue;
                         }
+                        if (!ir_is_const(f, arg, &c) && cop >= OP_SLT && cop <= OP_SGE && pty == IT_I32 && ir_nonneg(f, arg) &&
+                            (i64)(i32)(u32)ck <= ((cop == OP_SLT || cop == OP_SGE) ? 0 : -1)) {
+                            /* a value that is not negative against a bound at or below zero: decided (the -1 / byte
+                               result of a decoder's symbol function) */
+                            arg = ir_const(f, pty, 0x7fffffff); /* (compares as any such value would) */
+                        }
                         if (!ir_is_const(f, arg, &c)) {
                             u32 cond, saved = f->cur, t;
-                            if (pb->term != TERM_JMP || s0 == s1 || s0 == b || s1 == b || pty != IT_I32 ||
+                            if (nphi > 1 || pside >= 0 || pb->term != TERM_JMP || s0 == s1 || s0 == b || s1 == b || pty != IT_I32 ||
                                 pred_index(s0, pr) != 0xffffffffU || pred_index(s1, pr) != 0xffffffffU) {
                                 k++;
                                 continue;
                             }
                             f->cur = pr;
-                            cond = ir_ins(f, inv ? OP_EQ : OP_NE, IT_I32, arg, ir_const(f, pty, 0));
+                            cond = cop != OP_NE ? ir_ins(f, cop, IT_I32, arg, ir_const(f, pty, ck))
+                                                : ir_ins(f, inv ? OP_EQ : OP_NE, IT_I32, arg, ir_const(f, pty, 0));
                             f->cur = saved;
                             pb = &f->blk[pr];
                             for (t = 0; t < 2; t++) {
@@ -1462,18 +1604,68 @@ static int simplify_cfg(void)
                             again = 1;
                             continue;
                         }
-                        if (inv)
+                        if (cop != OP_NE) {
+                            /* the comparison of the constant, in the phi's width */
+                            int w64 = pty == IT_I64;
+                            i64 sa = w64 ? (i64)c : (i64)(i32)(u32)c, sb = w64 ? (i64)ck : (i64)(i32)(u32)ck;
+                            u64 ua = w64 ? c : c & 0xffffffffUL, ub = w64 ? ck : ck & 0xffffffffUL;
+                            switch (cop) {
+                            case OP_SLT: c = sa < sb; break;
+                            case OP_SLE: c = sa <= sb; break;
+                            case OP_SGT: c = sa > sb; break;
+                            case OP_SGE: c = sa >= sb; break;
+                            case OP_ULT: c = ua < ub; break;
+                            case OP_ULE: c = ua <= ub; break;
+                            case OP_UGT: c = ua > ub; break;
+                            default: c = ua >= ub; break;
+                            }
+                        } else if (inv)
                             c = !c;
                         target = c ? s0 : s1;
                         tb = &f->blk[target];
-                        if (target == b || pred_index(target, pr) != 0xffffffffU) {
+                        if (target == b || pred_index(target, pr) != 0xffffffffU || (nphi > 1 && !(under >> (c ? 1 : 0) & 1)) ||
+                            (nsuccs(pb) == 2 && pb->succ[0] == pb->succ[1])) {
                             k++;
                             continue;
+                        }
+                        if (pside >= 0 && target == (pside ? s1 : s0) && !np) {
+                            /* the first sent where the phi is used: a phi there takes its uses */
+                            u32 c2, w, n2, *o2;
+                            if (tb->npreds != 1) {
+                                k++;
+                                continue;
+                            }
+                            np = ir_phi(f, target, pty);
+                            f->xargs[f->ins[np].a] = p;
+                            for (c2 = 1; c2 < f->nblk; c2++) {
+                                Block *cb = &f->blk[c2];
+                                if (cb->term == TERM_NONE)
+                                    continue;
+                                /* (a phi's argument by the block it comes from) */
+                                for (w = cb->phis; w; w = f->ins[w].next)
+                                    if (w != np)
+                                        for (j = 0; j < f->ins[w].b; j++)
+                                            if (ir_resolve(f, f->xargs[f->ins[w].a + j]) == p && only_through(cb->preds[j], target))
+                                                f->xargs[f->ins[w].a + j] = np;
+                                if (!only_through(c2, target))
+                                    continue;
+                                for (w = cb->first; w; w = f->ins[w].next) {
+                                    IR_OPS(f, &f->ins[w], o2, n2);
+                                    for (j = 0; j < n2; j++)
+                                        if (ir_resolve(f, o2[j]) == p)
+                                            o2[j] = np;
+                                    if (f->ins[w].op == OP_CALL && ir_resolve(f, f->ins[w].c) == p)
+                                        f->ins[w].c = np;
+                                }
+                                if (cb->arg && ir_resolve(f, cb->arg) == p)
+                                    cb->arg = np;
+                            }
+                            tb = &f->blk[target];
                         }
                         /* the new edge carries the same phi values as the edge from b */
                         j = pred_index(target, b);
                         for (tv = tb->phis; tv; tv = f->ins[tv].next)
-                            ir_phi_add_arg(f, tv, f->xargs[f->ins[tv].a + j]);
+                            ir_phi_add_arg(f, tv, tv == np ? arg0 : f->xargs[f->ins[tv].a + j]);
                         ir_add_pred(f, target, pr);
                         for (j = 0; j < nsuccs(pb); j++)
                             if (pb->succ[j] == b)

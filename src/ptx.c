@@ -890,7 +890,9 @@ static void set_pred_n(u32 v, int n)
     case OP_FGT: c = "gt"; t = fty(oty); break;
     default: c = "ge"; t = fty(oty); break;
     }
-    P("\tsetp.%s.%s %%p%d, %s, %s;\n", c, t, n, ropnd(i->a), opnd(i->b));
+    /* (fast math: a float compare flushes subnormal operands as nvcc's -use_fast_math writes it, setp.gt.ftz.f32; without it a
+       subnormal compared above 0 and the .ftz divide after it then read it as 0: ufsm hgs_exp(1e-40) gave 2^30, test_hgsdev) */
+    P("\tsetp.%s%s.%s %%p%d, %s, %s;\n", c, i->op >= OP_FEQ && i->op <= OP_FGE ? FTZ(oty) : "", t, n, ropnd(i->a), opnd(i->b));
 }
 
 static void set_pred(u32 v)

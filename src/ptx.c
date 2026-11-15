@@ -36,7 +36,7 @@ extern char opt_cuda_target[24];
 int opt_dev_fn;
 int opt_norange, opt_nofastexp, opt_noifasm, opt_shsym, opt_nocondrec, opt_nodivcse, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
-int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
+int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6, opt_noparm;
 u32 ptx_maxntid;
 static u32 *byoff;     /* of an OP_BYVAL: where in the frame its copy is */
 static u32 *hostsyms;  /* host objects the device code addresses */
@@ -309,6 +309,9 @@ static const char *temp(int cls)
 
 static int remat; /* the body is being written: an address that is a constant is worked out where it is read */
 static const char *kern_name;
+static int *pm_h;  /* (a kernel's parameter blocks, below) */
+static u8 *pm_s;
+static u32 param_index(Func *f, u32 k);
 static const char *addr_const(u32 v);
 static const char *param_const(u32 v);
 static int premat; /* a kernel's parameters are read where they are used (MCC_PREMAT), not held from the start */
@@ -441,6 +444,11 @@ static const char *addr_const(u32 v)
     const char *t = temp(cls_of(i->ty));
     if (i->op == OP_ADDR && special_of(i->a) >= 0) {
         P("\tadd.u64 %s, %%SP, %ld;\n", t, (long)special_off[special_of(i->a)] + (long)(i32)i->b);
+    } else if (i->op == OP_SLOT && pm_h && pm_h[i->a] >= 0) {
+        /* a kernel's parameter block: its address in the .param space */
+        P("\tmov.u64 %s, %s_param_%u;\n", t, kern_name, param_index(PF, (u32)pm_h[i->a]));
+        if (i->b)
+            P("\tadd.u64 %s, %s, %ld;\n", t, t, (long)(i32)i->b);
     } else if (i->op == OP_SLOT) {
         P("\tadd.u64 %s, %%SP, %ld;\n", t, (long)slotoff[i->a] + (long)(i32)i->b);
     } else {
@@ -487,7 +495,19 @@ static const char *maddr(u32 a)
     if (addr_sum(a, &off))
         a = RV(PF->ins[a].a);
     i = &PF->ins[a];
-    if (remat && (i->op == OP_SLOT || (i->op == OP_ADDR && special_of(i->a) >= 0))) {
+    if (remat && i->op == OP_SLOT && pm_h && pm_h[i->a] >= 0) {
+        /* (a kernel's name is longer than obuf's: buffers of their own) */
+        static char *pb[4];
+        static u32 pn;
+        char **t = &pb[pn++ & 3];
+        off += (i64)(i32)i->b;
+        *t = (char *)xrealloc(*t, strlen(kern_name) + 48);
+        if (off)
+            sprintf(*t, "%s_param_%u+%ld", kern_name, param_index(PF, (u32)pm_h[i->a]), (long)off);
+        else
+            sprintf(*t, "%s_param_%u", kern_name, param_index(PF, (u32)pm_h[i->a]));
+        return *t;
+    } else if (remat && (i->op == OP_SLOT || (i->op == OP_ADDR && special_of(i->a) >= 0))) {
         base = "%SP";
         off += (i64)(i->op == OP_SLOT ? slotoff[i->a] : special_off[special_of(i->a)]) + (i64)(i32)i->b;
     } else {
@@ -514,6 +534,8 @@ static const char *local_maddr(u32 a)
         a = RV(PF->ins[a].a);
     i = &PF->ins[a];
     if (i->op != OP_SLOT && !(i->op == OP_ADDR && special_of(i->a) >= 0))
+        return 0;
+    if (i->op == OP_SLOT && pm_h && pm_h[i->a] >= 0)
         return 0;
     off += (i64)(i->op == OP_SLOT ? slotoff[i->a] : special_off[special_of(i->a)]) + (i64)(i32)i->b;
     s = obuf();
@@ -1339,6 +1361,132 @@ static void cn_find(Func *f)
     free(esc);
 }
 
+/* ---- a kernel's parameter blocks ----
+   A kernel's struct parameter arrives as doublewords of the .param space that the front end stores into a slot of the
+   frame (parse.c), so that members read at constant places become values. One read at a place worked out at run time
+   (p.ta[q]) kept the slot: 240 bytes of local memory filled at the start and LDL in the loop, where nvcc reads the
+   parameter itself (LDC from the constant bank). When the slot's only stores are those of the parameter's own
+   doublewords at their own offsets and every other reader of an address worked out from it is a load (or such a sum),
+   the loads are ld.param from the parameter (an address of a kernel's parameter is one of the .param space) and the
+   slot and its stores go. Anything else (a copy, a call, a stored pointer, a comparison) keeps the slot. */
+/* pm_h: per slot, the PTX parameter whose block it copies, or -1; pm_s: per value, an address in such a slot */
+
+/* store v is one of the front end's, of doubleword k of a block parameter into its slot at 8k: the slot (else -1) */
+static int pm_init(Func *f, u32 v, u32 *h_out)
+{
+    Ins *i = &f->ins[v], *a, *x;
+    i64 off = 0;
+    u32 r = RV(i->a), pk, h;
+    if (i->op != OP_STORE || i->mem != M_64)
+        return -1;
+    if (addr_sum(r, &off))
+        r = RV(f->ins[r].a);
+    a = &f->ins[r];
+    if (a->op != OP_SLOT)
+        return -1;
+    off += (i64)(i32)a->b;
+    x = &f->ins[RV(i->b)];
+    if (x->op != OP_PARAM || !(f->param_ty[x->a] & 0xc0))
+        return -1;
+    pk = x->a;
+    for (h = pk; h && (f->param_ty[h] & 0x40); h--)
+        ;
+    if (off != 8 * (i64)(pk - h))
+        return -1;
+    *h_out = h;
+    return (int)a->a;
+}
+
+static void pm_find(Func *f)
+{
+    u32 v, k, n, *p, h;
+    int changed, again, s;
+    u8 *esc;
+    for (k = 0; k < f->nslots; k++)
+        pm_h[k] = -2;
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        if (!i->blk || i->op != OP_STORE)
+            continue;
+        if ((s = pm_init(f, v, &h)) >= 0)
+            pm_h[s] = pm_h[s] == -2 || pm_h[s] == (int)h ? (int)h : -1;
+    }
+    for (k = 0; k < f->nslots; k++)
+        if (pm_h[k] == -2)
+            pm_h[k] = -1;
+    esc = (u8 *)xmalloc((size_t)f->nins + 1);
+    do {
+        again = 0;
+        memset(pm_s, 0, f->nins + 1);
+        for (v = 1; v < f->nins; v++)
+            if (f->ins[v].op == OP_SLOT && pm_h[f->ins[v].a] >= 0)
+                pm_s[v] = 1;
+        do {
+            changed = 0;
+            for (v = 1; v < f->nins; v++) {
+                Ins *i = &f->ins[v];
+                int is = 0;
+                if (pm_s[v] || !i->blk || i->ty != IT_I64)
+                    continue;
+                if (i->op == OP_ADD)
+                    is = !pm_s[RV(i->a)] != !pm_s[RV(i->b)];
+                else if (i->op == OP_SUB)
+                    is = pm_s[RV(i->a)] && !pm_s[RV(i->b)];
+                else if (i->op == OP_SELECT)
+                    is = pm_s[RV(i->b)] && pm_s[RV(i->c)] && !pm_s[RV(i->a)];
+                else if (i->op == OP_PHI && i->b) {
+                    is = 1;
+                    for (k = 0; k < i->b; k++)
+                        is &= pm_s[RV(f->xargs[i->a + k])];
+                }
+                if (is) {
+                    pm_s[v] = 1;
+                    changed = 1;
+                }
+            }
+        } while (changed);
+        memset(esc, 0, f->nins + 1);
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            if (!i->blk || i->op == OP_SLOT)
+                continue;
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++) {
+                u32 x = RV(p[k]);
+                int ok;
+                if (!x || x >= f->nins || !pm_s[x])
+                    continue;
+                ok = (i->op == OP_LOAD && p + k == &i->a) || (i->op == OP_STORE && p + k == &i->a && pm_init(f, v, &h) >= 0) ||
+                     (pm_s[v] && (i->op == OP_ADD || i->op == OP_SUB || i->op == OP_PHI || (i->op == OP_SELECT && p + k != &i->a)));
+                if (!ok)
+                    esc[x] = 1;
+            }
+        }
+        do {
+            changed = 0;
+            for (v = 1; v < f->nins; v++) {
+                Ins *i = &f->ins[v];
+                if (!pm_s[v] || i->op == OP_SLOT)
+                    continue;
+                IR_OPS(f, i, p, n);
+                for (k = 0; k < n; k++) {
+                    u32 x = RV(p[k]);
+                    if (!x || x >= f->nins || !pm_s[x] || esc[x] == esc[v])
+                        continue;
+                    esc[x] = esc[v] = 1;
+                    changed = 1;
+                }
+            }
+        } while (changed);
+        for (v = 1; v < f->nins; v++)
+            if (esc[v] && f->ins[v].op == OP_SLOT && pm_h[f->ins[v].a] >= 0) {
+                pm_h[f->ins[v].a] = -1;
+                again = 1;
+            }
+    } while (again);
+    free(esc);
+}
+
 /* (a pointer that is one of several is of global memory when the others are, or are null: a null arm is
    neutral, level 2) */
 #define GL_LEVEL(x) (f->ins[x].op == OP_CONST && !f->ins[x].a && !f->ins[x].b ? 2 : gl_s[x])
@@ -1991,6 +2139,10 @@ static void emit_ins(u32 v)
             P("\tld.shared.%s %s, [%s];\n", lt[i->mem], reg(v), a);
             return;
         }
+        if (pm_s && pm_s[RV(i->a)]) {
+            P("\tld.param.%s %s, [%s];\n", lt[i->mem], reg(v), maddr(i->a));
+            return;
+        }
         if ((a = local_maddr(i->a)) != 0) {
             P("\tld.local.%s %s, [%s];\n", lt[i->mem], reg(v), a);
             return;
@@ -2016,6 +2168,8 @@ static void emit_ins(u32 v)
             P("\tst.shared.%s [%s], %s;\n", stt[i->mem], a, b);
             return;
         }
+        if (pm_s && pm_s[RV(i->a)])
+            return; /* the front end's copy of a kernel's parameter block, read where it is (pm_find) */
         if ((a = local_maddr(i->a)) != 0) {
             b = ropnd(i->b);
             P("\tst.local.%s [%s], %s;\n", stt[i->mem], a, b);
@@ -3594,6 +3748,13 @@ void ptx_gen(Func *f, Obj *o, int entry)
     }
     cn_s = (u8 *)xmalloc((size_t)f->nins + 1);
     cn_find(f);
+    pm_h = 0;
+    pm_s = 0;
+    if (entry && !opt_noparm) {
+        pm_h = (int *)xmalloc(((size_t)f->nslots + 1) * sizeof(int));
+        pm_s = (u8 *)xmalloc((size_t)f->nins + 1);
+        pm_find(f);
+    }
     gl_s = 0;
     if (entry && !opt_noglobal) {
         gl_s = (u8 *)xmalloc((size_t)f->nins + 1);
@@ -3614,7 +3775,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     for (k = 0; k < f->nslots; k++)
         slotoff[k] = 0xffffffffU;
     for (v = 1; v < f->nins; v++)
-        if (used[v] && f->ins[v].op == OP_SLOT && slotoff[f->ins[v].a] == 0xffffffffU) {
+        if (used[v] && f->ins[v].op == OP_SLOT && slotoff[f->ins[v].a] == 0xffffffffU && !(pm_h && pm_h[f->ins[v].a] >= 0)) {
             Slot *sl = &f->slots[f->ins[v].a];
             u32 al = sl->align ? sl->align : 1;
             frame = (frame + al - 1) & ~(al - 1);
@@ -3788,6 +3949,10 @@ void ptx_gen(Func *f, Obj *o, int entry)
     lc_s = 0;
     free(cn_s);
     cn_s = 0;
+    free(pm_h);
+    free(pm_s);
+    pm_h = 0;
+    pm_s = 0;
     gl_s = 0;
     free(slotoff);
     free(byoff);

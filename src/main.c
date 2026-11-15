@@ -991,6 +991,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_cuda = force_cuda || has_suffix(in, ".cu");
         opt_nounroll = getenv("MCC_NOUNROLL") != 0;
         opt_nolocal = getenv("MCC_NOLOCAL") != 0; /* PTX: the frame through generic [%SP] */
+        opt_noparm = getenv("MCC_NOPARM") != 0; /* PTX: a kernel's struct parameter read from its copy in the frame */
         opt_nored = getenv("MCC_NORED") != 0; /* PTX: atom for atomics whose old value is not read */
         opt_nonc = getenv("MCC_NONC") != 0; /* PTX: no ld.global.nc through const restrict kernel pointers */
         opt_nolatch = getenv("MCC_NOLATCH") != 0;
@@ -1019,6 +1020,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_nodist = getenv("MCC_NODIST") != 0;
         opt_noifcall = getenv("MCC_NOIFCALL") != 0;
         opt_nolocal = getenv("MCC_NOLOCAL") != 0;
+        opt_noparm = getenv("MCC_NOPARM") != 0;
         opt_noxrem = getenv("MCC_NOXREM") ? (getenv("MCC_NOXREM")[0] >= '2' && getenv("MCC_NOXREM")[0] <= '3' ? getenv("MCC_NOXREM")[0] - '0' : 1) : 0;
         opt_nowiden = getenv("MCC_NOWIDEN") ? 1 : getenv("MCC_WIDEN") ? 2 : 0;
         opt_noglobal = getenv("MCC_NOGLOBAL") != 0;

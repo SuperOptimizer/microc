@@ -299,7 +299,7 @@ extern int opt_fmad; /* CUDA device code: a product and a sum become one fused o
 extern int opt_noparamfwd;
 extern int opt_norange, opt_nofastexp, opt_noifasm, opt_shsym, opt_nocondrec, opt_nodivcse, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 extern u32 opt_automax, opt_aumax;
-extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc;
+extern int opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_nominmax, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc, opt_noparm;
 extern int opt_dev_code, opt_dolicm; /* the function being read is device code only; MCC_LICM: its loops are hoisted from all the same */ /* debugging: MCC_NOUNROLL, MCC_NOSPLIT in the environment */
 extern int opt_dev_fn; /* the function being optimised is device code */
 extern int opt_fastmath; /* CUDA device code, nvcc's -use_fast_math: single precision flushes denormal numbers to zero

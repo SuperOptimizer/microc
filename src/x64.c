@@ -2433,12 +2433,12 @@ static void sel_term(u32 b, u32 next)
                 lv[n2] = 0;
             nl = br2_leaves(bb->arg, f->ins[bb->arg].op, lv, 0, 1, b);
             for (n2 = 0; n2 + 1 < nl; n2++) {
-                cc = emit_compare(lv[n2]);
+                cc = emit_cond(lv[n2]);
                 m = emit(X_JCC, 0, NOREG, NOREG, NOREG);
                 m->cc = (u8)(isand ? cc ^ 1 : cc);
                 m->imm = blk_index[isand ? e : t];
             }
-            cc = emit_compare(lv[nl - 1]);
+            cc = emit_cond(lv[nl - 1]);
         } else {
             cc = emit_cond(bb->arg);
         }
@@ -2743,7 +2743,7 @@ static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk)
     u32 k, o[2];
     if (n == 0xffffffffU)
         return n;
-    if (i->op == op && i->ty == IT_I32 && uses[v] == 1 && (!fused[v] || fused[v] == FUSE_BR2)) {
+    if (i->op == op && i->ty == IT_I32 && uses[v] == 1 && i->blk == blk && (!fused[v] || fused[v] == FUSE_BR2)) {
         if (!check)
             fused[v] = FUSE_BR2;
         o[0] = i->a;
@@ -2754,6 +2754,14 @@ static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk)
                 return n;
         }
         return n;
+    }
+    /* a value in a register of its own (any value for an or, a truth value for an and): tested where the branch is.
+       That is how an || chain's tests that a loop does not change, grouped by opt.c and taken out of it, cost one
+       test and branch per iteration. */
+    if (!is_compare(i->op) && i->ty == IT_I32 && i->op != OP_CONST && (!fused[v] || fused[v] == FUSE_ALIAS || fused[v] == FUSE_MOV) &&
+        (op == OP_OR || ir_is_bool(f, v, 3)) && n < BR2_MAX) {
+        lv[n] = v;
+        return n + 1;
     }
     /* a leaf used elsewhere only as a condition (a later if on the same test): those set the flags again */
     if (!is_compare(i->op) || vuses[v] != 1 || (fused[v] && fused[v] != FUSE_CMP) || n >= BR2_MAX || i->blk != blk)
@@ -3017,7 +3025,8 @@ static void prepare(void)
         }
         br2_leaves(x, f->ins[x].op, lv, 0, 0, layout[k]);
         for (n = 0; n < nl; n++)
-            fused[lv[n]] = FUSE_CMP;
+            if (is_compare(f->ins[lv[n]].op))
+                fused[lv[n]] = FUSE_CMP;
     }
     /* an and used once, to branch on whether it is zero, or by comparisons with zero that are
        themselves only conditions */

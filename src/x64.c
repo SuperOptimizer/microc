@@ -2681,12 +2681,16 @@ static int edge_cmp(const void *a, const void *b)
 
 #define COUNT(b) (f->blk[b].freq ? f->blk[b].freq - 1 : 1)
 
+static int opt_noedgew = -1; /* MCC_NOEDGEW: a branch edge into a block of several predecessors weighs min(b, t) again */
+
 static void profile_layout(void)
 {
     Edge *e = (Edge *)xmalloc((size_t)nlayout * 2 * sizeof(Edge));
     u32 *chain = (u32 *)xmalloc((size_t)f->nblk * 4 * sizeof(u32)); /* chain a block is in, by its first block */
     u32 *next = chain + f->nblk, *tail = next + f->nblk, *out = tail + f->nblk;
     u32 k, s, ne = 0, n = 0, pass;
+    if (opt_noedgew < 0)
+        opt_noedgew = getenv("MCC_NOEDGEW") != 0;
     for (k = 0; k < nlayout; k++) {
         u32 b = layout[k];
         Block *bb = &f->blk[b];
@@ -2698,6 +2702,12 @@ static void profile_layout(void)
             if (ns == 2 && bb->succ[0] == bb->succ[1] && s)
                 break;
             w = f->blk[t].npreds == 1 ? COUNT(t) : ns == 1 ? COUNT(b) : COUNT(b) < COUNT(t) ? COUNT(b) : COUNT(t);
+            if (ns == 2 && f->blk[t].npreds > 1 && f->blk[bb->succ[1 - s]].npreds == 1 && !opt_noedgew) {
+                /* the other way's block is entered from b alone, so its count is that edge's: this edge takes the rest
+                   (was min(b, t): a branch to a loop's latch outweighed the loop's body and the body went out of line) */
+                u32 o = COUNT(bb->succ[1 - s]);
+                w = COUNT(b) > o ? COUNT(b) - o : 0;
+            }
             if (!w && (COUNT(b) || COUNT(t)))
                 continue; /* nothing cold goes on the end of a path that runs */
             e[ne].w = w;
@@ -5548,6 +5558,8 @@ static u32 fx_len(const Fixup *fx)
     return fx->state == 2 ? 0 : fx->state == 1 ? 2 : fx_long(fx);
 }
 
+static int opt_nojj = -1; /* MCC_NOJJ: jumps to a jump stay */
+
 /* The jumps between blocks were all written in their long forms. Here "jcc A; jmp B; A:" becomes
    "jncc B" (when the two are in one block), jumps to the next instruction go, and the rest become short where the distance allows; the
    code moves together and the relocations made since first_rel move with it. (Not with inline assembly
@@ -5556,11 +5568,34 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
 {
     u32 k, bi, removed = 0, src, dst, *cut, *nb;
     int changed;
+    if (opt_nojj < 0)
+        opt_nojj = getenv("MCC_NOJJ") != 0;
 
     if (fixed) {
         for (k = 0; k < nfixups; k++)
             put_u32le(text->p + fixups[k].off, blk_off[fixups[k].target] - (fixups[k].off + 4));
         return;
+    }
+    if (!opt_nojj) {
+        /* a jump to a block that is only a jump goes to where that one goes (clang: branch folding); the block stays
+           for whatever falls into it */
+        u32 *jf = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));
+        for (bi = 0; bi < mf.nblk; bi++)
+            jf[bi] = 0xffffffffU;
+        for (k = 0, bi = 0; k < nfixups; k++) {
+            while (bi < mf.nblk && blk_off[bi] < fixups[k].off - 1)
+                bi++;
+            for (; bi < mf.nblk && blk_off[bi] == fixups[k].off - 1; bi++)
+                if (fixups[k].kind == FK_JMP && text->p[fixups[k].off - 1] == 0xe9)
+                    jf[bi] = k;
+        }
+        for (k = 0; k < nfixups; k++) {
+            u32 hops = 0, t = fixups[k].target;
+            while (jf[t] != 0xffffffffU && jf[t] != k && hops++ < 8)
+                t = fixups[jf[t]].target;
+            fixups[k].target = t;
+        }
+        free(jf);
     }
     for (k = 0, bi = 0; k + 1 < nfixups; k++) {
         Fixup *a = &fixups[k], *b = &fixups[k + 1];

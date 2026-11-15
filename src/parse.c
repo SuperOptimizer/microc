@@ -3263,6 +3263,52 @@ static void call(Expr *e)
             return;
         }
     }
+    /* The C library's number classification, which <math.h> calls under __SUPPORT_SNAN__ (mcc defines it, so isnan,
+       isinf, isfinite and signbit come here as __isnan(f), __isinf(f), __finite(f), __signbit(f)): comparisons in line.
+       A call each time otherwise, in the guards of hot loops (ufsm has ~230 of them), which also kept what the loop
+       holds in caller-saved registers off them and its loads from being reused. Same results as the library's:
+       __isinf is 1 for +inf, -1 for -inf; the others 1 or 0. MCC_NOFPCLASS: the calls. */
+    if (!flags && nargs == 1 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && type_is_int(ret) && type_ir(ret) == IT_I32 &&
+        (F->ins[args[0]].ty == IT_F32 || F->ins[args[0]].ty == IT_F64) && !getenv("MCC_NOFPCLASS")) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        int it = F->ins[args[0]].ty, f32 = it == IT_F32, k = -1;
+        static const char *const nm[4][3] = {{"__isnan", "isnan", "isnanf"}, {"__isinf", "isinf", "isinff"},
+                                              {"__finite", "finite", "finitef"}, {"__signbit", "", ""}};
+        int j;
+        for (j = 0; j < 4 && k < 0; j++) {
+            /* (the double names; float ones carry an f: __isnanf, isnanf) */
+            char b0[16];
+            size_t l0 = strlen(nm[j][0]);
+            memcpy(b0, nm[j][0], l0);
+            b0[l0] = 'f';
+            b0[l0 + 1] = 0;
+            if (strcmp(cn, f32 ? b0 : nm[j][0]) == 0 || (f32 ? (nm[j][2][0] && strcmp(cn, nm[j][2]) == 0)
+                                                               : (nm[j][1][0] && strcmp(cn, nm[j][1]) == 0)))
+                k = j;
+        }
+        if (k >= 0) {
+            u32 x = args[0], r, pinf = ir_fconst(F, it, 1.0 / 0.0), ninf = ir_fconst(F, it, -1.0 / 0.0);
+            if (k == 0) {
+                r = ir_ins(F, OP_FNE, IT_I32, x, x);
+            } else if (k == 1) {
+                u32 t = ir_raw(F, OP_SELECT, IT_I32, ir_ins(F, OP_FEQ, IT_I32, x, ninf), ir_const(F, IT_I32, (u64)-1));
+                F->ins[t].c = ir_const(F, IT_I32, 0);
+                ir_append(F, F->cur, t);
+                r = ir_raw(F, OP_SELECT, IT_I32, ir_ins(F, OP_FEQ, IT_I32, x, pinf), ir_const(F, IT_I32, 1));
+                F->ins[r].c = t;
+                ir_append(F, F->cur, r);
+            } else if (k == 2) {
+                /* both false for a NaN */
+                r = ir_ins(F, OP_AND, IT_I32, ir_ins(F, OP_FLT, IT_I32, x, pinf), ir_ins(F, OP_FGT, IT_I32, x, ninf));
+            } else {
+                int bt = f32 ? IT_I32 : IT_I64;
+                r = ir_ins(F, OP_SLT, IT_I32, ir_ins(F, OP_BITCAST, bt, x, 0), ir_const(F, bt, 0));
+            }
+            set_expr(e, ret, r, 0);
+            return;
+        }
+    }
     /* abs, labs, llabs: a negation and a select (a call through the PLT each time otherwise) */
     if (!flags && nargs == 1 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && F->ins[callee].op == OP_ADDR &&
         !F->ins[callee].b && O->syms[F->ins[callee].a].name && type_is_int(ret)) {

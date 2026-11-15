@@ -192,6 +192,8 @@ u32 ir_addr(Func *f, u32 sym, i64 off);
 u32 ir_slot_addr(Func *f, u32 slot, i64 off);
 u32 ir_new_slot(Func *f, u64 size, u32 align);
 u32 ir_add_param(Func *f, int ty); /* returns the OP_PARAM value */
+int ptx_single_trip(Func *f); /* device code: loops that run at most once lose their way back */
+extern int opt_nostrip, opt_noldcomb;
 
 int ir_is_const(Func *f, u32 v, u64 *val); /* integer constant */
 int ir_is_fconst(Func *f, u32 v, double *val);

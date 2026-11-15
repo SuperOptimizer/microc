@@ -13,11 +13,11 @@ static float host_body(int t, int a, int b, int c, float s, float o, unsigned m)
             int base = a * b + c;                  /* the same in every arm */
             float sc = s * (float)base + o;        /* and this */
             int own = t * q + base;                /* differs per arm */
-            ia += own % 7 + base / 3;
+            ia += own % 7 + base / 3 + base / c + own / c;   /* (base / c: a division by a parameter, the same in every arm) */
             acc += sc * (float)(own & 15);
         } else if (m >> (q + 12) & 1) {
             int base = a * b + c;
-            ia -= base ^ q;
+            ia -= (base ^ q) + base % c;
         }
     }
 #pragma unroll 1
@@ -35,11 +35,11 @@ __device__ __forceinline__ float dev_body(int t, int a, int b, int c, float s, f
             int base = a * b + c;                  /* the same in every arm */
             float sc = s * (float)base + o;        /* and this */
             int own = t * q + base;                /* differs per arm */
-            ia += own % 7 + base / 3;
+            ia += own % 7 + base / 3 + base / c + own / c;   /* (base / c: a division by a parameter, the same in every arm) */
             acc += sc * (float)(own & 15);
         } else if (m >> (q + 12) & 1) {
             int base = a * b + c;
-            ia -= base ^ q;
+            ia -= (base ^ q) + base % c;
         }
     }
 #pragma unroll 1
@@ -68,7 +68,7 @@ int main(void) {
             bad += out[t] != host_body(t, a, b, c, s, o, mask[t]);
             sum += out[t];
         }
-        a = -5; b = 9; s = 3.f;
+        a = -5; b = 9; c = -4; s = 3.f;
     }
     printf("%.1f %d\n", sum, bad);
     return 0;

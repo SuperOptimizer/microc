@@ -921,6 +921,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_nonc = getenv("MCC_NONC") != 0; /* PTX: no ld.global.nc through const restrict kernel pointers */
         opt_nolatch = getenv("MCC_NOLATCH") != 0;
         opt_norange = getenv("MCC_NORANGE") != 0;
+        opt_nodivcse = getenv("MCC_NODIVCSE") != 0; /* device code: integer divisions not numbered in gvn (as on the host) */
         opt_nohoist = getenv("MCC_NOHOIST") != 0; /* device code: no common values of sibling blocks moved up (gvn, hoist_to) */
         opt_nofastcall = getenv("MCC_NOFASTCALL") != 0; /* PTX: math calls under -use_fast_math as without it (fast_tmpl) */ /* PTX: keep the sign corrections of divisions by a constant (range_fold) */ /* PTX: a loop's moves after its branch out, in a block of their own */
         opt_unrollpeel = getenv("MCC_UNROLLPEEL") != 0; /* #pragma unroll N: N copies, then a loop of one (before 11-14) */

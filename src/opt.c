@@ -609,7 +609,10 @@ static void gvn(void)
                     }
                 continue;
             }
-            if (!is_pure(i->op))
+            /* device code: an integer division never traps on a GPU (by zero it gives some value), so equal ones are one
+               (conv_bwd_w_f8_k<1,6,...>: the GroupNorm slab row, a division by a parameter, done for each of 48
+               channels and 2 planes). MCC_NODIVCSE: as on the host */
+            if (!is_pure(i->op) && !(opt_dev_fn && !opt_nodivcse && i->op >= OP_SDIV && i->op <= OP_UREM))
                 continue;
         number:
             i = &f->ins[v];

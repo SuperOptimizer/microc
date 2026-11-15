@@ -3584,9 +3584,9 @@ static void mem_tail(u32 reg, const EA *ea, u32 immbytes)
         b4(0);
         return;
     }
-    if (ea->base == NOREG) {
+    if (ea->base == NOREG) { /* [idx * scale + disp32] (SIB base 101 with mod 00: no base); without an index, [disp32] */
         b1(r | 4);
-        b1(0x25);
+        b1(ea->idx == NOREG ? 0x25 : ea->scale << 6 | (ea->idx & 7) << 3 | 5);
         b4((u32)ea->disp);
         return;
     }
@@ -4912,16 +4912,9 @@ static void encode(MIns *i)
         b = i->s1 == NOREG ? NOREG : use(i->s1, SCR1);
         x = i->s2 == NOREG ? NOREG : use(i->s2, SCR0);
         mem_ea(i, b, x, i->imm, &ea);
-        if (x == SCR0 && is_spill(vl) && !fp) {
-            /* three spilled operands, two registers: the address is put together first */
-            EA t;
-            ea_base(&t, b, 0);
-            t.idx = x;
-            t.scale = ea.scale;
-            op_mem(0x8d, 1, SCR1, &t, 0);
-            ea.base = SCR1;
-            ea.idx = NOREG;
-        }
+        if (x == SCR0 && is_spill(vl) && !fp)
+            ea_join(&ea); /* three spilled operands, two registers: the address is put together first (from the ea, whose base
+                             is rbp for a frame slot: b was NOREG there, and the lea of b + x lost the frame) */
         a = use(i->s0, fp ? FSCR0 : SCR0);
         n = mem_bytes[i->cc];
         if (i->cc == M_V128 || i->cc == M_V256 || i->cc == M_V512)

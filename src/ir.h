@@ -183,6 +183,7 @@ typedef struct Func {
 Func *ir_func_new(void);
 void ir_rehash(Func *f);
 int ir_is_bool(Func *f, u32 v, int depth); /* is v known to be 0 or 1? */
+int ir_nonneg(Func *f, u32 v);              /* is the I32 v known not to be negative? */
 void ir_func_reset(Func *f);
 
 u32 ir_const(Func *f, int ty, u64 v);

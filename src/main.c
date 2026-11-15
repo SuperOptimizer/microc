@@ -618,6 +618,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_inline_hot = atoi(a + 13);
         else if (strncmp(a, "-fhot-shift=", 12) == 0)
             opt_hot_shift = atoi(a + 12);
+        else if (strcmp(a, "-O0") == 0 || strcmp(a, "-O1") == 0 || strcmp(a, "-O2") == 0 || strcmp(a, "-O") == 0)
+            opt_level = a[2] ? a[2] - '0' : 1; /* (-O1: the default passes without the -O2 extras; -O2 the default) */
         else if (strcmp(a, "-O3") == 0)
             opt_level = 3;
         else if (strcmp(a, "-fvec-report") == 0)

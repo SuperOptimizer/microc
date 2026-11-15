@@ -2102,6 +2102,12 @@ static void run_passes(Func *fn)
 {
     int round;
     f = fn;
+    if (opt_level == 0 && !opt_cuda && !opt_dev_fn) {
+        /* -O0 (host): as written, the variables in their stack slots (for a debugger), nothing inlined or moved */
+        ir_resolve_all(f);
+        opt_dce(f);
+        return;
+    }
     /* x86-64 too: records and arrays of a few scalars, and the locals of memcpy type puns, become values */
     if ((opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1)) && !opt_nosplit) {
         opt_split(f);

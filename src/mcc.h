@@ -413,9 +413,10 @@ enum { CFI_PUSHFP,  /* rbp pushed: the frame is 16 bytes above rsp, rbp saved at
        CFI_SETFP,   /* rbp holds rsp: the frame is found from rbp from here on */
        CFI_SAVE,    /* register reg (the processor's number) saved n * 8 bytes below the frame */
        CFI_EPI,     /* the frame is gone (after leave): rsp + 8, until the next CFI_RESTORE */
-       CFI_RESTORE };
+       CFI_RESTORE,
+       CFI_SUBSP }; /* rsp lowered (no frame pointer): the frame is v bytes above rsp */
 typedef struct DwCfi {
-    u32 off;
+    u32 off, v;
     u8 op, reg, n;
 } DwCfi;
 void dwarf_reset(const char *path);

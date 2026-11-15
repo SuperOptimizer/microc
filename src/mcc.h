@@ -444,6 +444,7 @@ void dwarf_finish(Obj *o); /* the unit's sections */
 /* ---- elf.c: ELF relocatable objects (aarch64) ---- */
 
 void elf_write_obj(Buf *out, Obj *o);
+Obj *elf_read_obj(const char *name, const u8 *d, size_t len, int full); /* x86-64 ELF object back (lto) */
 
 /* ---- macho.c: MH_OBJECT files and archives ---- */
 

@@ -19,10 +19,11 @@ if [ "$3" = x86_64 ]; then
     GS=; [ -n "$GLIBC_SYSROOT" ] && GS=--sysroot=$GLIBC_SYSROOT
     if [ -n "$GS" ] || { [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; }; then
         mkdir -p $2/glibc/lib $2/glibc/obj
-        for f in f16 int128; do $MCC --target=x86_64-linux-gnu -mglibc $GS -c libc/src/$f.c -o $2/glibc/obj/$f.o; done
+        # (prof: the -fprofile-generate run time, __mcc_prof_enter, which writes MCC_PROFILE / mcc.prof at exit)
+        for f in f16 int128 prof; do $MCC --target=x86_64-linux-gnu -mglibc $GS -c libc/src/$f.c -o $2/glibc/obj/$f.o; done
         rm -f $2/glibc/lib/libmcc.a
-        $MCC elf ar rcs $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o 2>/dev/null ||
-            ${AR:-llvm-ar} rcs $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o
+        $MCC elf ar rcs $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o $2/glibc/obj/prof.o 2>/dev/null ||
+            ${AR:-llvm-ar} rcs $2/glibc/lib/libmcc.a $2/glibc/obj/f16.o $2/glibc/obj/int128.o $2/glibc/obj/prof.o
     fi
 fi
 mkdir -p $D/lib $T

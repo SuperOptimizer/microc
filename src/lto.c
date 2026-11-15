@@ -1,6 +1,6 @@
 /* Link-time optimisation. With -flto the compiler does not generate code:
    each function is stored, as parsed, in the object's IR section, and its
-   symbol is given a one-instruction placeholder. At link time every object
+   symbol is defined at its record there. At link time every object
    that carries IR is merged into one; its functions are then optimised and
    compiled callees first, so that calls can be inlined across source files,
    and functions nothing refers to are left out. */
@@ -111,14 +111,12 @@ void lto_save(Func *f, Obj *o)
     free(copy);
     buf_free(&syms);
 
-    /* the placeholder that defines the symbol: brk #1 */
-    buf_align(text, 4);
-    if (o->align[SEC_TEXT] < 4)
-        o->align[SEC_TEXT] = 4;
-    o->syms[f->sym].sec = SEC_TEXT;
-    o->syms[f->sym].value = text->len;
-    hdr[0] = 0xd4200020U;
-    buf_put(text, hdr, 4);
+    /* the symbol is defined at its record in the IR section, which is SHF_EXCLUDE (elf.c): the system's linker alone
+       (an -flto object that never went through lto_link) then stops at "defined in discarded section" instead of
+       linking a placeholder (a brk #1, garbage on x86-64) */
+    (void)text;
+    o->syms[f->sym].sec = SEC_IR;
+    o->syms[f->sym].value = start;
 }
 
 /* ---- link time ---- */
@@ -345,18 +343,30 @@ void lto_link(Obj **objs, size_t *nobjs, const char *entry)
     /* merge data and symbols */
     for (i = 0; i < n; i++) {
         Obj *o = objs[i];
-        u64 base[SEC_COUNT];
-        u32 *map;
+        u64 *base;
+        u32 *map, *secto;
         if (!o->sec[SEC_IR].len)
             continue;
-        if (o->nrel[SEC_TEXT])
-            die("%s: an object with IR also has compiled code", o->name);
         map = maps[i] = (u32 *)xmalloc((o->nsyms + 1) * sizeof(u32));
-        base[SEC_TEXT] = 0;
-        for (sec = SEC_CONST; sec < SEC_COUNT; sec++) {
-            base[sec] = obj_reserve(M, (int)sec, o->sec[sec].len, o->align[sec]);
-            if (sec != SEC_BSS)
-                buf_put(&M->sec[sec], o->sec[sec].p, o->sec[sec].len);
+        base = (u64 *)xmalloc((o->nsec + 1) * sizeof(u64));
+        secto = (u32 *)xmalloc((o->nsec + 1) * sizeof(u32)); /* the section of M each of o's goes to */
+        /* compiled code (functions with inline assembly) comes as it is; the IR functions' placeholders in it are
+           left behind, unreferenced */
+        secto[SEC_TEXT] = SEC_TEXT;
+        base[SEC_TEXT] = obj_reserve(M, SEC_TEXT, o->sec[SEC_TEXT].len, o->align[SEC_TEXT]);
+        buf_put(&M->sec[SEC_TEXT], o->sec[SEC_TEXT].p, o->sec[SEC_TEXT].len);
+        for (sec = SEC_CONST; sec < o->nsec; sec++) {
+            u32 to = sec;
+            if (sec == SEC_IR)
+                continue;
+            if (sec >= SEC_NSTORE) /* named sections (.init_array, .tdata, ...): appended to M's of the same name */
+                to = (u32)obj_section(M, o->secname[sec], o->secflags[sec]);
+            if (sec >= SEC_NSTORE && !M->secent[to])
+                M->secent[to] = o->secent[sec];
+            secto[sec] = to;
+            base[sec] = obj_reserve(M, (int)to, o->sec[sec].len, o->align[sec]);
+            if (!(M->secflags[to] & SF_NOBITS))
+                buf_put(&M->sec[to], o->sec[sec].p, o->sec[sec].len);
         }
         for (j = 0; j < o->nsyms; j++) {
             ObjSym *s = &o->syms[j], *ms;
@@ -367,8 +377,12 @@ void lto_link(Obj **objs, size_t *nobjs, const char *entry)
             }
             if (s->global && s->name) {
                 m = gsym[s->name];
-                if (m == 0xffffffffU)
+                if (m == 0xffffffffU) {
                     m = gsym[s->name] = obj_add_sym(M, s->name, SEC_UNDEF, 0, 1);
+                    M->syms[m].weak = s->sec == SEC_UNDEF && s->weak; /* weak while every reference is */
+                } else if (s->sec == SEC_UNDEF && !s->weak && M->syms[m].sec == SEC_UNDEF) {
+                    M->syms[m].weak = 0;
+                }
             } else {
                 m = obj_add_sym(M, s->name, SEC_UNDEF, 0, 0);
             }
@@ -380,16 +394,27 @@ void lto_link(Obj **objs, size_t *nobjs, const char *entry)
                 cap_fn = cap;
             }
             ms = &M->syms[m];
-            if (s->sec < SEC_COUNT) {
-                if (ms->sec < SEC_COUNT || is_fn[m])
-                    die("duplicate symbol %s (in %s)", intern_str(s->name), o->name);
-                if (s->sec == SEC_TEXT) {
-                    is_fn[m] = 1; /* defined once its function is compiled */
+            if (s->sec < o->nsec) {
+                if (ms->sec < 0xfff0 || is_fn[m]) {
+                    if (s->weak)
+                        continue; /* a weak definition after another: the first stays */
+                    if (!ms->weak)
+                        die("duplicate symbol %s (in %s)", intern_str(s->name), o->name);
+                }
+                ms->weak = s->weak;
+                ms->hidden = s->hidden;
+                ms->kind = s->kind;
+                ms->size = s->size;
+                ms->dsize = s->dsize;
+                if (s->sec == SEC_IR) { /* an IR function: undefined until its function is compiled */
+                    is_fn[m] = 1;
+                    ms->sec = SEC_UNDEF;
+                    ms->value = 0;
                 } else {
-                    ms->sec = s->sec;
+                    ms->sec = (u16)secto[s->sec];
                     ms->value = s->value + base[s->sec];
                 }
-            } else if (s->sec == SEC_COMMON && !is_fn[m] && ms->sec >= SEC_COUNT) {
+            } else if (s->sec == SEC_COMMON && !is_fn[m] && ms->sec >= 0xfff0) {
                 if (ms->sec != SEC_COMMON || ms->value < s->value) {
                     ms->value = s->value;
                     ms->align = s->align;
@@ -397,12 +422,18 @@ void lto_link(Obj **objs, size_t *nobjs, const char *entry)
                 ms->sec = SEC_COMMON;
             }
         }
-        for (sec = SEC_CONST; sec <= SEC_DATA; sec++) {
+        for (sec = SEC_TEXT; sec < o->nsec; sec++) {
+            if (sec == SEC_IR || sec == SEC_BSS)
+                continue;
             for (k = 0; k < o->nrel[sec]; k++) {
                 ObjReloc *r = &o->rel[sec][k];
-                obj_add_reloc(M, (int)sec, (u32)(r->off + base[sec]), (int)r->type, map[r->sym], r->addend);
+                if (map[r->sym] == 0xffffffffU)
+                    die("%s: a relocation against a symbol that is left out", o->name);
+                obj_add_reloc(M, (int)secto[sec], (u32)(r->off + base[sec]), (int)r->type, map[r->sym], r->addend);
             }
         }
+        free(base);
+        free(secto);
     }
 
     /* find the functions */
@@ -442,6 +473,9 @@ void lto_link(Obj **objs, size_t *nobjs, const char *entry)
                     M->syms[fn->syms[k]].align = (u8)rl->addend;
             }
             fn_of[fn->syms[0]] = nfns;
+            is_fn[fn->syms[0]] = 1; /* defined once its function is compiled */
+            M->syms[fn->syms[0]].sec = SEC_UNDEF;
+            M->syms[fn->syms[0]].value = 0;
             at += size;
         }
     }
@@ -463,8 +497,11 @@ void lto_link(Obj **objs, size_t *nobjs, const char *entry)
             if (o->syms[j].sec == SEC_UNDEF && o->syms[j].name && o->syms[j].name < nnames)
                 root(gsym[o->syms[j].name]);
     }
-    for (sec = SEC_CONST; sec <= SEC_DATA; sec++) {
-        /* compiling adds no relocations to these sections */
+    for (sec = SEC_TEXT; sec < M->nsec; sec++) {
+        /* compiling adds no relocations to these sections (the named ones too: .init_array roots the constructors);
+           in .text, so far, only the compiled code of the objects */
+        if (sec == SEC_IR || sec == SEC_BSS)
+            continue;
         for (k = 0; k < M->nrel[sec]; k++)
             root(M->rel[sec][k].sym);
     }

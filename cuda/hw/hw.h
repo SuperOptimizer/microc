@@ -39,6 +39,9 @@ struct HwMemcpy2D { /* CUDA_MEMCPY2D */
     X(PrimaryCtxSetFlags, "cuDevicePrimaryCtxSetFlags_v2", (CUdevice, unsigned)) \
     X(PrimaryCtxGetState, "cuDevicePrimaryCtxGetState", (CUdevice, unsigned *, int *)) \
     X(CtxSetCurrent, "cuCtxSetCurrent", (CUhandle)) \
+    X(CtxEnablePeerAccess, "cuCtxEnablePeerAccess", (CUhandle, unsigned)) \
+    X(CtxDisablePeerAccess, "cuCtxDisablePeerAccess", (CUhandle)) \
+    X(DeviceCanAccessPeer, "cuDeviceCanAccessPeer", (int *, CUdevice, CUdevice)) \
     X(CtxSynchronize, "cuCtxSynchronize", (void)) \
     X(CtxGetStreamPriorityRange, "cuCtxGetStreamPriorityRange", (int *, int *)) \
     X(ModuleLoadData, "cuModuleLoadData", (CUhandle *, const void *)) \
@@ -71,6 +74,8 @@ struct HwMemcpy2D { /* CUDA_MEMCPY2D */
     X(MemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2", (CUdeviceptr, const void *, size_t, CUhandle)) \
     X(MemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2", (void *, CUdeviceptr, size_t, CUhandle)) \
     X(MemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2", (CUdeviceptr, CUdeviceptr, size_t, CUhandle)) \
+    X(MemcpyPeer, "cuMemcpyPeer", (CUdeviceptr, CUhandle, CUdeviceptr, CUhandle, size_t)) \
+    X(MemcpyPeerAsync, "cuMemcpyPeerAsync", (CUdeviceptr, CUhandle, CUdeviceptr, CUhandle, size_t, CUhandle)) \
     X(Memcpy2DUnaligned, "cuMemcpy2DUnaligned_v2", (const struct HwMemcpy2D *)) \
     X(Memcpy2DAsync, "cuMemcpy2DAsync_v2", (const struct HwMemcpy2D *, CUhandle)) \
     X(MemsetD8, "cuMemsetD8_v2", (CUdeviceptr, unsigned char, size_t)) \
@@ -97,12 +102,24 @@ struct HwDriver {
     void *lib; /* the open library, for cudaGetDriverEntryPointByVersion */
 };
 extern struct HwDriver hw;
-extern CUdevice hw_dev;
-extern CUhandle hw_ctx;
 
-/* Before anything that needs the device: opens the driver and the device's primary context once, and makes
-   that context the calling thread's. Returns a cudaError_t number (0, 100 no device, 3 no driver ...). */
+/* The devices: the driver's (as CUDA_VISIBLE_DEVICES shows them), each with its primary context, retained when a
+   thread first makes it current. Each thread has a current device (cudaSetDevice), device 0 at first. */
+#define HW_MAXDEV 16
+extern int hw_ndev;
+extern CUdevice hw_devs[HW_MAXDEV];
+extern CUhandle hw_ctxs[HW_MAXDEV];
+int hw_cur(void); /* the calling thread's device */
+#define hw_dev (hw_devs[hw_cur()])
+#define hw_ctx (hw_ctxs[hw_cur()])
+
+/* Before anything that needs the device: opens the driver once, and makes the primary context of the thread's
+   device the thread's. Returns a cudaError_t number (0, 100 no device, 3 no driver ...). */
 int hw_enter(void);
+/* Makes device d the calling thread's (its context retained on first use): 0 or a cudaError_t number (101 no such device). */
+int hw_set_device(int d);
+/* The primary context of device d, retained (0 if d is no device or it fails). */
+CUhandle hw_ctx_of(int d);
 /* A function of the driver by name, 0 if there is none (the driver must be open). */
 void *hw_entry(const char *name);
 

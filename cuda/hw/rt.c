@@ -1,5 +1,6 @@
 /* mcudahw: the cuda* run-time API on NVIDIA's driver. A stream is the driver's stream, an event its event,
-   device memory its device memory; the device is device 0 with its primary context. */
+   device memory its device memory; a device is the driver's device with its primary context, the thread's
+   current one by cudaSetDevice (device 0 at first). */
 #include "hw.h"
 #include <mcuda.h>
 #include <cuda_runtime.h>
@@ -41,7 +42,7 @@ cudaError_t cudaGetDeviceCount(int *count)
     e = hw_enter();
     if (e)
         return ret(e == 100 ? cudaErrorNoDevice : e);
-    *count = 1; /* (only device 0 is used) */
+    *count = hw_ndev;
     return cudaSuccess;
 }
 
@@ -50,22 +51,23 @@ cudaError_t cudaGetDevice(int *device)
     if (!device)
         return ret(cudaErrorInvalidValue);
     ENTER();
-    *device = 0;
+    *device = hw_cur();
     return cudaSuccess;
 }
 
 cudaError_t cudaSetDevice(int device)
 {
-    ENTER();
-    return ret(device == 0 ? cudaSuccess : cudaErrorInvalidDevice);
+    return ret(hw_set_device(device));
 }
+
+/* 1: d is a device */
+static int dev_ok(int d) { return d >= 0 && d < hw_ndev; }
 
 cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, unsigned int flags)
 {
     (void)deviceFlags;
     (void)flags;
-    ENTER();
-    return ret(device == 0 ? cudaSuccess : cudaErrorInvalidDevice);
+    return ret(hw_set_device(device));
 }
 
 static unsigned int dev_flags;
@@ -98,10 +100,11 @@ cudaError_t cudaDeviceReset(void)
     return ret(hw.CtxSynchronize());
 }
 
+static CUdevice attr_dev;
 static int attr(int a)
 {
     int v = 0;
-    hw.DeviceGetAttribute(&v, a, hw_dev);
+    hw.DeviceGetAttribute(&v, a, attr_dev);
     return v;
 }
 
@@ -111,12 +114,14 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *p, int device)
     if (!p)
         return ret(cudaErrorInvalidValue);
     ENTER();
-    if (device != 0)
+    if (!dev_ok(device))
         return ret(cudaErrorInvalidDevice);
     memset(p, 0, sizeof *p);
-    hw.DeviceGetName(p->name, (int)sizeof p->name - 1, hw_dev);
-    hw.DeviceGetUuid(&p->uuid, hw_dev);
-    hw.DeviceTotalMem(&total, hw_dev);
+    hw_lock(); /* (attr_dev) */
+    attr_dev = hw_devs[device];
+    hw.DeviceGetName(p->name, (int)sizeof p->name - 1, attr_dev);
+    hw.DeviceGetUuid(&p->uuid, attr_dev);
+    hw.DeviceTotalMem(&total, attr_dev);
     p->totalGlobalMem = total;
     p->maxThreadsPerBlock = attr(1);
     p->maxThreadsDim[0] = attr(2);
@@ -174,6 +179,7 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *p, int device)
     p->accessPolicyMaxWindowSize = attr(109);
     p->reservedSharedMemPerBlock = (size_t)attr(111);
     p->hostRegisterSupported = attr(99);
+    hw_unlock();
     return cudaSuccess;
 }
 
@@ -182,35 +188,49 @@ cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr a, int device
     if (!value)
         return ret(cudaErrorInvalidValue);
     ENTER();
-    if (device != 0)
+    if (!dev_ok(device))
         return ret(cudaErrorInvalidDevice);
-    return ret(hw.DeviceGetAttribute(value, (int)a, hw_dev));
+    return ret(hw.DeviceGetAttribute(value, (int)a, hw_devs[device]));
 }
 
-/* Only device 0 is used, so there is no peer. */
 cudaError_t cudaDeviceCanAccessPeer(int *can, int device, int peer)
 {
     if (!can)
         return ret(cudaErrorInvalidValue);
     *can = 0;
     ENTER();
-    if (device != 0 || peer != 0)
+    if (!dev_ok(device) || !dev_ok(peer))
         return ret(cudaErrorInvalidDevice);
-    return cudaSuccess;
+    if (device == peer)
+        return cudaSuccess; /* (as NVIDIA's: a device is not its own peer) */
+    return ret(hw.DeviceCanAccessPeer(can, hw_devs[device], hw_devs[peer]));
 }
 
+/* The driver's numbers: 704 CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED, 705 ..._NOT_ENABLED; the run time's are 704 / 705 as well. */
 cudaError_t cudaDeviceEnablePeerAccess(int peer, unsigned int flags)
 {
+    CUhandle c;
     if (flags)
         return ret(cudaErrorInvalidValue);
-    (void)peer;
-    return ret(cudaErrorInvalidDevice);
+    ENTER();
+    if (!dev_ok(peer) || peer == hw_cur())
+        return ret(cudaErrorInvalidDevice);
+    c = hw_ctx_of(peer);
+    if (!c)
+        return ret(cudaErrorInvalidDevice);
+    return ret(hw.CtxEnablePeerAccess(c, 0));
 }
 
 cudaError_t cudaDeviceDisablePeerAccess(int peer)
 {
-    (void)peer;
-    return ret(cudaErrorPeerAccessNotEnabled);
+    CUhandle c;
+    ENTER();
+    if (!dev_ok(peer))
+        return ret(cudaErrorInvalidDevice);
+    c = hw_ctxs[peer];
+    if (!c)
+        return ret(cudaErrorPeerAccessNotEnabled);
+    return ret(hw.CtxDisablePeerAccess(c));
 }
 
 cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest)
@@ -446,6 +466,11 @@ cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *a, const void
     hw.PointerGetAttribute(&h, 4 /* HOST_POINTER */, DP(p));
     a->type = managed ? cudaMemoryTypeManaged : t == 1 ? cudaMemoryTypeHost : cudaMemoryTypeDevice;
     a->device = 0;
+    {
+        int ord = 0; /* CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL (9): the driver's ordinal, which is the run time's */
+        if (hw.PointerGetAttribute(&ord, 9, DP(p)) == 0)
+            a->device = ord;
+    }
     a->devicePointer = (void *)(size_t)d;
     a->hostPointer = h;
     return cudaSuccess;
@@ -545,20 +570,35 @@ cudaError_t cudaMemcpyWithAttributesAsync(void *dst, const void *src, size_t n, 
     return ret(copy(dst, src, n, cudaMemcpyDefault, 1, s));
 }
 
+/* Between devices: the driver's peer copy names both contexts (it stages through the host where there is no peer access). */
+static int peer_copy(void *dst, int ddev, const void *src, int sdev, size_t n, int async, cudaStream_t s)
+{
+    CUhandle dc, sc;
+    if (!dev_ok(ddev) || !dev_ok(sdev))
+        return cudaErrorInvalidDevice;
+    if (ddev == sdev)
+        return copy(dst, src, n, cudaMemcpyDeviceToDevice, async, s);
+    if (!n)
+        return 0;
+    if (!dst || !src)
+        return cudaErrorInvalidValue;
+    dc = hw_ctx_of(ddev);
+    sc = hw_ctx_of(sdev);
+    if (!dc || !sc)
+        return cudaErrorInvalidDevice;
+    return async ? hw.MemcpyPeerAsync(DP(dst), dc, DP(src), sc, n, s) : hw.MemcpyPeer(DP(dst), dc, DP(src), sc, n);
+}
+
 cudaError_t cudaMemcpyPeer(void *dst, int ddev, const void *src, int sdev, size_t n)
 {
-    if (ddev != 0 || sdev != 0)
-        return ret(cudaErrorInvalidDevice);
     ENTER();
-    return ret(copy(dst, src, n, cudaMemcpyDeviceToDevice, 0, 0));
+    return ret(peer_copy(dst, ddev, src, sdev, n, 0, 0));
 }
 
 cudaError_t cudaMemcpyPeerAsync(void *dst, int ddev, const void *src, int sdev, size_t n, cudaStream_t s)
 {
-    if (ddev != 0 || sdev != 0)
-        return ret(cudaErrorInvalidDevice);
     ENTER();
-    return ret(copy(dst, src, n, cudaMemcpyDeviceToDevice, 1, s));
+    return ret(peer_copy(dst, ddev, src, sdev, n, 1, s));
 }
 
 cudaError_t cudaMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch, size_t w, size_t h, enum cudaMemcpyKind kind)

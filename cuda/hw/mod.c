@@ -25,7 +25,7 @@ typedef struct {
     char *host;
     size_t size;
     unsigned align;
-    CUdeviceptr dev;
+    CUdeviceptr dev[HW_MAXDEV]; /* on each device (each starts with the host object's bytes) */
     int mod; /* a module that names it */
 } Glob;
 
@@ -37,10 +37,12 @@ typedef struct {
     const char *pb, *pe; /* a function's declaration ahead of the bodies, if there is one */
 } Item;
 
-/* a kernel that was asked for: a module of the driver's for itself */
-typedef struct {
+/* a kernel that was asked for: a module of the driver's for itself, on device 0; on the others in more[device]
+   (a module belongs to a context, so each device loads its own, from the same cache file) */
+typedef struct Kern {
     CUhandle module, f;
     int tried, err;
+    struct Kern *more;
 } Kern;
 
 typedef struct {
@@ -1542,18 +1544,18 @@ static void take_fn(Build *B, int pi, int item)
     put(&B->part[pi].body, copied, (size_t)(e - copied));
 }
 
-/* the block of device memory of device global j */
+/* the block of device memory of device global j on the thread's device */
 static int glob_dev(int j)
 {
-    int r;
-    if (globs[j].dev)
+    int r, d = hw_cur();
+    if (globs[j].dev[d])
         return 0;
-    r = hw.MemAlloc(&globs[j].dev, globs[j].size ? globs[j].size : 1);
+    r = hw.MemAlloc(&globs[j].dev[d], globs[j].size ? globs[j].size : 1);
     if (!r)
-        r = hw.MemcpyHtoD(globs[j].dev, globs[j].host, globs[j].size);
+        r = hw.MemcpyHtoD(globs[j].dev[d], globs[j].host, globs[j].size);
     if (r) {
         fprintf(stderr, "mcuda: device global %s: error %d\n", globs[j].name, r);
-        globs[j].dev = 0;
+        globs[j].dev[d] = 0;
     }
     return r;
 }
@@ -1901,7 +1903,7 @@ static void kload(Kern *K, int mod, int item)
         size_t gtb = 0;
         for (j = 0; !r && j < J.nkg; j++) {
             r = glob_dev(J.kg[j]);
-            addr[j] = globs[J.kg[j]].dev;
+            addr[j] = globs[J.kg[j]].dev[hw_cur()];
         }
         if (!r)
             r = hw.ModuleGetGlobal(&gt, &gtb, K->module, "__mcuda_gt");
@@ -2052,6 +2054,15 @@ static Kern *kern_get(struct __mcuda_module *m, const char *kernel, int *err)
         }
     }
     K = &mods[mod].kern[v - 1];
+    if (hw_cur()) { /* (the thread's device is not 0) */
+        if (!K->more)
+            K->more = (Kern *)calloc(HW_MAXDEV, sizeof *K->more);
+        if (!K->more) {
+            *err = 2; /* cudaErrorMemoryAllocation */
+            return 0;
+        }
+        K = &K->more[hw_cur()];
+    }
     if (!K->tried)
         kload(K, mod, v - 1);
     *err = K->err;
@@ -2063,6 +2074,7 @@ static Kern *kern_get(struct __mcuda_module *m, const char *kernel, int *err)
 typedef struct {
     const char *kernel; /* the address of the name is the key: the compiler passes a constant */
     struct __mcuda_module *m;
+    int dev;            /* the device whose module f is in */
     CUhandle f;
     unsigned maxdyn;
     unsigned long calls; /* MCUDA_PROFILE: launches, and the seconds they ran */
@@ -2077,11 +2089,11 @@ static Fn *fn_get(struct __mcuda_module *m, const char *kernel, int *err)
     unsigned h, i;
     Kern *g;
     Fn *f;
-    int v = 0;
+    int v = 0, dev = hw_cur();
     if (capfns) {
         h = (unsigned)(((size_t)kernel >> 3) * 2654435761U) & (capfns - 1);
         for (i = h; fns[i].kernel; i = (i + 1) & (capfns - 1))
-            if (fns[i].kernel == kernel && fns[i].m == m)
+            if (fns[i].kernel == kernel && fns[i].m == m && fns[i].dev == dev)
                 return &fns[i];
     }
     g = kern_get(m, kernel, err);
@@ -2109,6 +2121,7 @@ static Fn *fn_get(struct __mcuda_module *m, const char *kernel, int *err)
     f->f = g->f;
     f->kernel = kernel;
     f->m = m;
+    f->dev = dev;
     hw.FuncGetAttribute(&v, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, f->f);
     f->maxdyn = (unsigned)v;
     nfns++;
@@ -2232,7 +2245,7 @@ CUdeviceptr hw_symbol(const void *p, size_t *left)
         if (c >= globs[j].host && c < globs[j].host + globs[j].size) {
             err = glob_dev(j);
             if (!err) {
-                d = globs[j].dev + (CUdeviceptr)(c - globs[j].host);
+                d = globs[j].dev[hw_cur()] + (CUdeviceptr)(c - globs[j].host);
                 if (left)
                     *left = globs[j].size - (size_t)(c - globs[j].host);
             }

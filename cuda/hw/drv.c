@@ -1,4 +1,4 @@
-/* mcudahw: the driver, opened at run time; the device's primary context; the per-thread state. */
+/* mcudahw: the driver, opened at run time; the devices' primary contexts; the per-thread state. */
 #include "hw.h"
 #include <dlfcn.h>
 #include <pthread.h>
@@ -7,11 +7,13 @@
 #include <string.h>
 
 struct HwDriver hw;
-CUdevice hw_dev;
-CUhandle hw_ctx;
+int hw_ndev;
+CUdevice hw_devs[HW_MAXDEV];
+CUhandle hw_ctxs[HW_MAXDEV];
 
 typedef struct {
-    int current; /* the context was made this thread's */
+    int current; /* 1 + the device whose context was made this thread's, 0: none yet */
+    int dev;     /* the thread's device (cudaSetDevice) */
     int err;     /* the last error */
 } Tls;
 
@@ -91,18 +93,16 @@ static int open_driver(void)
     r = hw.DeviceGetCount(&n);
     if (r || n < 1)
         return 100; /* cudaErrorNoDevice */
-    r = hw.DeviceGet(&hw_dev, 0);
+    hw_ndev = n > HW_MAXDEV ? HW_MAXDEV : n;
+    for (i = 0; !r && i < hw_ndev; i++)
+        r = hw.DeviceGet(&hw_devs[i], i);
     if (!r)
-        r = hw.PrimaryCtxRetain(&hw_ctx, hw_dev);
+        r = hw.PrimaryCtxRetain(&hw_ctxs[0], hw_devs[0]);
     return r;
 }
 
-int hw_enter(void)
+static int opened(void)
 {
-    Tls *t = tls();
-    int r;
-    if (t && t->current)
-        return 0;
     if (state != 1) {
         pthread_mutex_lock(&init_lock);
         if (state == 0) {
@@ -113,9 +113,59 @@ int hw_enter(void)
         if (state != 1)
             return init_err;
     }
-    r = hw.CtxSetCurrent(hw_ctx);
+    return 0;
+}
+
+int hw_cur(void)
+{
+    Tls *t = tls();
+    return t ? t->dev : 0;
+}
+
+CUhandle hw_ctx_of(int d)
+{
+    CUhandle c;
+    if (opened() || d < 0 || d >= hw_ndev)
+        return 0;
+    pthread_mutex_lock(&init_lock);
+    if (!hw_ctxs[d] && hw.PrimaryCtxRetain(&c, hw_devs[d]) == 0)
+        hw_ctxs[d] = c;
+    c = hw_ctxs[d];
+    pthread_mutex_unlock(&init_lock);
+    return c;
+}
+
+int hw_set_device(int d)
+{
+    Tls *t = tls();
+    int r = opened();
+    if (r)
+        return r;
+    if (d < 0 || d >= hw_ndev)
+        return 101; /* cudaErrorInvalidDevice */
+    if (!hw_ctx_of(d))
+        return 101;
+    if (t) {
+        t->dev = d;
+        t->current = 0; /* (hw_enter makes it current) */
+    }
+    return hw_enter();
+}
+
+int hw_enter(void)
+{
+    Tls *t = tls();
+    int r, d = t ? t->dev : 0;
+    if (t && t->current == d + 1)
+        return 0;
+    r = opened();
+    if (r)
+        return r;
+    if (!hw_ctxs[d] && !hw_ctx_of(d))
+        return 101;
+    r = hw.CtxSetCurrent(hw_ctxs[d]);
     if (!r && t)
-        t->current = 1;
+        t->current = d + 1;
     if (!r) {
         static int asked;
         const char *v = getenv("MCUDA_PRECOMPILE");

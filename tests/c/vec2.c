@@ -2,6 +2,7 @@
    the instructions each element width has or lacks on x86-64, and the shapes of ufsm's hot loops */
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 #define N 77
 static unsigned char ua[N + 40], ub[N + 40], uc[N + 40];
@@ -44,6 +45,10 @@ static void bmixed(unsigned char *g, const unsigned char *p, const signed char *
 { int j; for (j = 0; j < m; j++) g[j] = (unsigned char)(p[j] > s[j] ? p[j] : s[j]); }
 
 /* papyrus.h: o[x] += w * q[x] */
+/* the test's data: a product rounded on its own (a volatile, never contracted into an fma), so that -ffp-contract=fast
+   (part of -ffast-math) feeds the kernels the same numbers */
+static float fmulr(float a, float b) { volatile float p = a * b; return p; }
+static double dmulr(double a, double b) { volatile double p = a * b; return p; }
 static void axpy(float *o, const float *q, float w, int n) { int x; for (x = 0; x < n; x++) o[x] += w * q[x]; }
 static void zero(float *o, int n) { int x; for (x = 0; x < n; x++) o[x] = 0.f; }
 static void fclamp(float *o, const float *q, int n) { int x; for (x = 0; x < n; x++) o[x] = q[x] < 0.f ? 0.f : q[x] > 255.f ? 255.f : q[x]; }
@@ -157,6 +162,36 @@ static void isel(float *w, const float *q, int cn, int n) { int i; const int bz 
 static void isel64(double *w, const double *q, long c, int n) { int i; for (i = 0; i < n; i++) w[i] = c ? q[i] * 2 : q[i] - 1; }
 static void linv8(float *o, const float *m, const float *a, int n) { int i; for (i = 0; i < n; i++) o[i] = a[i] * m[0] + m[1] - a[i] * m[2] + m[3] * m[4] - m[5] + m[6] * a[i] + m[7]; }
 static void u3(float *U, const float *A, const float *w, int n, float c) { int i, d; for (i = 0; i < n; i++) for (d = 0; d < 3; d++) U[d * 39 + i] = c + A[d * 3] * w[i] + A[d * 3 + 1]; }
+#ifdef __MCC_FP_CONTRACT__
+/* -ffp-contract=fast (mcc defines __MCC_FP_CONTRACT__): references with each product rounded on its own */
+static float ra[N + 40], rb[N + 40], rc[N + 40];
+static void rlinv8(float *o, const float *m, const float *a, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) { float p0 = fmulr(a[i], m[0]), p2 = fmulr(a[i], m[2]), p34 = fmulr(m[3], m[4]), p6 = fmulr(m[6], a[i]);
+                              o[i] = p0 + m[1] - p2 + p34 - m[5] + p6 + m[7]; }
+}
+static void ru3(float *U, const float *A, const float *w, int n, float c)
+{ int i, d; for (i = 0; i < n; i++) for (d = 0; d < 3; d++) U[d * 39 + i] = c + fmulr(A[d * 3], w[i]) + A[d * 3 + 1]; }
+static int near(const float *x, const float *y, int n, int k)
+{
+    /* a few ulp of the values, or of the largest of the array where terms cancel (the arrays feed each other) */
+    int i;
+    float big = 0.f;
+    for (i = 0; i < n; i++)
+        if (fabsf(y[i]) > big) big = fabsf(y[i]);
+    for (i = 0; i < n; i++) {
+        union { float f; int i; } a, b;
+        a.f = x[i]; b.f = y[i];
+        if (x[i] == y[i] || (x[i] != x[i] && y[i] != y[i])) continue;
+        if ((a.i < 0) == (b.i < 0) && a.i - b.i <= k && b.i - a.i <= k) continue;
+        if (fabsf(x[i] - y[i]) <= 1e-5f * big) continue;
+        printf("contracted %d: %a, rounded one by one %a (largest %a)\n", i, x[i], y[i], big);
+        return 0;
+    }
+    return 1;
+}
+#endif
 
 /* running maxima and minima of floats with NaNs among them (exact even with -ffast-math -fno-finite-math-only) */
 static float fmxi(const float *a, float m, int n) { int i; for (i = 0; i < n; i++) m = a[i] > m ? a[i] : m; return m; }
@@ -228,7 +263,7 @@ int main(void)
         printf("   %lx %lx %lx %lx %lx %lx %d %d\n", check(fc, sizeof fc), check(ua, sizeof ua) ^ check(ub, sizeof ub), check(uc, sizeof uc),
                check(ib, sizeof ib) ^ check(hb, sizeof hb), check(wb, sizeof wb) ^ check(ia, sizeof ia), check(sb, sizeof sb), cnt(fb, 9.f, n),
                bsumw(ua, ub, n));
-        for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 41) * 0.7f - 13.f; da[i] = (double)((i * 11) % 23) * 0.9 - 9.0; }
+        for (i = 0; i < N + 40; i++) { fa[i] = fmulr((float)((i * 37) % 41), 0.7f) - 13.f; da[i] = dmulr((double)((i * 11) % 23), 0.9) - 9.0; }
         roots(fc, fa, n); droots(db, da, n);
         stencil(fb, fa, 3, n); shiftw(ib, ia, 5, n); fwd(ia, n); rec(ia + 2, n); rec2(ib, 2, n / 2); rec2(ib + 40, 9, n / 2);
         clamprow(fc, ua, n / 2, 3); half(ub + 2, ua, n, 1, n / 2); fgat(fb, fc, 2, n / 2); sgat(ib, ha, n); selfgat(ia, n / 2);
@@ -251,8 +286,18 @@ int main(void)
         printf("   %lx %lx %lx %lx\n", check(ua, sizeof ua) ^ check(ub, sizeof ub), check(ia, sizeof ia) ^ check(ib, sizeof ib),
                check(qa, sizeof qa) ^ check(qb, sizeof qb), check(fb, sizeof fb) ^ check(fc, sizeof fc));
         isel(fc, fa, 5, n); isel(fb, fa, 2, n); isel64(db, da, n & 1, n); isel64(da, db, (long)n << 33, n);
+#ifdef __MCC_FP_CONTRACT__
+        memcpy(ra, fa, sizeof fa); memcpy(rb, fb, sizeof fb); memcpy(rc, fc, sizeof fc);
+#endif
         linv8(fc, fb, fa, n); linv8(fb + 3, fb, fa, n / 2); linv8(fa, fa + n / 2, fb, n);
         u3(fb, fa, fc, n / 2, 0.5f); u3(fa, fa + 1, fb, n / 3, -1.f);
+#ifdef __MCC_FP_CONTRACT__
+        /* a * b + c contracted (one rounding): within a few ulp of the same steps rounded one by one, which go on */
+        rlinv8(rc, rb, ra, n); rlinv8(rb + 3, rb, ra, n / 2); rlinv8(ra, ra + n / 2, rb, n);
+        ru3(rb, ra, rc, n / 2, 0.5f); ru3(ra, ra + 1, rb, n / 3, -1.f);
+        if (!near(fa, ra, N + 40, 16) || !near(fb, rb, N + 40, 16) || !near(fc, rc, N + 40, 16)) return 1;
+        memcpy(fa, ra, sizeof fa); memcpy(fb, rb, sizeof fb); memcpy(fc, rc, sizeof fc);
+#endif
         printf("   %lx %lx %lx %lx\n", check(fa, sizeof fa), check(fb, sizeof fb), check(fc, sizeof fc), check(da, sizeof da) ^ check(db, sizeof db));
         for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 53) - 20.5f; da[i] = db[i] = (double)((i * 11) % 29) - 9.25; }
         for (i = 3; i < N + 40; i += 7) { fa[i] = __builtin_nanf(""); da[i] = __builtin_nan(""); }
@@ -268,7 +313,7 @@ int main(void)
         printf("   %lx %lx", check(fc, sizeof fc), check(dc, sizeof dc));
         fclamp4(fc, fa, n); fclamp4(fb, fb, n);
         printf(" %lx %lx\n", check(fc, sizeof fc), check(fb, sizeof fb));
-        for (i = 0; i < N + 40; i++) { fa[i] = (float)((i * 37) % 53) * 1.37e-38f + (float)(i % 7) * 3.1f; da[i] = (double)((i * 7) % 31) * 1.1e-300 - i; }
+        for (i = 0; i < N + 40; i++) { fa[i] = fmulr((float)((i * 37) % 53), 1.37e-38f) + fmulr((float)(i % 7), 3.1f); da[i] = dmulr((double)((i * 7) % 31), 1.1e-300) - i; }
         divc(fb, fa, n); divv(fc, fa, 8.f, n); ddivc(db, da, n);
         printf("   %lx %lx %lx\n", check(fb, sizeof fb), check(fc, sizeof fc), check(db, sizeof db));
     }

@@ -396,6 +396,8 @@ static void target_macros(void)
         "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2",
         "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", 0};
     int k;
+    if (opt_fp_contract)
+        pp_define("__MCC_FP_CONTRACT__"); /* a * b + c may be one rounding (-ffp-contract=fast, -ffast-math): tests/c/vec2.c */
     if (getenv("MCC_NOLDGV"))
         pp_define("__MCC_NOLDGV"); /* mcuda_device.h: __ldg of the vector types field by field (for the GPU A/B) */
     if (std_c99)
@@ -441,6 +443,7 @@ static void target_macros(void)
         opt_f16c = (x86_feat & XF_F16C) != 0;
         opt_x64_sse41 = (x86_feat & XF_SSE41) != 0; /* the vectoriser may use it */
         opt_x64_avx2 = (x86_feat & XF_AVX2) != 0;   /* 32-byte vectors in AVX functions */
+        opt_x64_fma = (x86_feat & XF_FMA) != 0;     /* -ffp-contract: a * b + c as vfmadd */
     }
     if (opt_size)
         pp_define("__OPTIMIZE_SIZE__");
@@ -615,6 +618,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_inline_hot = atoi(a + 13);
         else if (strncmp(a, "-fhot-shift=", 12) == 0)
             opt_hot_shift = atoi(a + 12);
+        else if (strcmp(a, "-O0") == 0 || strcmp(a, "-O1") == 0 || strcmp(a, "-O2") == 0 || strcmp(a, "-O") == 0)
+            opt_level = a[2] ? a[2] - '0' : 1; /* (-O1: the default passes without the -O2 extras; -O2 the default) */
         else if (strcmp(a, "-O3") == 0)
             opt_level = 3;
         else if (strcmp(a, "-fvec-report") == 0)
@@ -626,7 +631,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strcmp(a, "-fvec-report=2") == 0)
             opt_vec_report = 2; /* with the instruction that stopped it */
         else if (strcmp(a, "-ffast-math") == 0)
-            opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1, opt_no_signed_zeros = 1, opt_reciprocal_math = 1;
+            opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1, opt_no_signed_zeros = 1, opt_reciprocal_math = 1,
+            opt_fp_contract = 1; /* (as clang: -ffast-math implies -ffp-contract=fast) */
         else if (strcmp(a, "-fassociative-math") == 0 || strcmp(a, "-funsafe-math-optimizations") == 0)
             opt_fast_math = 1; /* floating-point sums may be reordered (maxima / minima also need -ffinite-math-only) */
         else if (strcmp(a, "-fno-fast-math") == 0)

@@ -415,8 +415,9 @@ static int grabbing;
 #define UNROLL_AUTO_INS 600   /* and this many instructions, as the body is first read */
 /* host code at -O3: loops of a few trips (for d < 3 over coordinates), so the loop around them is one block the
    vectoriser takes, and the counter is a constant in each copy */
-#define UNROLL_HOST_N 8
-#define UNROLL_HOST_INS 160
+#define UNROLL_HOST_N 16      /* (a loop over the 8 corners of a cell, 13 neighbours) */
+#define UNROLL_HOST_INS 1200  /* (8 corners x a short row loop: ufsm write_spatial_tm 1.11x, phase_blend_row 1.5x) */
+#define UNROLL_HOST_SIZE 2400 /* tokens */
 static u32 au_n;
 static u32 auto_n; /* loops unrolled unasked so far (debugging: MCC_AUTOMAX, MCC_AUTOLOG) */
 static Sym *unroll_probe; /* C: the counter read as its constant while an unasked unroll reads the condition (C++ reads every
@@ -2996,6 +2997,39 @@ static Sym *overload_pick(Sym *set, TArgs *given, Expr *av, u32 n, u32 loc)
     return best;
 }
 
+/* A C library math function whose result depends on its arguments alone: only errno is written, and not under
+   -fno-math-errno (these never set it). Two calls with the same arguments give the same value (clang: readnone). */
+static int pure_math_in(const char *n)
+{
+    static const char *const always[] = {"fabs", "floor", "ceil", "trunc", "round", "rint", "nearbyint", "copysign", "fmin", "fmax", 0};
+    static const char *const noerrno[] = {"sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
+                                          "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "pow",
+                                          "sqrt", "cbrt", "hypot", "erf", "erfc", "fmod", "remainder", 0};
+    int k;
+    for (k = 0; always[k]; k++)
+        if (strcmp(n, always[k]) == 0)
+            return 1;
+    if (opt_math_errno)
+        return 0;
+    for (k = 0; noerrno[k]; k++)
+        if (strcmp(n, noerrno[k]) == 0)
+            return 1;
+    return 0;
+}
+
+static int pure_math(const char *n)
+{
+    char base[16];
+    size_t len = strlen(n);
+    if (pure_math_in(n))
+        return 1;
+    if (len < 2 || len >= sizeof base || (n[len - 1] != 'f' && n[len - 1] != 'l'))
+        return 0;
+    memcpy(base, n, len - 1); /* sinf, sinl: sin */
+    base[len - 1] = 0;
+    return pure_math_in(base);
+}
+
 static void call(Expr *e)
 {
     Type *ft = e->ty, *ret;
@@ -3177,6 +3211,14 @@ static void call(Expr *e)
         if (opt_target != TARGET_LINUX && cn[0] == '_')
             cn++;
         if (ir_is_const(F, args[2], &n) && n > 0 && n <= 64) {
+            if (strcmp(cn, "memcpy") == 0 && (n == 1 || n == 2 || n == 4 || n == 8)) {
+                /* one scalar: a load and a store (x86-64 takes them unaligned), so that a local on either side
+                   is a value at once, as the w of memcpy(&w, p, 8) in a bit reader */
+                int m = n == 1 ? M_8U : n == 2 ? M_16U : n == 4 ? M_32 : M_64;
+                ir_store(F, m, args[0], ir_load(F, n == 8 ? IT_I64 : IT_I32, m, args[1]));
+                set_expr(e, ret, args[0], 0);
+                return;
+            }
             if (strcmp(cn, "memcpy") == 0) {
                 emit_mem(OP_MEMCPY, args[0], args[1], n, 1);
                 set_expr(e, ret, args[0], 0);
@@ -3224,6 +3266,9 @@ static void call(Expr *e)
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
     v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? (vec_mem(ret) == M_V256 ? IT_V256 : IT_V128) : type_ir(ret), callee, args, nargs,
                 ft->variadic ? ft->nparams + (flags ? 1 : 0) : opt_arch == ARCH_X64 && ft->oldstyle ? nargs : 0xffffffffU, flags);
+    if (!flags && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && type_is_float(ret) && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && pure_math(intern_str(O->syms[F->ins[callee].a].name)))
+        F->ins[v].flags |= IF_PURE;
     if (!flags && vec_mem(ret)) {
         u32 tmp = new_temp(ret);
         ir_store(F, vec_mem(ret), tmp, v);
@@ -6035,8 +6080,20 @@ static void primary(Expr *e)
     case SK_TYPEDEF:
         error_at(loc, "unexpected type name '%s'", intern_str(s->name));
     }
-    if (s == unroll_probe && s->cv == 1) {
-        set_int(e, s->ty, (u64)s->val);
+    if (s->cv) {
+        /* the counter of a loop being unrolled, in the condition and in each copy of the body (C; cxx_primary
+           does the same for C++): a constant, so that arrays indexed by it are values from the first split on */
+        if (s == cv_lvalue) {
+            u32 addr = new_temp(s->ty);
+            cv_lvalue = 0;
+            store_val(s->ty, addr, s->cv == 1 ? ir_const(F, type_ir(s->ty), (u64)s->val) : ir_fconst(F, type_ir(s->ty), s->fval));
+            set_expr(e, s->ty, addr, 1);
+        } else if (s->cv == 1) {
+            set_int(e, s->ty, (u64)s->val);
+            e->konst = 1;
+        } else {
+            set_expr(e, s->ty, ir_fconst(F, type_ir(s->ty), s->fval), 0);
+        }
         return;
     }
     if (s->local) {
@@ -10247,7 +10304,9 @@ static void statement(void)
                         break;
                     }
                     if (!cv) {
-                        if (k && (u64)k * bn <= UNROLL_AUTO_SIZE && unroll_plain(btk, bn) && auto_n < opt_automax) {
+                        if (opt_autolog && !(k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn)))
+                            warn_at(for_loc, "loop %u: %u times %u tokens, or not plain", au_n, k, bn);
+                        if (k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn) && auto_n < opt_automax) {
                             /* how much code the body is, the loops inside it unrolled: it is read once, into
                                blocks that are never run */
                             u32 n0 = F->nins, s_break = break_blk, s_cont = cont_blk, grown;
@@ -10268,6 +10327,8 @@ static void statement(void)
                                 ur = k + 1;
                                 if (opt_autolog)
                                     warn_at(tok.loc, "loop %u unrolled unasked: %u times %u instructions", auto_n, k, grown);
+                            } else if (opt_autolog) {
+                                warn_at(for_loc, "loop %u: %u times %u instructions: too many", au_n, k, grown);
                             }
                         }
                         break;
@@ -10758,6 +10819,8 @@ static LazyFn *lazy_fn(u32 sym)
     return &lazy[sym];
 }
 
+static u32 *defer_gen, ndefer_gen, capdefer_gen; /* functions to generate at the end of the unit, in order */
+
 static void lazy_generate(u32 sym)
 {
     u32 sec = lazy[sym].sec;
@@ -11079,8 +11142,18 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             F = const_func; /* its PTX is written at the end of the unit */
             return;
         }
-        if (opt_target != TARGET_LINUX || (!s->is_static && !def_extern_inline) || (s->aflags & AT_USED))
-            lazy_generate(sym);
+        if (opt_target != TARGET_LINUX || (!s->is_static && !def_extern_inline) || (s->aflags & AT_USED)) {
+            if (opt_arch == ARCH_X64 && opt_target == TARGET_LINUX && opt_level >= 2 && !lf->dev && !(s->aflags & AT_USED)) {
+                /* x86-64: at the end of the unit, when every call of each static function is known */
+                if (ndefer_gen == capdefer_gen) {
+                    capdefer_gen = capdefer_gen ? capdefer_gen * 2 : 64;
+                    defer_gen = (u32 *)xrealloc(defer_gen, capdefer_gen * sizeof(u32));
+                }
+                defer_gen[ndefer_gen++] = sym;
+            } else {
+                lazy_generate(sym);
+            }
+        }
         F = const_func;
         return;
     }
@@ -11376,6 +11449,28 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     emit_deferred();
     if (opt_cuda && !opt_syntax_only && !opt_dump_ir)
         emit_ptx();
+    if (ndefer_gen) {
+        /* a static function called from one place only, whose address is used nowhere else, is inlined there
+           whatever its size (as clang does), and needs no code of its own */
+        u32 k, r, sec, n = O->nsyms, *calls = (u32 *)xmalloc((n + 1) * sizeof(u32));
+        u8 *esc = (u8 *)xmalloc(n + 1);
+        memset(calls, 0, (n + 1) * sizeof(u32));
+        memset(esc, 0, n + 1);
+        func_refs(calls, esc, n);
+        for (sec = 0; sec < O->nsec; sec++)
+            for (r = 0; r < O->nrel[sec]; r++)
+                if (O->rel[sec][r].sym < n)
+                    esc[O->rel[sec][r].sym] = 1;
+        for (k = 0; k < n && k < nlazy; k++)
+            if (calls[k] == 1 && !esc[k] && lazy[k].has && !lazy[k].done && !lazy[k].dev && !O->syms[k].global)
+                func_once(k);
+        free(calls);
+        free(esc);
+        for (k = 0; k < ndefer_gen; k++)
+            if (!lazy[defer_gen[k]].done)
+                lazy_generate(defer_gen[k]);
+        ndefer_gen = 0;
+    }
     if (opt_target == TARGET_LINUX) {
         u32 k;
         /* the targets of aliases are needed whether or not anything else uses them */

@@ -406,6 +406,40 @@ static u32 hoist_to(u32 o, u32 a, u32 b)
     return l;
 }
 
+/* gvn: the pure calls seen (IF_PURE), the latest of each kind last */
+#define PURE_CAP 64
+static u32 pure_tab[PURE_CAP], npure;
+
+static int pure_same(u32 x, u32 y)
+{
+    Ins *a = &f->ins[x], *b = &f->ins[y];
+    u32 k;
+    if (a->c != b->c || a->b != b->b || a->ty != b->ty || !b->blk)
+        return 0;
+    for (k = 0; k < a->b; k++)
+        if (ir_resolve(f, f->xargs[a->a + k]) != ir_resolve(f, f->xargs[b->a + k]))
+            return 0;
+    return 1;
+}
+
+static u32 pure_find(u32 v)
+{
+    u32 k;
+    for (k = npure; k-- > 0;)
+        if (pure_same(v, pure_tab[k]))
+            return pure_tab[k];
+    return 0;
+}
+
+static void pure_add(u32 v)
+{
+    if (npure == PURE_CAP) {
+        memmove(pure_tab, pure_tab + 1, (PURE_CAP - 1) * sizeof(u32));
+        npure--;
+    }
+    pure_tab[npure++] = v;
+}
+
 static void gvn(void)
 {
     u32 k, v, nx, n, j, mask;
@@ -439,6 +473,7 @@ static void gvn(void)
     }
     memset(vn_tab, 0, n * sizeof(u32));
     mask = n - 1; /* only this much of the table is in use for this function */
+    npure = 0;
 
     for (k = 0; k < nrpo; k++) {
         u32 b = rpo[k];
@@ -528,6 +563,18 @@ static void gvn(void)
                 mem_add(i->a, i->mem, i->b, 1);
                 continue;
             case OP_CALL:
+                if (i->flags & IF_PURE) {
+                    /* a math function of its arguments: memory is as it was, and an earlier call alike that
+                       dominates this one gave the same value */
+                    u32 o = pure_find(v);
+                    if (o && dominates(f->ins[o].blk, b))
+                        ir_replace(f, v, o);
+                    else
+                        pure_add(v);
+                    continue;
+                }
+                nmem = 0;
+                continue;
             case OP_MEMCPY:
             case OP_MEMZERO:
             case OP_VSTORE:
@@ -1545,6 +1592,170 @@ static int dev_reassoc(void)
     return changed;
 }
 
+/* ---- || and && chains regrouped (after licm): an or (and) of truth values in block b whose leaves are partly
+   made outside b becomes or(or of those, or of the rest), so licm can take the first part out of the loop; and
+   x < 0 || x >= k (x >= 0 && x < k), k >= 0 a constant, is the one unsigned x >= k (x < k). ---- */
+#define RG_MAX 16
+static u32 *rg_uses;
+
+static int rg_collect(u32 v, int op, u32 b, u32 *lv, u32 n, int root)
+{
+    Ins *i = &f->ins[v];
+    if (n > RG_MAX)
+        return n;
+    if (i->op == op && i->ty == IT_I32 && i->blk == b && (root || rg_uses[v] == 1)) {
+        n = (u32)rg_collect(i->a, op, b, lv, n, 0);
+        return rg_collect(i->b, op, b, lv, n, 0);
+    }
+    if (n < RG_MAX)
+        lv[n] = v;
+    return (int)(n + 1);
+}
+
+/* x < 0 (low = 1) or x >= k (k >= 0: low = 0, *k) for the or; for the and x >= 0 (low = 1), x < k */
+static u32 rg_bound(u32 v, int isand, int *low, i64 *k)
+{
+    Ins *i = &f->ins[v];
+    u64 c;
+    int t;
+    if (i->op < OP_SLT || i->op > OP_SGE || !ir_is_const(f, i->b, &c))
+        return 0;
+    t = f->ins[i->a].ty;
+    if (t != IT_I32 && t != IT_I64)
+        return 0;
+    if (t == IT_I32)
+        c = (u64)(i64)(i32)(u32)c;
+    if (!isand) {
+        if ((i->op == OP_SLT && (i64)c == 0) || (i->op == OP_SLE && (i64)c == -1)) {
+            *low = 1;
+            return i->a;
+        }
+        if ((i->op == OP_SGE && (i64)c >= 0) || (i->op == OP_SGT && (i64)c >= -1)) {
+            *low = 0;
+            *k = i->op == OP_SGE ? (i64)c : (i64)c + 1;
+            return i->a;
+        }
+    } else {
+        if ((i->op == OP_SGE && (i64)c == 0) || (i->op == OP_SGT && (i64)c == -1)) {
+            *low = 1;
+            return i->a;
+        }
+        if ((i->op == OP_SLT && (i64)c >= 0) || (i->op == OP_SLE && (i64)c >= -1)) {
+            *low = 0;
+            *k = i->op == OP_SLT ? (i64)c : (i64)c + 1;
+            return i->a;
+        }
+    }
+    return 0;
+}
+
+static int bool_regroup(void)
+{
+    u32 b, v, k, n, *ops, nx;
+    int changed = 0;
+    rg_uses = (u32 *)xmalloc((f->nins + 1) * sizeof(u32));
+    memset(rg_uses, 0, (f->nins + 1) * sizeof(u32));
+    for (b = 1; b < f->nblk; b++) {
+        for (v = f->blk[b].phis; v; v = f->ins[v].next) {
+            IR_OPS(f, &f->ins[v], ops, n);
+            for (k = 0; k < n; k++)
+                rg_uses[ops[k]]++;
+        }
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            IR_OPS(f, &f->ins[v], ops, n);
+            for (k = 0; k < n; k++)
+                rg_uses[ops[k]]++;
+            if (f->ins[v].op == OP_CALL)
+                rg_uses[f->ins[v].c]++;
+        }
+        if (f->blk[b].arg)
+            rg_uses[f->blk[b].arg]++;
+    }
+    for (b = 1; b < f->nblk; b++) {
+        for (v = f->blk[b].first; v; v = nx) {
+            Ins *i = &f->ins[v];
+            u32 lv[RG_MAX + 1], out[RG_MAX], in[RG_MAX], nout = 0, nin = 0, nl, j, x, y, acc;
+            int op = i->op, isand = op == OP_AND, users_same = 0;
+            nx = i->next;
+            if ((op != OP_OR && op != OP_AND) || i->ty != IT_I32)
+                continue;
+            /* only roots: not itself one link of a larger chain of the same operation in this block */
+            for (x = i->next; x && !users_same; x = f->ins[x].next)
+                if (f->ins[x].op == op && (f->ins[x].a == v || f->ins[x].b == v) && rg_uses[v] == 1)
+                    users_same = 1;
+            if (users_same)
+                continue;
+            nl = (u32)rg_collect(v, op, b, lv, 0, 1);
+            if (nl < 3 || nl > RG_MAX)
+                continue;
+            for (j = 0; j < nl; j++)
+                if (!ir_is_bool(f, lv[j], 3))
+                    break;
+            if (j < nl)
+                continue;
+            /* pairs of bounds of one value: one unsigned comparison */
+            for (x = 0; x < nl; x++) {
+                int lx, ly;
+                i64 kx = 0, ky = 0;
+                u32 vx, vy;
+                if (!lv[x] || !(vx = rg_bound(lv[x], isand, &lx, &kx)))
+                    continue;
+                for (y = 0; y < nl; y++) {
+                    if (y == x || !lv[y] || !(vy = rg_bound(lv[y], isand, &ly, &ky)) || vy != vx || lx == ly)
+                        continue;
+                    {
+                        i64 kk = lx ? ky : kx;
+                        u32 c = ir_raw(f, isand ? OP_ULT : OP_UGE, IT_I32, vx, ir_const(f, f->ins[vx].ty, (u64)kk));
+                        ir_insert_before(f, v, c);
+                        lv[x] = c;
+                        lv[y] = 0;
+                        changed = 1;
+                    }
+                    break;
+                }
+            }
+            for (j = 0; j < nl; j++) {
+                if (!lv[j])
+                    continue;
+                if (f->ins[lv[j]].blk != b && f->ins[lv[j]].op != OP_CONST)
+                    out[nout++] = lv[j];
+                else
+                    in[nin++] = lv[j];
+            }
+            if (nout < 2 && !changed)
+                continue;
+            if (nout >= 2 || (nout && nin))
+                changed = 1;
+            acc = 0;
+            for (j = 0; j < nout; j++) {
+                if (!acc) {
+                    acc = out[j];
+                    continue;
+                }
+                x = ir_raw(f, op, IT_I32, acc, out[j]);
+                ir_insert_before(f, v, x);
+                acc = x;
+            }
+            for (j = 0; j < nin; j++) {
+                if (!acc) {
+                    acc = in[j];
+                    continue;
+                }
+                x = ir_raw(f, op, IT_I32, acc, in[j]);
+                ir_insert_before(f, v, x);
+                acc = x;
+            }
+            ir_replace(f, v, acc);
+        }
+    }
+    free(rg_uses);
+    if (changed) {
+        ir_resolve_all(f);
+        opt_dce(f);
+    }
+    return changed;
+}
+
 static int licm(void)
 {
     u32 *mark, *stack, k, j, p, v, nx, sp, nblk0 = f->nblk;
@@ -1891,6 +2102,12 @@ static void run_passes(Func *fn)
 {
     int round;
     f = fn;
+    if (opt_level == 0 && !opt_cuda && !opt_dev_fn) {
+        /* -O0 (host): as written, the variables in their stack slots (for a debugger), nothing inlined or moved */
+        ir_resolve_all(f);
+        opt_dce(f);
+        return;
+    }
     /* x86-64 too: records and arrays of a few scalars, and the locals of memcpy type puns, become values */
     if ((opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1)) && !opt_nosplit) {
         opt_split(f);
@@ -1906,8 +2123,9 @@ static void run_passes(Func *fn)
     }
     f = fn;
     gvn();
-    if (opt_cuda) {
-        /* arrays handed to functions that are now part of this one */
+    if (opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1 && !opt_nosplit)) {
+        /* arrays handed to functions that are now part of this one (x86-64: a decoder's state record whose
+           functions were inlined, its fields then values) */
         ir_resolve_all(f);
         /* ... and again while it brings something: an address read back from a record that was split (what
            a lambda captured by reference) is then seen to be that of a local, which can now be a value too */
@@ -1950,6 +2168,14 @@ static void run_passes(Func *fn)
     }
     if (!(opt_dev_fn && !opt_dolicm) && !(opt_cuda && opt_nolicm) && licm())
         ir_resolve_all(f);
+    /* x86-64: the tests of an || / && chain that the loop does not change, now outside it, grouped, so the group
+       leaves the loop too */
+    if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2 && !getenv("MCC_NOREGROUP")) {
+        int r;
+        for (r = 0; r < 3 && bool_regroup(); r++) /* one loop level per round (licm reports only replacements) */
+            if (licm())
+                ir_resolve_all(f);
+    }
     if (opt_level >= 3 && !opt_size && !opt_novec && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
         opt_dce(f);
         return; /* vector code stays out of the inliner: the scalar passes do not know it */

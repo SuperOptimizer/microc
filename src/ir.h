@@ -90,6 +90,8 @@ enum { ATOM_LOAD, ATOM_STORE, ATOM_XCHG, ATOM_ADD, ATOM_SUB, ATOM_AND, ATOM_OR, 
 #define IF_NC 0x40 /* OP_LOAD, device code: of global memory the kernel only reads (__ldg: ld.global.nc) */
 #define IF_SSE0 0x10 /* OP_CALL with IF_SRET and mem, x86-64: the first eight bytes come back in an xmm register, */
 #define IF_SSE1 0x20 /* the second eight; Func.has_sret says the same with 0x40 and 0x80 */
+#define IF_PURE 0x80 /* OP_CALL, x86-64 host: a C library math function of its arguments alone (no memory read or written, no
+                        errno under -fno-math-errno): gvn shares two alike */
 #define IF_ASM 2  /* OP_CALL: inline assembly. The callee is the constant index of an AsmStmt; the
                      arguments are the values of its operands that are read or are addresses */
 
@@ -255,6 +257,7 @@ extern int opt_no_signed_zeros; /* -fno-signed-zeros (in -ffast-math) */
 extern int opt_finite_math; /* -ffinite-math-only (in -ffast-math): no NaN or infinity reaches a comparison, so a < b ? a : b may be a min */
 extern int opt_vec_report;
 extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
+extern int opt_x64_fma;   /* x64.c: FMA3 may be used (-mfma, -march=native / x86-64-v3) */
 extern int opt_x64_avx2;  /* opt_vec.c: 32-byte vectors in AVX functions */
 extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */
 extern Obj *opt_obj;    /* opt_vec.c: the object the functions being optimised go to (for the names of what they call) */
@@ -274,6 +277,8 @@ void func_stash(Func *f, int mode);
 int func_stashed(u32 sym);
 void func_unstash(Func *f, u32 sym);
 void func_realise(Func *f, u32 sym);
+void func_refs(u32 *calls, u8 *esc, u32 nsym); /* calls of each function put aside; esc: its address used otherwise */
+void func_once(u32 sym);                         /* called from one place only: inlined there even when large */
 void opt_finish(Func *f); /* last changes before code generation */
 
 /* opt.c */

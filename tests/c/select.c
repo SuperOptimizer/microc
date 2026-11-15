@@ -11,7 +11,7 @@ int two(int c, int *p, int *q) { int x, y; if (c > 3) { x = *p; y = *q; } else {
 char *ps(char *a, char *b, long n) { return n ? a : b; }
 int sgn(int x) { return x > 0 ? 1 : x < 0 ? -1 : 0; }
 int main(void) {
-    int i, j, p = 7, q = 9; double nan = 0.0; nan = nan / nan;
+    int i, j, p = 7, q = 9; double nan = __builtin_nan(""); /* (0.0 / 0.0 made at run time is -nan on x86, folded +nan) */
     for (i = -3; i <= 3; i++) for (j = -3; j <= 3; j += 2)
         printf("%d %d: %d %u %ld %.1f %.1f %d %d %d %d %s %d\n", i, j, max(i, j), umin((unsigned)i, (unsigned)j), clampl(i * 10, j, 12),
                dmax(i, j), (double)fsel(i, 1.5f, 2.5f), absi(i), b01(i, j), b10(i, j), two(i + j, &p, &q), ps("a", "b", i), sgn(i));

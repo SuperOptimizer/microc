@@ -1,6 +1,6 @@
 /* -g: shadowed locals each resolve to their own block (DW_TAG_lexical_block); &x keeps them in the frame */
 #include <stdio.h>
-static void use(int *p) { if (*p == -1) printf("."); }
+__attribute__((noinline)) static void use(int *p) { /* (kept: the test is about lexical blocks, not optimised locations) */ if (*p == -1) printf("."); }
 static int sq(int v) { int t = v * v; return t + 1; }
 int f(int n)
 {

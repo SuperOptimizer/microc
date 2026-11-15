@@ -30,6 +30,7 @@ typedef struct Body {
     u8 avx;
     u8 always; /* always_inline */
     u8 hinted; /* declared inline (opt_inline_mode 3): opt_inline_hint instead of opt_inline_limit */
+    u8 once;   /* called from one place only (opt_inline_once): up to ONCE_INLINE_INS there */
     u32 copies;
     u32 size; /* instructions */
 } Body;
@@ -155,6 +156,7 @@ void inline_save(Func *f)
     y->size = count;
     y->always = opt_inline_mode == 1;
     y->hinted = opt_inline_mode == 3;
+    y->once = opt_inline_once && opt_inline_mode != 2;
     if (f->sym >= nbodies) {
         u32 n = nbodies ? nbodies : 256;
         while (n <= f->sym)
@@ -250,6 +252,7 @@ typedef struct Stash {
     u8 mode;  /* opt_inline_mode for it */
     u8 novec; /* opt_novec for it */
     u8 dev;   /* device code only: opt_dev_fn for it */
+    u8 once;  /* called from one place only, its address taken nowhere (func_once) */
 } Stash;
 
 static Stash *stash; /* by object symbol */
@@ -300,6 +303,7 @@ void func_realise(Func *f, u32 sym)
     func_unstash(f, sym);
     opt_inline_mode = stash[sym].mode;
     opt_novec = stash[sym].novec;
+    opt_inline_once = stash[sym].once;
     {
         int was = opt_dev_fn;
         opt_dev_fn = stash[sym].dev;
@@ -308,9 +312,78 @@ void func_realise(Func *f, u32 sym)
     }
     opt_inline_mode = 0;
     opt_novec = 0;
+    opt_inline_once = 0;
     body_free(stash[sym].y);
     stash[sym].y = body_copy(f);
     stash[sym].state = 3;
+}
+
+/* The calls to each function put aside (as parsed) and whether its address is used otherwise: esc[sym] |= 1. Code in
+   blocks no path reaches (the trial reads of the unroller) does not count. */
+void func_refs(u32 *calls, u8 *esc, u32 nsym)
+{
+    u32 s, v, b, k, n, *ops, *stk = 0, cap = 0;
+    u8 *seen = 0;
+    for (s = 0; s < nstash; s++) {
+        Body *yb = stash[s].y;
+        u32 ns = 0;
+        if (stash[s].state != 1 || !yb)
+            continue;
+        seen = (u8 *)xrealloc(seen, yb->nblk + 1);
+        memset(seen, 0, yb->nblk + 1);
+        if (cap < yb->nblk + 1) {
+            cap = yb->nblk + 1;
+            stk = (u32 *)xrealloc(stk, cap * sizeof(u32));
+        }
+        if (yb->nblk > 1) {
+            stk[ns++] = 1;
+            seen[1] = 1;
+        }
+        while (ns) {
+            Block *bb = &yb->blk[stk[--ns]];
+            u32 nsucc = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0;
+            for (k = 0; k < nsucc; k++)
+                if (bb->succ[k] && bb->succ[k] < yb->nblk && !seen[bb->succ[k]]) {
+                    seen[bb->succ[k]] = 1;
+                    stk[ns++] = bb->succ[k];
+                }
+        }
+        for (v = 1; v < yb->nins; v++) {
+            Ins *i = &yb->ins[v];
+            b = i->blk;
+            if (!b || b >= yb->nblk || !seen[b])
+                continue;
+            if (i->op == OP_CALL && !(i->flags & (IF_ASM | IF_ATOMIC)) && yb->ins[i->c].op == OP_ADDR && yb->ins[i->c].a < nsym) {
+                if (yb->ins[i->c].b || yb->ins[i->c].a == s)
+                    esc[yb->ins[i->c].a] = 1; /* (an offset, or a call of itself) */
+                calls[yb->ins[i->c].a]++;
+            }
+            IR_OPS(yb, i, ops, n);
+            for (k = 0; k < n; k++)
+                if (ops[k] < yb->nins && yb->ins[ops[k]].op == OP_ADDR && yb->ins[ops[k]].a < nsym)
+                    esc[yb->ins[ops[k]].a] = 1;
+        }
+        for (b = 1; b < yb->nblk; b++) {
+            Block *bb = &yb->blk[b];
+            if (seen[b] && bb->arg && bb->arg < yb->nins && yb->ins[bb->arg].op == OP_ADDR && yb->ins[bb->arg].a < nsym)
+                esc[yb->ins[bb->arg].a] = 1;
+            for (v = bb->phis; v && seen[b]; v = yb->ins[v].next) {
+                IR_OPS(yb, &yb->ins[v], ops, n);
+                for (k = 0; k < n; k++)
+                    if (ops[k] < yb->nins && yb->ins[ops[k]].op == OP_ADDR && yb->ins[ops[k]].a < nsym)
+                        esc[yb->ins[ops[k]].a] = 1;
+            }
+        }
+    }
+    free(seen);
+    free(stk);
+}
+
+/* sym is called from one place only: inlined there whatever its size (up to ONCE_INLINE_INS) */
+void func_once(u32 sym)
+{
+    if (sym < nstash && stash[sym].state == 1 && stash[sym].mode != 2)
+        stash[sym].once = 1;
 }
 
 static Func *f;
@@ -582,7 +655,7 @@ int inline_calls(Func *fn)
             }
             if (!ok)
                 continue;
-            if (!opt_inline_once && !y->always) {
+            if (!opt_inline_once && !y->always && !y->once) {
                 /* what the profile says about this call decides how much may be copied here */
                 u32 fr = f->blk[cur].freq;
                 u32 lim = fr == 1 ? 3 : fr && fr - 1 >= (prof_max >> opt_hot_shift) && !opt_size ? (u32)opt_inline_hot :

@@ -852,6 +852,7 @@ static void sel_atomic(u32 v)
 }
 
 int opt_x64_fma;
+int opt_x64_bmi2; /* BMI2 (-mbmi2, -march=native / x86-64-v3): shifts by a register count as shlx / shrx / sarx (MCC_NOSHLX: shl %cl) */
 int opt_math_errno = 1; /* sqrt of a negative number sets errno (as the C library's does): not done in line; -fno-math-errno */
 
 /* A call of one of the mathematical library's functions that one instruction does: in line. A function of that name
@@ -2260,6 +2261,10 @@ static void sel_ins(u32 v)
             m = emit(op + (X_SHLI - X_SHL), w, d, reg_of(i->a), NOREG);
             m->imm = c & (w ? 63 : 31);
             return;
+        } else if (opt_x64_bmi2) {
+            /* BMI2: three operands, any count register (no copy to rcx, nothing tied), the flags left alone; the
+               count is taken mod 32 / 64 as shl's */
+            emit_vex(VE(0xf7, 2, op == X_SHL ? 1 : op == X_SHR ? 3 : 2, w), XF_RVM, d, reg_of(i->b), reg_of(i->a), NOREG, -1);
         } else {
             u32 ra = reg_of(i->a);
             move_to(RCX, i->b);

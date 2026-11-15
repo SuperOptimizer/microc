@@ -260,6 +260,7 @@ extern int opt_finite_math; /* -ffinite-math-only (in -ffast-math): no NaN or in
 extern int opt_vec_report;
 extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
 extern int opt_x64_fma;   /* x64.c: FMA3 may be used (-mfma, -march=native / x86-64-v3) */
+extern int opt_x64_bmi2;  /* x64.c: shlx / shrx / sarx for shifts by a register (BMI2; MCC_NOSHLX: off) */
 extern int opt_x64_avx2;  /* opt_vec.c: 32-byte vectors in AVX functions */
 extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */
 extern Obj *opt_obj;    /* opt_vec.c: the object the functions being optimised go to (for the names of what they call) */

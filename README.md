@@ -599,6 +599,17 @@ and how much of its state stays in memory, so device code is treated differently
   `(long)(x + k)` be `(long)x + k`, with `(x + k) * c` multiplied out, so addresses that differ by a constant
   share one sum and the constant is part of the address; sums are kept in one operand order, and the value
   numbering also numbers what its own folding creates;
+- a whole number that is cheap to work out and is made in one block and read in another is worked out again
+  where it is read, so that it holds no register in between: always when it is a value plus, masked by or shifted
+  by a constant (`xrem_mark` in `src/ptx.c`), and when it is a small tree of sums, products, shifts and selects
+  whose leaves are alive at every place it is read in any case (`xrem_live`: liveness of those leaves only).
+  Once per stretch of code without a label. A kernel's per-thread constants (row offsets, addresses of its
+  rows) otherwise each hold a register through the main loop, and the assembler spills: the producer loop of
+  the weight-gradient kernel had 75 registers' worth of them against nvcc's 36 and was 23% slower for it.
+  Addresses in shared memory are left alone. `MCC_NOXREM=1` turns all of this off, `=3` the trees, `=2`
+  all but the widening of 32-bit numbers;
+- a load through `c ? &a : &b` is always the choice between two loads, whatever else is done with `a` and `b`
+  (the two are read where the load stood);
 - a float rounded to a 16-bit float and then stored as one is rounded once.
 - `extern template` is honoured, so a unit does not instantiate again the kernels another unit provides.
 
@@ -606,11 +617,21 @@ and how much of its state stays in memory, so device code is treated differently
 `MCC_NOSELK`, `MCC_NOGLOBAL`, `MCC_NOLOCAL`, `MCC_NOIFCALL`, `MCC_NOPRED`, `MCC_NODIST`, `MCC_NOASMCO`, `MCC_LICM` (`=2`: all but what costs nothing in the loop) in the environment turn these
 off (or the hoisting on) for experiments; `MCC_SLOTCHECK` checks after the passes that no instruction addresses a local that was
 given up. `ptxas -v` on a `--ptx-out` file shows the spills per kernel without a GPU. On the pipeline fixture
-(150 training steps, RTX PRO 4000 Blackwell) ufsm built by mcc trains at about 490 samples a second, nvcc's
-build at about 555; without these changes it was 86. The launch itself costs the same in both (3 us). ufsm's
-own `bench_f4conv` times each convolution kernel by itself and prints a hash of what it wrote, the same in both
-builds: the forward convolutions are level with nvcc's, the weight-gradient and stride-2 kernels 1.2 to 1.4
-times slower, the sum over all of it 1.14 times at 64 voxels a side (1.09 at 16).
+(150 training steps, RTX PRO 4000 Blackwell) ufsm built by mcc trains at about 498 samples a second, nvcc's
+build at about 555; without these changes it was 86. ufsm's own `bench_f4conv` times each convolution kernel
+by itself and prints a hash of what it wrote, the same in both builds: the sum over all of it is 1.08 times
+nvcc's at 64 voxels a side and 1.07 at 16 (the weight gradient that was 1.2 times slower is level). In the
+training run the kernels, each timed between two synchronisations (`MCUDA_PROFILE=1`), add up to the same
+time in both builds, and still the run is a tenth slower: with nvcc's PTX put in place of mcc's for one kernel
+at a time (`MCUDA_SUBST`) four small kernels give back 1 to 1.5 percent each, the rest less.
+
+On real data (the PHerc1299 scan at 9.6 um read over HTTP, the `wind96` checkpoint) the two builds predict
+the same thing: of 157 million voxels of a 384 x 640 x 640 box 1591 differ, by one level of 255, in 5.4 s
+against 5.0; and forty training steps on that scan against its published surface labels give the same
+losses to four places. That training waits for its loader, and there mcc's host code is behind: reading
+labels (a binary range decoder, one bit at a time) takes 1.7 times gcc's time, reading CT 2.7 times, since
+the codec's AVX2 kernels are not used (`-DVOLCOMP_NO_AVX2`: mcc's `<immintrin.h>` is exact but element by
+element), so the loader delivers about half the samples a second.
 
 ## x86-64 Linux
 

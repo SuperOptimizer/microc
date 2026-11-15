@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+/* declared here too: a C89 <math.h> has none of them */
+float sqrtf(float), fabsf(float), floorf(float), ceilf(float), truncf(float), rintf(float);
+double nearbyint(double);
+long lrint(double), lrintf(float);
 
 #define N 77
 static unsigned char ua[N + 40], ub[N + 40], uc[N + 40];

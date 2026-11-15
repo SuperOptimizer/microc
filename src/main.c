@@ -1004,7 +1004,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_nodist = getenv("MCC_NODIST") != 0;
         opt_noifcall = getenv("MCC_NOIFCALL") != 0;
         opt_nolocal = getenv("MCC_NOLOCAL") != 0;
-        opt_noxrem = getenv("MCC_NOXREM") != 0;
+        opt_noxrem = getenv("MCC_NOXREM") ? (getenv("MCC_NOXREM")[0] >= '2' && getenv("MCC_NOXREM")[0] <= '3' ? getenv("MCC_NOXREM")[0] - '0' : 1) : 0;
         opt_nowiden = getenv("MCC_NOWIDEN") ? 1 : getenv("MCC_WIDEN") ? 2 : 0;
         opt_noglobal = getenv("MCC_NOGLOBAL") != 0;
         opt_premat = getenv("MCC_PREMAT") != 0;

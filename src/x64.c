@@ -46,6 +46,7 @@ enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, 
 
 enum {
     X_MOV, X_MOVI, X_FMOVI, X_LEA, X_SLOTADDR,
+    X_LEAX,                  /* d = s0 + (s1 << imm), imm 1..3 */
     X_ADD, X_SUB, X_IMUL, X_AND, X_OR, X_XOR,
     X_ADDI, X_IMULI, X_ANDI, X_ORI, X_XORI,
     X_SHL, X_SHR, X_SAR,     /* the count is in rcx */
@@ -67,6 +68,7 @@ enum {
     X_RMW,                   /* [s1 + s2 * scale + imm] op= s0; cc = access kind, w = which (the processor's number: */
     X_RMWI,                  /* [s1 + s2 * scale + (i32)imm] op= imm >> 32                0 add 1 or 4 and 5 sub 6 xor) */
     X_FADD, X_FSUB, X_FMUL, X_FDIV, X_FNEG,
+    X_FMAX, X_FMIN,          /* maxss / minss d = s0 > s1 ? s0 : s1 (s1 if unordered): C's a > b ? a : b exactly */
     X_SITOF, X_UITOF, X_FTOSI, X_FTOUI, X_FCVT, /* cc: the source is 64 bits wide */
     X_BITCAST,               /* movd / movq between the register files; cc: to a floating-point register */
     X_JMP, X_JCC, X_CALL, X_CALLR, X_TAIL, X_RET,
@@ -124,6 +126,7 @@ static Func *f;
 static Obj *obj;
 static MFunc mf;
 static u32 *uses;      /* per IR value: number of uses */
+static u32 *vuses;     /* ... of them as a value (not the condition of a branch or a select) */
 #define FUSE_CMP 1   /* a comparison used only as a condition: whoever uses it sets the flags */
 #define FUSE_OFF 2   /* add of a constant folded into an address */
 #define FUSE_IDX 3   /* add of an index register folded into an address */
@@ -133,6 +136,11 @@ static u32 *uses;      /* per IR value: number of uses */
 #define FUSE_TEST 9  /* and whose result only says zero or not: a test where that is asked */
 #define FUSE_RMW 8   /* operation on a loaded value, stored back: done in memory by the store */
 #define FUSE_ALIAS 7 /* truncation or extension that is its operand's register, unchanged */
+#define FUSE_BR2 10  /* an and / or of comparisons that only decides a branch: one conditional branch per comparison */
+#define BR2_MAX 8     /* (at most so many comparisons) */
+#define FUSE_DIVR 11 /* quotient or remainder that an earlier division of the same operands in its block also gave */
+static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk);
+static u32 div_pair(u32 v, int first);
 #define FUSE_NOT 0x80 /* while counting uses: the value is used as a value */
 #define LOAD_SIGNED32 10 /* access kind, here only: a 32-bit load that sign-extends to 64 bits */
 static u8 *fused;
@@ -180,6 +188,9 @@ static MIns *emit(int op, int w, u32 d, u32 s0, u32 s1)
     switch (op) { /* the two-address ones: allocation hints */
     case X_ADD: case X_IMUL: case X_AND: case X_OR: case X_XOR: case X_FADD: case X_FMUL:
         i->flags = MF_TIED | MF_COMMUT;
+        break;
+    case X_FMAX: case X_FMIN:
+        i->flags = MF_TIED | MF_NOTS1;
         break;
     case X_SUB: case X_FSUB: case X_FDIV: case X_ADDI: case X_ANDI: case X_ORI: case X_XORI:
     case X_SHL: case X_SHR: case X_SAR: case X_SHLI: case X_SHRI: case X_SARI: case X_RORI:
@@ -2026,6 +2037,15 @@ static void sel_ins(u32 v)
             m->imm = i->op == OP_ADD ? c : -c;
             return;
         }
+        if (i->op == OP_ADD && (fused[i->b] == FUSE_SKIP || fused[i->a] == FUSE_SKIP)) {
+            /* lea d, [a + b * 2^k] */
+            u32 y = fused[i->b] == FUSE_SKIP ? i->b : i->a, x = y == i->b ? i->a : i->b;
+            u64 sh = 0;
+            ir_is_const(f, f->ins[y].b, &sh);
+            m = emit(X_LEAX, w, d, reg_of(x), reg_of(f->ins[y].a));
+            m->imm = (i64)sh;
+            return;
+        }
         op = i->op == OP_ADD ? X_ADD : X_SUB;
         goto binary;
     case OP_MUL:
@@ -2096,7 +2116,11 @@ static void sel_ins(u32 v)
     case OP_SREM:
     case OP_UREM: {
         int sgn = i->op == OP_SDIV || i->op == OP_SREM, rem = i->op == OP_SREM || i->op == OP_UREM;
-        u32 ra = reg_of(i->a), rb = reg_of(i->b);
+        u32 ra, rb, pv;
+        if (fused[v] == FUSE_DIVR)
+            return; /* the earlier division set it */
+        pv = div_pair(v, 0);
+        ra = reg_of(i->a), rb = reg_of(i->b);
         emit(X_MOV, 1, RAX, ra, NOREG);
         if (sgn) {
             m = emit(X_CQO, w, RDX, NOREG, NOREG);
@@ -2109,6 +2133,8 @@ static void sel_ins(u32 v)
         m->pmask = BIT(RAX) | BIT(RDX);
         emit(X_DEFREG, 1, RDX, NOREG, NOREG);
         emit(X_MOV, 1, d, rem ? RDX : RAX, NOREG);
+        if (pv && fused[pv] == FUSE_DIVR)
+            emit(X_MOV, 1, VREG0 + pv, rem ? RAX : RDX, NOREG);
         return;
     }
     case OP_UMULH:
@@ -2289,8 +2315,25 @@ static void sel_ins(u32 v)
         }
         return;
     case OP_SELECT: {
-        u32 rb = reg_of(i->b), rc = reg_of(i->c);
-        int cc = emit_cond(i->a);
+        u32 rb, rc;
+        int cc;
+        if (is_xmm(i->ty) && (f->ins[i->a].op == OP_FLT || f->ins[i->a].op == OP_FGT) && fused[i->a] == FUSE_CMP) {
+            /* p < q ? p : q is minss p, q and p > q ? p : q maxss p, q, NaNs and signed zeros included (the second
+               operand when unordered or equal); with the arms the other way round, the other one of q, p */
+            Ins *c = &f->ins[i->a];
+            int lt = c->op == OP_FLT;
+            if (i->b == c->a && i->c == c->b) {
+                emit(lt ? X_FMIN : X_FMAX, w, d, reg_of(c->a), reg_of(c->b));
+                return;
+            }
+            if (i->b == c->b && i->c == c->a) {
+                emit(lt ? X_FMAX : X_FMIN, w, d, reg_of(c->b), reg_of(c->a));
+                return;
+            }
+        }
+        rb = reg_of(i->b);
+        rc = reg_of(i->c);
+        cc = emit_cond(i->a);
         m = emit(is_xmm(i->ty) ? X_FSEL : X_CMOV, w, d, rb, rc);
         m->cc = (u8)cc;
         return;
@@ -2359,7 +2402,24 @@ static void sel_term(u32 b, u32 next)
         break;
     case TERM_BR: {
         u32 t = bb->succ[0], e = bb->succ[1];
-        int cc = emit_cond(bb->arg);
+        int cc;
+        if (fused[bb->arg] == FUSE_BR2) {
+            /* all but the last comparison: an and leaves for e where one fails, an or for t where one holds */
+            u32 lv[BR2_MAX], nl, n2;
+            int isand = f->ins[bb->arg].op == OP_AND;
+            for (n2 = 0; n2 < BR2_MAX; n2++)
+                lv[n2] = 0;
+            nl = br2_leaves(bb->arg, f->ins[bb->arg].op, lv, 0, 1, b);
+            for (n2 = 0; n2 + 1 < nl; n2++) {
+                cc = emit_compare(lv[n2]);
+                m = emit(X_JCC, 0, NOREG, NOREG, NOREG);
+                m->cc = (u8)(isand ? cc ^ 1 : cc);
+                m->imm = blk_index[isand ? e : t];
+            }
+            cc = emit_compare(lv[nl - 1]);
+        } else {
+            cc = emit_cond(bb->arg);
+        }
         if (t != next && e != next && f->blk[e].freq > f->blk[t].freq && f->blk[t].freq) {
             /* neither follows: the conditional branch goes to the likelier one */
             cc ^= 1;
@@ -2653,6 +2713,69 @@ static int is_scale(u32 v)
            sh >= 1 && sh <= 3;
 }
 
+/* The comparisons at the leaves of v, a tree of op (OP_AND / OP_OR) each node and leaf used once, in the order they are
+   evaluated, into lv; how many (0xffffffff if v is not such a tree). check: only count; else the inner nodes become FUSE_BR2. */
+static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk)
+{
+    Ins *i = &f->ins[v];
+    u32 k, o[2];
+    if (n == 0xffffffffU)
+        return n;
+    if (i->op == op && i->ty == IT_I32 && uses[v] == 1 && (!fused[v] || fused[v] == FUSE_BR2)) {
+        if (!check)
+            fused[v] = FUSE_BR2;
+        o[0] = i->a;
+        o[1] = i->b;
+        for (k = 0; k < 2; k++) {
+            n = br2_leaves(o[k], op, lv, n, check, blk);
+            if (n == 0xffffffffU)
+                return n;
+        }
+        return n;
+    }
+    /* a leaf used elsewhere only as a condition (a later if on the same test): those set the flags again */
+    if (!is_compare(i->op) || vuses[v] != 1 || (fused[v] && fused[v] != FUSE_CMP) || n >= BR2_MAX || i->blk != blk)
+        return 0xffffffffU;
+    lv[n] = v;
+    return n + 1;
+}
+
+/* v is computed into a register of its own (not a load folded into its user, an address part, a condition) */
+static int reg_value(u32 v)
+{
+    return !fused[v] || fused[v] == FUSE_ALIAS || fused[v] == FUSE_MOV;
+}
+
+/* v is a shift by 1, 2 or 3 of type ty that can be the scaled index of an lea */
+static int lea_scale(u32 v, int ty)
+{
+    u64 sh;
+    return f->ins[v].op == OP_SHL && !fused[v] && f->ins[v].ty == ty && ir_is_const(f, f->ins[v].b, &sh) && sh >= 1 && sh <= 3;
+}
+
+/* The later division in v's block with v's operands that gives the other half (quotient / remainder) of
+   v's, or 0. first: only for a v that is not itself such a partner. */
+static u32 div_pair(u32 v, int first)
+{
+    Ins *i = &f->ins[v];
+    int sgn, rem;
+    u32 u;
+    if (i->op != OP_SDIV && i->op != OP_UDIV && i->op != OP_SREM && i->op != OP_UREM)
+        return 0;
+    if (fused[v] || (first && !uses[v]))
+        return 0;
+    sgn = i->op == OP_SDIV || i->op == OP_SREM;
+    rem = i->op == OP_SREM || i->op == OP_UREM;
+    for (u = i->next; u; u = f->ins[u].next) {
+        Ins *x = &f->ins[u];
+        if (x->a != i->a || x->b != i->b || x->ty != i->ty || !uses[u] || (fused[u] && fused[u] != FUSE_DIVR))
+            continue;
+        if (x->op == (sgn ? (rem ? OP_SDIV : OP_SREM) : (rem ? OP_UDIV : OP_UREM)))
+            return u;
+    }
+    return 0;
+}
+
 static void prepare(void)
 {
     u32 b, v, k, n;
@@ -2706,6 +2829,8 @@ static void prepare(void)
     }
 
     uses = (u32 *)xmalloc(f->nins * sizeof(u32));
+    vuses = (u32 *)xmalloc(f->nins * sizeof(u32));
+    memset(vuses, 0, f->nins * sizeof(u32));
     fused = (u8 *)xmalloc(f->nins);
     cache_reg = (u32 *)xmalloc(f->nins * sizeof(u32));
     cache_blk = (u32 *)xmalloc(f->nins * sizeof(u32));
@@ -2718,6 +2843,7 @@ static void prepare(void)
             for (n = 0; n < f->ins[v].b; n++) {
                 u32 x = f->xargs[f->ins[v].a + n];
                 uses[x]++;
+                vuses[x]++;
                 fused[x] = FUSE_NOT;
             }
         }
@@ -2728,19 +2854,24 @@ static void prepare(void)
             IR_OPS(f, i, ops, n);
             if (i->op == OP_CALL) {
                 uses[i->c]++;
+                vuses[i->c]++;
                 fused[i->c] = FUSE_NOT;
             }
             for (b = 0; b < n; b++) {
                 u32 x = ops[b];
                 uses[x]++;
-                if (b || !sel)
+                if (b || !sel) {
+                    vuses[x]++;
                     fused[x] = FUSE_NOT; /* used as a value, not as a condition */
+                }
             }
         }
         if (bb->arg) {
             uses[bb->arg]++;
-            if (bb->term != TERM_BR)
+            if (bb->term != TERM_BR) {
+                vuses[bb->arg]++;
                 fused[bb->arg] = FUSE_NOT;
+            }
         }
     }
     /* a comparison used only as the condition of branches and selects is
@@ -2811,6 +2942,37 @@ static void prepare(void)
         if (cache_blk[v] && cache_blk[v] == uses[v])
             fused[v] = FUSE_SKIP;
         cache_blk[v] = 0;
+    }
+    /* a branch on an and (or an or) of comparisons, each used there only: a branch per comparison, as
+       && (||) would be, instead of setcc / movzx / and of each and a test of the result */
+    for (k = 0; k < nlayout; k++) {
+        Block *bb = &f->blk[layout[k]];
+        u32 x = bb->arg, lv[BR2_MAX], nl;
+        if (bb->term != TERM_BR || (f->ins[x].op != OP_AND && f->ins[x].op != OP_OR) || uses[x] != 1 || fused[x] ||
+            f->ins[x].ty != IT_I32)
+            continue;
+        nl = br2_leaves(x, f->ins[x].op, lv, 0, 1, layout[k]);
+        if (nl == 0xffffffffU || nl < 2)
+            continue;
+        {
+            /* the comparisons are made at the end of the block: nothing after the first of them may write memory
+               (a load folded into one would move past it) */
+            u32 u, first = 0, bad = 0;
+            for (u = bb->first; u; u = f->ins[u].next) {
+                int op = f->ins[u].op;
+                for (n = 0; n < nl && !first; n++)
+                    if (lv[n] == u)
+                        first = u;
+                if (first && (op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_VSTORE ||
+                              op == OP_XI || op == OP_ASMOUT))
+                    bad = 1;
+            }
+            if (bad)
+                continue;
+        }
+        br2_leaves(x, f->ins[x].op, lv, 0, 0, layout[k]);
+        for (n = 0; n < nl; n++)
+            fused[lv[n]] = FUSE_CMP;
     }
     /* an and used once, to branch on whether it is zero, or by comparisons with zero that are
        themselves only conditions */
@@ -2947,6 +3109,24 @@ static void prepare(void)
             }
         }
     }
+    /* a + (b << 1..3), the shift used nowhere else, is one lea (x * 3, 5, 9 come out of the strength reduction as
+       that); last, so that only an add no other fusion took (a read-modify-write store, an address) is looked at */
+    for (k = 0; k < nlayout; k++)
+        for (v = f->blk[layout[k]].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            i64 c;
+            u32 y;
+            if (i->op != OP_ADD || fused[v] || (i->ty != IT_I32 && i->ty != IT_I64) || const_of(i->b, &c))
+                continue;
+            y = lea_scale(i->b, i->ty) && uses[i->b] == 1 ? i->b : lea_scale(i->a, i->ty) && uses[i->a] == 1 ? i->a : 0;
+            if (y && reg_value(y == i->b ? i->a : i->b) && reg_value(f->ins[y].a))
+                fused[y] = FUSE_SKIP;
+        }
+    /* x / y and x % y in one block: one div gives both (i / sy, i % sy of the index -> coordinates idiom) */
+    for (k = 0; k < nlayout; k++)
+        for (v = f->blk[layout[k]].first; v; v = f->ins[v].next)
+            if (div_pair(v, 1))
+                fused[div_pair(v, 0)] = FUSE_DIVR;
     memset(cache_reg, 0, f->nins * sizeof(u32));
 }
 
@@ -3933,11 +4113,14 @@ static void encode_vec(MIns *i)
         }
         dr = dst(i->d, FSCR0);
         if (i->cc == 1) {
-            mov_ri(SCR0, i->sym ? 0x7fffffffU : 0x7fffffffffffffffUL, 1);
-            op_rr(O_66 | O_0F | 0x6e, 1, FSCR1, SCR0); /* movq */
-            mov_loc(dr, sl);
-            op_rr(O_66 | O_0F | 0x54, 0, dr, FSCR1); /* andpd */
+            if (sl != dr)
+                mov_loc(dr, sl);
+            ea_base(&ea, NOREG, 0);
+            ea.sym = fconst_sym(i->sym ? (u64)0x7fffffffu << 32 | 0x7fffffffu : 0x7fffffffffffffffUL, 16);
+            op_mem(O_0F | 0x54, 0, dr, &ea, 0); /* andps with the mask in the constant section */
         } else {
+            if (sl != dr)
+                op_rr(O_0F | 0x57, 0, dr, dr); /* xorps: sqrtss / roundss merge into dr's upper lanes */
             op_loc((u32)i->imm, 0, dr, sl);
             if ((i->imm & 0xff) == 0x0a || (i->imm & 0xff) == 0x0b)
                 b1((u32)(i->imm >> 32) & 0xff);
@@ -4242,6 +4425,20 @@ static void encode(MIns *i)
     case X_OR: bin_int(i, 0x0b, 0); return;
     case X_XOR: bin_int(i, 0x33, 0); return;
     case X_IMUL: bin_int(i, O_0F | 0xaf, 0); return;
+    case X_LEAX:
+        a = use(i->s0, SCR0);
+        x = use(i->s1, SCR1);
+        dr = dst(i->d, SCR0);
+        ea_base(&ea, a, 0);
+        ea.idx = x;
+        ea.scale = (int)i->imm;
+        if ((x & 7) == 4 && x < 16 && i->imm == 0) { /* (rsp is no index; never scaled here) */
+            ea.base = x;
+            ea.idx = a;
+        }
+        op_mem(0x8d, w, dr, &ea, 0);
+        fin(i->d, dr);
+        return;
     case X_ADDI: {
         u32 al = loc_of(i->s0);
         dr = dst(i->d, SCR0);
@@ -4594,6 +4791,8 @@ static void encode(MIns *i)
         }
         return;
     }
+    case X_FMAX: bin_fp(i, 0x5f, 0); return;
+    case X_FMIN: bin_fp(i, 0x5d, 0); return;
     case X_FADD: bin_fp(i, 0x58, 1); return;
     case X_FMUL: bin_fp(i, 0x59, 1); return;
     case X_FSUB: bin_fp(i, 0x5c, 0); return;
@@ -4611,11 +4810,13 @@ static void encode(MIns *i)
     }
     case X_SITOF:
         dr = dst(i->d, FSCR0);
+        op_rr(O_0F | 0x57, 0, dr, dr); /* xorps: cvtsi2ss writes the low lane only and would wait for dr's last writer */
         op_loc((w ? O_F2 : O_F3) | O_0F | 0x2a, i->cc, dr, loc_of(i->s0));
         fin(i->d, dr);
         return;
     case X_UITOF:
         dr = dst(i->d, FSCR0);
+        op_rr(O_0F | 0x57, 0, dr, dr); /* xorps (as X_SITOF) */
         if (!i->cc) {
             op_loc(0x8b, 0, SCR0, loc_of(i->s0)); /* the upper half cleared */
             op_rr((w ? O_F2 : O_F3) | O_0F | 0x2a, 1, dr, SCR0);
@@ -4688,6 +4889,8 @@ static void encode(MIns *i)
     }
     case X_FCVT:
         dr = dst(i->d, FSCR0);
+        if (loc_of(i->s0) != dr)
+            op_rr(O_0F | 0x57, 0, dr, dr); /* xorps: cvtss2sd / cvtsd2ss merge into dr's upper lanes */
         op_loc((w ? O_F3 : O_F2) | O_0F | 0x5a, 0, dr, loc_of(i->s0));
         fin(i->d, dr);
         return;
@@ -5364,6 +5567,7 @@ void x64_gen(Func *fn, Obj *o)
     free(layout);
     free(blk_index);
     free(uses);
+    free(vuses);
     free(fused);
     free(cache_reg);
     free(cache_blk);

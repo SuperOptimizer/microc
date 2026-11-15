@@ -3187,6 +3187,38 @@ static void call(Expr *e)
             }
         }
     }
+    /* fmax, fmin (f): y > x ? y : x is maxss / maxsd (x when unordered), then y where x is a NaN (a branch that is
+       never taken in practice): what clang makes of them, NaNs and signed zeros alike, without the call */
+    if (!flags && nargs == 2 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && type_is_float(ret)) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        int it = type_ir(ret), mx = strcmp(cn, it == IT_F32 ? "fmaxf" : "fmax") == 0, mn = strcmp(cn, it == IT_F32 ? "fminf" : "fmin") == 0;
+        if ((mx || mn) && (it == IT_F32 || it == IT_F64) && F->ins[args[0]].ty == it && F->ins[args[1]].ty == it) {
+            u32 x = args[0], y = args[1], t, r;
+            t = ir_raw(F, OP_SELECT, it, ir_ins(F, mx ? OP_FGT : OP_FLT, IT_I32, y, x), y);
+            F->ins[t].c = x;
+            ir_append(F, F->cur, t);
+            r = ir_raw(F, OP_SELECT, it, ir_ins(F, OP_FNE, IT_I32, x, x), y);
+            F->ins[r].c = t;
+            ir_append(F, F->cur, r);
+            set_expr(e, ret, r, 0);
+            return;
+        }
+    }
+    /* abs, labs, llabs: a negation and a select (a call through the PLT each time otherwise) */
+    if (!flags && nargs == 1 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && type_is_int(ret)) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        int it = F->ins[args[0]].ty;
+        if ((strcmp(cn, "abs") == 0 && it == IT_I32) || ((strcmp(cn, "labs") == 0 || strcmp(cn, "llabs") == 0) && it == IT_I64)) {
+            u32 x = args[0], sel = ir_raw(F, OP_SELECT, it, ir_ins(F, OP_SLT, IT_I32, x, ir_const(F, it, 0)),
+                                         ir_ins(F, OP_NEG, it, x, 0));
+            F->ins[sel].c = x;
+            ir_append(F, F->cur, sel);
+            set_expr(e, ret, sel, 0);
+            return;
+        }
+    }
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
     v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? (vec_mem(ret) == M_V256 ? IT_V256 : IT_V128) : type_ir(ret), callee, args, nargs,
                 ft->variadic ? ft->nparams + (flags ? 1 : 0) : opt_arch == ARCH_X64 && ft->oldstyle ? nargs : 0xffffffffU, flags);
@@ -4545,8 +4577,12 @@ static int builtin(Expr *e)
         double zero = 0, big = 1e300, val;
         Type *ft = b[strlen(b) - 1] == 'f' && strcmp(b, "inf") != 0 ? ty_float : ty_double;
         val = b[0] == 'n' ? zero / zero : big * big;
-        if (b[0] == 'n' && val < 0)
-            val = -val; /* the quiet one with the sign clear */
+        if (b[0] == 'n') {
+            /* the quiet one with the sign clear, as gcc / clang give it (0/0 on x86-64 is the negative one, and a
+               NaN never compares below 0, so a test of the sign did nothing) */
+            unsigned char *vb = (unsigned char *)&val;
+            vb[sizeof val - 1] &= 0x7f; /* (little-endian hosts) */
+        }
         next();
         expect(T_LPAREN);
         while (tok.kind == T_STR)
@@ -10120,6 +10156,8 @@ static void statement(void)
             u32 in;
             Token *itk = grab_done(&in, 0);
             uv = unroll_var(itk, in, &uval);
+            if (au && opt_autolog && !uv)
+                warn_at(for_loc, "loop %u: no counter", au_n);
         }
         if (uv && tok.kind != T_SEMI) {
             /* #pragma unroll: the body and the step are read once for each time the condition, read before
@@ -10142,6 +10180,8 @@ static void statement(void)
             btk = grab_done(&bn, 0);
             if (!unroll_step(uv, stk, sn, 0) || unroll_writes(uv->name, btk, bn) || unroll_writes(uv->name, ctk, cn))
                 ur = 0, au = 0; /* not a loop that counts in a way that is understood: an ordinary one */
+            if (opt_autolog && !au)
+                warn_at(for_loc, "loop %u: step / writes", au_n);
             if (au) {
                 /* how often the loop runs, if reading the condition with the counter known tells */
                 i64 v = uval;
@@ -10158,8 +10198,11 @@ static void statement(void)
                     rvalue(&e);
                     c = to_bool(&e);
                     expect(T_SEMI);
-                    if (!ir_is_const(F, c, &cv))
+                    if (!ir_is_const(F, c, &cv)) {
+                        if (opt_autolog)
+                            warn_at(for_loc, "loop %u: condition not constant at %u", au_n, k);
                         break;
+                    }
                     if (!cv) {
                         if (k && (u64)k * bn <= UNROLL_AUTO_SIZE && unroll_plain(btk, bn) && auto_n < opt_automax) {
                             /* how much code the body is, the loops inside it unrolled: it is read once, into
@@ -10939,7 +10982,8 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         lf->sec = s->section ? (u32)obj_section(O, s->section, SF_ALLOC | SF_EXEC) : SEC_TEXT;
         lf->noemit = (u8)def_extern_inline;
         /* (+4: device code, which has no vector operations) */
-        func_stash(F, (s->aflags & (AT_NOINLINE | AT_WEAK) ? 2 : s->aflags & AT_ALWAYS_INLINE ? 1 : 0) + (lf->dev ? 4 : 0) + (lf->dev == 1 ? 8 : 0));
+        func_stash(F, (s->aflags & (AT_NOINLINE | AT_WEAK) ? 2 : s->aflags & AT_ALWAYS_INLINE ? 1 : s->is_inline && !lf->dev ? 3 : 0) +
+                          (lf->dev ? 4 : 0) + (lf->dev == 1 ? 8 : 0));
         cur_fn_dev = 0;
         cur_fn_avx = 0;
         opt_dev_parse = 0;

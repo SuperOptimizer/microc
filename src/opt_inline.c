@@ -29,6 +29,7 @@ typedef struct Body {
     u8 variadic;
     u8 avx;
     u8 always; /* always_inline */
+    u8 hinted; /* declared inline (opt_inline_mode 3): opt_inline_hint instead of opt_inline_limit */
     u32 copies;
     u32 size; /* instructions */
 } Body;
@@ -70,11 +71,12 @@ static void *dup(const void *p, size_t n)
 }
 
 int opt_inline_once; /* the function being compiled has a single call site */
+int opt_inline_hint = 48; /* the limit for functions declared inline (the C keyword is a request: clang's is ~5x its default) */
 int opt_inline_hot = 40; /* limit at call sites a profile shows to be hot */
 int opt_hot_shift = 10;  /* hot: runs at least 1/2^n as often as the busiest block of the program */
 #define LIMIT (opt_size ? 3 : opt_inline_limit)
 
-int opt_inline_mode; /* of the function being optimised: 0 inline by size, 1 always, 2 never */
+int opt_inline_mode; /* of the function being optimised: 0 inline by size, 1 always, 2 never, 3 by size, declared inline */
 int opt_novec;       /* of the function being optimised: no vector code, which only the processor's back end takes */
 
 static Body *body_copy(Func *f)
@@ -145,12 +147,14 @@ void inline_save(Func *f)
     /* a function the profile saw running is kept up to a larger size, for
        the call sites that matter */
     if (opt_inline_mode != 1 &&
-        (count > (opt_inline_once ? ONCE_INLINE_INS : f->blk[1].freq > 1 && !opt_size ? (u32)opt_inline_hot : (u32)LIMIT) + f->nparams ||
+        (count > (opt_inline_once ? ONCE_INLINE_INS : f->blk[1].freq > 1 && !opt_size ? (u32)opt_inline_hot :
+                  opt_inline_mode == 3 && !opt_size ? (u32)opt_inline_hint : (u32)LIMIT) + f->nparams ||
          live > MAX_INLINE_BLOCKS))
         return;
     y = body_copy(f);
     y->size = count;
     y->always = opt_inline_mode == 1;
+    y->hinted = opt_inline_mode == 3;
     if (f->sym >= nbodies) {
         u32 n = nbodies ? nbodies : 256;
         while (n <= f->sym)
@@ -580,7 +584,8 @@ int inline_calls(Func *fn)
             if (!opt_inline_once && !y->always) {
                 /* what the profile says about this call decides how much may be copied here */
                 u32 fr = f->blk[cur].freq;
-                u32 lim = fr == 1 ? 3 : fr && fr - 1 >= (prof_max >> opt_hot_shift) && !opt_size ? (u32)opt_inline_hot : (u32)LIMIT;
+                u32 lim = fr == 1 ? 3 : fr && fr - 1 >= (prof_max >> opt_hot_shift) && !opt_size ? (u32)opt_inline_hot :
+                          y->hinted && !opt_size ? (u32)opt_inline_hint : (u32)LIMIT;
                 if (y->size > lim + y->nparams)
                     continue;
             }

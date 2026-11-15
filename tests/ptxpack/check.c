@@ -10,7 +10,6 @@
 
 extern struct __mcuda_module *__start_mcuda_modules[] __attribute__((weak));
 extern struct __mcuda_module *__stop_mcuda_modules[] __attribute__((weak));
-static unsigned long long rd8(const unsigned char *p) { return mcuda_pack_rd8(p); }
 
 int main(int argc, char **argv)
 {
@@ -18,7 +17,8 @@ int main(int argc, char **argv)
     long n;
     char *want, *got;
     const char *ptx;
-    unsigned long long un, pm, k;
+    unsigned long long un, pm, pl, tot, k;
+    char *pro;
     unsigned char *copy;
     int bad = 0;
     if (argc != 2 || !(f = fopen(argv[1], "rb")))
@@ -34,36 +34,45 @@ int main(int argc, char **argv)
     ptx = __start_mcuda_modules[0]->ptx;
     if (!mcuda_packed(ptx))
         return printf("check: the record is not packed\n"), 1;
-    un = rd8((const unsigned char *)ptx + 4), pm = rd8((const unsigned char *)ptx + 12);
+    un = mcuda_pack_n(ptx), pm = mcuda_pack_m(ptx), pl = mcuda_pack_p(ptx), tot = MCUDA_PACK_HDR + pl + pm;
     if (un != (unsigned long long)n + 1)
         return printf("check: unpacked size %llu, the text has %ld + 1\n", un, n), 1;
     got = mcuda_unpack(ptx);
     if (!got || strcmp(got, want) != 0)
         return printf("check: the unpacked text differs from --ptx-out\n"), 1;
     free(got);
+    /* the prologue alone: the text's first P bytes, every declaration, no function body */
+    pro = malloc((size_t)un + 8);
+    if (mcuda_unpack_prologue(ptx, pro) || strlen(pro) != pl || strncmp(pro, want, (size_t)pl) != 0)
+        return printf("check: the prologue is not the text's first %llu bytes\n", pl), 1;
+    if (pl < un - 1 && strstr(pro, "\n{") != 0)
+        return printf("check: the prologue holds a function body\n"), 1;
+    if (mcuda_unpack_body(ptx, pro) || strcmp(pro, want) != 0)
+        return printf("check: prologue + body differs from --ptx-out\n"), 1;
+    free(pro);
     /* damaged copies: each must be refused or give some NUL-terminated text of the stated size */
-    copy = malloc((size_t)(MCUDA_PACK_HDR + pm));
+    copy = malloc((size_t)tot);
     for (k = 0; k < 64 && k < pm; k++) {
-        unsigned long long at = MCUDA_PACK_HDR + (k * 7919) % pm;
-        memcpy(copy, ptx, (size_t)(MCUDA_PACK_HDR + pm));
+        unsigned long long at = MCUDA_PACK_HDR + pl + (k * 7919) % pm;
+        memcpy(copy, ptx, (size_t)tot);
         copy[at] ^= (unsigned char)(1 + k % 255);
         got = mcuda_unpack((const char *)copy);
         if (got && strlen(got) + 1 > un)
             bad++;
         free(got);
     }
-    memcpy(copy, ptx, (size_t)(MCUDA_PACK_HDR + pm));
+    memcpy(copy, ptx, (size_t)tot);
     copy[12] = (unsigned char)(pm / 2), copy[13] = (unsigned char)(pm / 512), copy[14] = 0, copy[15] = 0; /* cut short */
     memset(copy + 16, 0, 4);
     if ((got = mcuda_unpack((const char *)copy)) != 0)
         bad++, free(got);
-    memcpy(copy, ptx, (size_t)(MCUDA_PACK_HDR + pm));
+    memcpy(copy, ptx, (size_t)tot);
     copy[4] ^= 1; /* a wrong unpacked size */
     if ((got = mcuda_unpack((const char *)copy)) != 0)
         bad++, free(got);
     free(copy);
     if (bad)
         return printf("check: %d damaged records not refused\n", bad), 1;
-    printf("ok %ld bytes -> %llu (%.2fx)\n", n, pm + MCUDA_PACK_HDR, (double)n / (double)(pm + MCUDA_PACK_HDR));
+    printf("ok %ld bytes -> %llu (%.2fx), prologue %llu\n", n, tot, (double)n / (double)tot, pl);
     return 0;
 }

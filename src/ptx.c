@@ -3849,11 +3849,11 @@ static void pk_ins(Pk *k, size_t i)
     if (i + 32 <= k->n && (i & 7) == 0)
         k->h32[pk_h32(k->in + i, k->hb)] = (u32)i;
 }
-/* out = "\0MPZ", n (u64), m (u64), the tokens (m bytes) */
-static void ptx_pack(Buf *out, const u8 *in, size_t n)
+/* out = "\0MPZ", n (u64), m (u64), P (u64), in[0..P) plain (the declarations), the tokens (m bytes) of in[P..n) */
+static void ptx_pack(Buf *out, const u8 *in, size_t n, size_t pro)
 {
     Pk k;
-    size_t lit = 0, i = 0, bl, bo, l2, o2, at, j;
+    size_t lit = pro, i = 0, bl, bo, l2, o2, at, j;
     int hb = 10;
     while (hb < 22 && ((size_t)1 << hb) < n)
         hb++;
@@ -3867,6 +3867,11 @@ static void ptx_pack(Buf *out, const u8 *in, size_t n)
     buf_u64(out, (u64)n);
     at = out->len;
     buf_u64(out, 0);
+    buf_u64(out, (u64)pro);
+    buf_put(out, in, pro);
+    for (; i < pro && i + 8 <= n; i++) /* (the bodies may copy from the declarations) */
+        pk_ins(&k, i);
+    i = pro;
     while (i + 8 <= n) {
         pk_best(&k, i, &bl, &bo);
         if (bl < PK_MINM) {
@@ -3892,7 +3897,7 @@ static void ptx_pack(Buf *out, const u8 *in, size_t n)
     }
     buf_uleb(out, (u64)(n - lit));
     buf_put(out, in + lit, n - lit);
-    put_u64le(out->p + at, (u64)(out->len - at - 8));
+    put_u64le(out->p + at, (u64)(out->len - at - 16 - pro));
     free(k.h8);
     free(k.h32);
     free(k.chain);
@@ -3914,6 +3919,7 @@ void ptx_finish(Obj *o)
 {
     Buf t, names, tab;
     u32 k, textsym, namesym, tabsym, modname;
+    size_t prologue = 0;
     u64 off;
     const char *q, *e;
 
@@ -3977,7 +3983,9 @@ void ptx_finish(Obj *o)
         BP(&t, ";\n");
     }
     BP(&t, "\n");
-    /* the bodies, with the names of called functions filled in */
+    /* the bodies, with the names of called functions filled in (what is ahead of them, the declarations, stays plain
+       in a packed record: mcudahw scans every unit's declarations, and unpacks only the bodies it runs) */
+    prologue = t.len;
     q = (const char *)body.p;
     e = q + body.len;
     while (q < e) {
@@ -3999,7 +4007,7 @@ void ptx_finish(Obj *o)
         textsym = put_data(o, SEC_CONST, t.p, t.len, 1);
     } else { /* (packed: mcuda_pack.h; the run time unpacks it before it reads it) */
         Buf z = {0};
-        ptx_pack(&z, t.p, t.len);
+        ptx_pack(&z, t.p, t.len, prologue);
         textsym = put_data(o, SEC_CONST, z.p, z.len, 1);
         buf_free(&z);
     }

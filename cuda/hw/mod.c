@@ -63,6 +63,7 @@ typedef struct {
 
 typedef struct {
     struct __mcuda_module *m;
+    const char *packed;   /* a packed record (mcuda_pack.h) whose bodies are not unpacked yet: m->ptx holds its declarations */
     const char *body;     /* the text after the declarations */
     char **ext;           /* the functions it declares and does not define, without their "__mcuda_" */
     int *extdef, next;    /* and the module that defines each, -1: the library */
@@ -413,8 +414,19 @@ static void take(void)
         memset(&mods[nmods], 0, sizeof *mods);
         mods[nmods].m = pending[i];
         pending[i]->handle = 0;
-        if (mcuda_ptx_plain(&pending[i]->ptx)) /* (packed by mcc: unpacked once, before scan reads it) */
-            fprintf(stderr, "mcudahw: %s: damaged packed PTX: the unit has no device code\n", pending[i]->name ? pending[i]->name : "module");
+        if (mcuda_packed(pending[i]->ptx)) {
+            /* packed by mcc: its declarations now (scan reads them), the bodies when index_mod first wants them; the buffer is
+               malloc'd whole, but its pages are only touched as far as the text is written */
+            const char *pk = pending[i]->ptx;
+            char *t = (char *)malloc((size_t)mcuda_pack_n(pk) + 8);
+            if (!t || mcuda_unpack_prologue(pk, t)) {
+                fprintf(stderr, "mcudahw: %s: damaged packed PTX: the unit has no device code\n", pending[i]->name ? pending[i]->name : "module");
+                free(t);
+                t = 0, pk = 0;
+            }
+            pending[i]->ptx = t;
+            mods[nmods].packed = pk;
+        }
         nmods++;
     }
     npending = 0;
@@ -1338,11 +1350,17 @@ static void item_add(Mod *M, int *cap, int kind, const char *name, int len, cons
 static void index_mod(int i)
 {
     Mod *M = &mods[i];
-    const char *t = M->m->ptx ? M->m->ptx : "", *p, *e, *q;
+    const char *t, *p, *e, *q;
     int cap = 0, k, len;
     if (M->indexed)
         return;
     M->indexed = 1;
+    if (M->packed) { /* (the bodies of a packed record, once: after the declarations that take() unpacked) */
+        if (mcuda_unpack_body(M->packed, (char *)M->m->ptx))
+            fprintf(stderr, "mcudahw: %s: damaged packed PTX: its functions are missing\n", M->m->name ? M->m->name : "module");
+        M->packed = 0;
+    }
+    t = M->m->ptx ? M->m->ptx : "";
     for (p = t; *p; p = e) {
         const char *l = p;
         int ext = 0;

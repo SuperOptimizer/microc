@@ -12,6 +12,7 @@
    launch's stream), and a copy to the symbol writes the block and every loaded copy on that device. */
 #include "hw.h"
 #include <mcuda.h>
+#include <mcuda_pack.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -412,6 +413,8 @@ static void take(void)
         memset(&mods[nmods], 0, sizeof *mods);
         mods[nmods].m = pending[i];
         pending[i]->handle = 0;
+        if (mcuda_ptx_plain(&pending[i]->ptx)) /* (packed by mcc: unpacked once, before scan reads it) */
+            fprintf(stderr, "mcudahw: %s: damaged packed PTX: the unit has no device code\n", pending[i]->name ? pending[i]->name : "module");
         nmods++;
     }
     npending = 0;

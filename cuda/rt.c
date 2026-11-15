@@ -4,6 +4,7 @@
 #define MCUDA_INTERNAL
 #include "mc.h"
 #include <mcuda.h>
+#include <mcuda_pack.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1243,6 +1244,8 @@ static McModule *module_get(struct __mcuda_module *m)
             mcuda_unlock(MC_LOCK_MODULE);
             return 0;
         }
+    if (!h && m->ptx && mcuda_ptx_plain(&m->ptx)) /* (packed by mcc: unpacked here, once) */
+        fprintf(stderr, "mcuda: %s: damaged packed PTX\n", m->name ? m->name : "module");
     if (!h && m->ptx) {
         h = mc_module_load(m->ptx, m->name);
         if (h) {

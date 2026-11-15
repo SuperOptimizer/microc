@@ -415,8 +415,9 @@ static int grabbing;
 #define UNROLL_AUTO_INS 600   /* and this many instructions, as the body is first read */
 /* host code at -O3: loops of a few trips (for d < 3 over coordinates), so the loop around them is one block the
    vectoriser takes, and the counter is a constant in each copy */
-#define UNROLL_HOST_N 8
-#define UNROLL_HOST_INS 160
+#define UNROLL_HOST_N 16      /* (a loop over the 8 corners of a cell, 13 neighbours) */
+#define UNROLL_HOST_INS 1200  /* (8 corners x a short row loop: ufsm write_spatial_tm 1.11x, phase_blend_row 1.5x) */
+#define UNROLL_HOST_SIZE 2400 /* tokens */
 static u32 au_n;
 static u32 auto_n; /* loops unrolled unasked so far (debugging: MCC_AUTOMAX, MCC_AUTOLOG) */
 static Sym *unroll_probe; /* C: the counter read as its constant while an unasked unroll reads the condition (C++ reads every
@@ -3177,6 +3178,14 @@ static void call(Expr *e)
         if (opt_target != TARGET_LINUX && cn[0] == '_')
             cn++;
         if (ir_is_const(F, args[2], &n) && n > 0 && n <= 64) {
+            if (strcmp(cn, "memcpy") == 0 && (n == 1 || n == 2 || n == 4 || n == 8)) {
+                /* one scalar: a load and a store (x86-64 takes them unaligned), so that a local on either side
+                   is a value at once, as the w of memcpy(&w, p, 8) in a bit reader */
+                int m = n == 1 ? M_8U : n == 2 ? M_16U : n == 4 ? M_32 : M_64;
+                ir_store(F, m, args[0], ir_load(F, n == 8 ? IT_I64 : IT_I32, m, args[1]));
+                set_expr(e, ret, args[0], 0);
+                return;
+            }
             if (strcmp(cn, "memcpy") == 0) {
                 emit_mem(OP_MEMCPY, args[0], args[1], n, 1);
                 set_expr(e, ret, args[0], 0);
@@ -6035,8 +6044,20 @@ static void primary(Expr *e)
     case SK_TYPEDEF:
         error_at(loc, "unexpected type name '%s'", intern_str(s->name));
     }
-    if (s == unroll_probe && s->cv == 1) {
-        set_int(e, s->ty, (u64)s->val);
+    if (s->cv) {
+        /* the counter of a loop being unrolled, in the condition and in each copy of the body (C; cxx_primary
+           does the same for C++): a constant, so that arrays indexed by it are values from the first split on */
+        if (s == cv_lvalue) {
+            u32 addr = new_temp(s->ty);
+            cv_lvalue = 0;
+            store_val(s->ty, addr, s->cv == 1 ? ir_const(F, type_ir(s->ty), (u64)s->val) : ir_fconst(F, type_ir(s->ty), s->fval));
+            set_expr(e, s->ty, addr, 1);
+        } else if (s->cv == 1) {
+            set_int(e, s->ty, (u64)s->val);
+            e->konst = 1;
+        } else {
+            set_expr(e, s->ty, ir_fconst(F, type_ir(s->ty), s->fval), 0);
+        }
         return;
     }
     if (s->local) {
@@ -10247,7 +10268,9 @@ static void statement(void)
                         break;
                     }
                     if (!cv) {
-                        if (k && (u64)k * bn <= UNROLL_AUTO_SIZE && unroll_plain(btk, bn) && auto_n < opt_automax) {
+                        if (opt_autolog && !(k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn)))
+                            warn_at(for_loc, "loop %u: %u times %u tokens, or not plain", au_n, k, bn);
+                        if (k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn) && auto_n < opt_automax) {
                             /* how much code the body is, the loops inside it unrolled: it is read once, into
                                blocks that are never run */
                             u32 n0 = F->nins, s_break = break_blk, s_cont = cont_blk, grown;
@@ -10268,6 +10291,8 @@ static void statement(void)
                                 ur = k + 1;
                                 if (opt_autolog)
                                     warn_at(tok.loc, "loop %u unrolled unasked: %u times %u instructions", auto_n, k, grown);
+                            } else if (opt_autolog) {
+                                warn_at(for_loc, "loop %u: %u times %u instructions: too many", au_n, k, grown);
                             }
                         }
                         break;

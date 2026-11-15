@@ -1906,8 +1906,9 @@ static void run_passes(Func *fn)
     }
     f = fn;
     gvn();
-    if (opt_cuda) {
-        /* arrays handed to functions that are now part of this one */
+    if (opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1 && !opt_nosplit)) {
+        /* arrays handed to functions that are now part of this one (x86-64: a decoder's state record whose
+           functions were inlined, its fields then values) */
         ir_resolve_all(f);
         /* ... and again while it brings something: an address read back from a record that was split (what
            a lambda captured by reference) is then seen to be that of a local, which can now be a value too */

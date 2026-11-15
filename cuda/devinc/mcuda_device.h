@@ -257,6 +257,28 @@ __device__ static __forceinline__ unsigned __match_any_sync(unsigned mask, unsig
 template <class T> __host__ __device__ static __forceinline__ T __ldg(const T *p) {
     if (__builtin_mcuda_device()) return __builtin_mcc_ldg(p);
     return *p; }
+/* the vector types in one ld.global.nc.v4 / .v2, as CUDA's own __ldg (a record through __builtin_mcc_ldg was read field
+   by field: lp_s2 had no vector .nc load, nvcc 111 v4). MCC_NOLDGV in mcc's environment (__MCC_NOLDGV): field by field */
+#ifndef __MCC_NOLDGV
+__host__ __device__ static __forceinline__ uint4 __ldg(const uint4 *p) {
+    if (__builtin_mcuda_device()) { uint4 r; asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p)); return r; }
+    return *p; }
+__host__ __device__ static __forceinline__ int4 __ldg(const int4 *p) {
+    if (__builtin_mcuda_device()) { int4 r; asm("ld.global.nc.v4.s32 {%0,%1,%2,%3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p)); return r; }
+    return *p; }
+__host__ __device__ static __forceinline__ float4 __ldg(const float4 *p) {
+    if (__builtin_mcuda_device()) { float4 r; asm("ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w) : "l"(p)); return r; }
+    return *p; }
+__host__ __device__ static __forceinline__ uint2 __ldg(const uint2 *p) {
+    if (__builtin_mcuda_device()) { uint2 r; asm("ld.global.nc.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p)); return r; }
+    return *p; }
+__host__ __device__ static __forceinline__ int2 __ldg(const int2 *p) {
+    if (__builtin_mcuda_device()) { int2 r; asm("ld.global.nc.v2.s32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p)); return r; }
+    return *p; }
+__host__ __device__ static __forceinline__ float2 __ldg(const float2 *p) {
+    if (__builtin_mcuda_device()) { float2 r; asm("ld.global.nc.v2.f32 {%0,%1}, [%2];" : "=f"(r.x), "=f"(r.y) : "l"(p)); return r; }
+    return *p; }
+#endif
 __device__ static __forceinline__ unsigned long __cvta_generic_to_shared(const void *p) { unsigned long r; asm("cvta.to.shared.u64 %0, %1;" : "=l"(r) : "l"(p)); return r; }
 
 /* warps */

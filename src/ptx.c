@@ -4273,6 +4273,113 @@ void ptx_gen(Func *f, Obj *o, int entry)
 }
 
 /* Puts bytes into a section and returns a new symbol for them. */
+/* ---- packing the module text (cuda/include/mcuda_pack.h has the layout and the unpacker) ----
+   LZ77 over the whole unit: two hash tables, one keyed by 8 bytes (chains of depth PK_DEPTH) and one by 32 bytes
+   at every 8th position, which finds the long repeats of one template's instantiations however far back they
+   are; greedy with one step of lazy matching. Measured on lp_f4fwd_i0p (18.7 MB of PTX): 5.3x in 0.37 s (depth
+   4); depth 1 5.1x in 0.28 s, depth 16 5.5x in 0.92 s; zstd -1 6.4x (a 128 KB window: 2.4x less there). */
+#define PK_DEPTH 4
+#define PK_MINM 6 /* MCUDA_PACK_MINM */
+static u64 pk_ld8(const u8 *p) { u64 v; memcpy(&v, p, 8); return v; }
+static u32 pk_h8(const u8 *p, int hb) { return (u32)(((pk_ld8(p) << 16) * ((u64)0x9E3779B9u << 32 | 0x7F4A7C15u)) >> (64 - hb)); }
+static u32 pk_h32(const u8 *p, int hb)
+{
+    u64 v = pk_ld8(p) ^ pk_ld8(p + 8) * 31 ^ pk_ld8(p + 16) * 1009 ^ pk_ld8(p + 24) * 65537;
+    return (u32)((v * ((u64)0x9E3779B9u << 32 | 0x7F4A7C15u)) >> (64 - hb));
+}
+static size_t pk_len(const u8 *a, const u8 *b, const u8 *e)
+{
+    const u8 *s = b;
+    while (b + 8 <= e && pk_ld8(a) == pk_ld8(b))
+        a += 8, b += 8;
+    while (b < e && *a == *b)
+        a++, b++;
+    return (size_t)(b - s);
+}
+typedef struct {
+    const u8 *in;
+    size_t n;
+    int hb;
+    u32 *h8, *h32, *chain;
+} Pk;
+static void pk_best(Pk *k, size_t i, size_t *bl, size_t *bo)
+{
+    u32 c;
+    int d;
+    *bl = 0, *bo = 0;
+    if (i + 32 <= k->n && (c = k->h32[pk_h32(k->in + i, k->hb)]) != 0xffffffffu) {
+        size_t l = pk_len(k->in + c, k->in + i, k->in + k->n);
+        if (l > *bl)
+            *bl = l, *bo = i - c;
+    }
+    for (c = k->h8[pk_h8(k->in + i, k->hb)], d = 0; d < PK_DEPTH && c != 0xffffffffu; d++, c = k->chain[c]) {
+        size_t l = pk_len(k->in + c, k->in + i, k->in + k->n);
+        if (l > *bl)
+            *bl = l, *bo = i - c;
+    }
+}
+static void pk_ins(Pk *k, size_t i)
+{
+    u32 h = pk_h8(k->in + i, k->hb);
+    k->chain[i] = k->h8[h];
+    k->h8[h] = (u32)i;
+    if (i + 32 <= k->n && (i & 7) == 0)
+        k->h32[pk_h32(k->in + i, k->hb)] = (u32)i;
+}
+/* out = "\0MPZ", n (u64), m (u64), P (u64), in[0..P) plain (the declarations), the tokens (m bytes) of in[P..n) */
+static void ptx_pack(Buf *out, const u8 *in, size_t n, size_t pro)
+{
+    Pk k;
+    size_t lit = pro, i = 0, bl, bo, l2, o2, at, j;
+    int hb = 10;
+    while (hb < 22 && ((size_t)1 << hb) < n)
+        hb++;
+    k.in = in, k.n = n, k.hb = hb;
+    k.h8 = (u32 *)xmalloc(sizeof(u32) << hb);
+    k.h32 = (u32 *)xmalloc(sizeof(u32) << hb);
+    k.chain = (u32 *)xmalloc(sizeof(u32) * (n + 1));
+    memset(k.h8, 0xff, sizeof(u32) << hb);
+    memset(k.h32, 0xff, sizeof(u32) << hb);
+    buf_put(out, "\0MPZ", 4);
+    buf_u64(out, (u64)n);
+    at = out->len;
+    buf_u64(out, 0);
+    buf_u64(out, (u64)pro);
+    buf_put(out, in, pro);
+    for (; i < pro && i + 8 <= n; i++) /* (the bodies may copy from the declarations) */
+        pk_ins(&k, i);
+    i = pro;
+    while (i + 8 <= n) {
+        pk_best(&k, i, &bl, &bo);
+        if (bl < PK_MINM) {
+            pk_ins(&k, i++);
+            continue;
+        }
+        pk_ins(&k, i);
+        if (i + 9 <= n) {
+            pk_best(&k, i + 1, &l2, &o2);
+            if (l2 > bl + 1) { /* (lazy: a longer match one byte on) */
+                i++;
+                continue;
+            }
+        }
+        buf_uleb(out, (u64)(i - lit));
+        buf_put(out, in + lit, i - lit);
+        buf_uleb(out, (u64)(bl - PK_MINM));
+        buf_uleb(out, (u64)bo);
+        for (j = i + 1; j < i + bl && j + 8 <= n; j++)
+            pk_ins(&k, j);
+        i += bl;
+        lit = i;
+    }
+    buf_uleb(out, (u64)(n - lit));
+    buf_put(out, in + lit, n - lit);
+    put_u64le(out->p + at, (u64)(out->len - at - 16 - pro));
+    free(k.h8);
+    free(k.h32);
+    free(k.chain);
+}
+
 static u32 put_data(Obj *o, int sec, const void *p, size_t n, u32 align)
 {
     u64 off = obj_reserve(o, sec, n, align);
@@ -4289,6 +4396,7 @@ void ptx_finish(Obj *o)
 {
     Buf t, names, tab;
     u32 k, textsym, namesym, tabsym, modname;
+    size_t prologue = 0;
     u64 off;
     const char *q, *e;
 
@@ -4352,7 +4460,9 @@ void ptx_finish(Obj *o)
         BP(&t, ";\n");
     }
     BP(&t, "\n");
-    /* the bodies, with the names of called functions filled in */
+    /* the bodies, with the names of called functions filled in (what is ahead of them, the declarations, stays plain
+       in a packed record: mcudahw scans every unit's declarations, and unpacks only the bodies it runs) */
+    prologue = t.len;
     q = (const char *)body.p;
     e = q + body.len;
     while (q < e) {
@@ -4370,7 +4480,14 @@ void ptx_finish(Obj *o)
         }
     }
     buf_u8(&t, 0);
-    textsym = put_data(o, SEC_CONST, t.p, t.len, 1);
+    if (opt_ptx_raw) {
+        textsym = put_data(o, SEC_CONST, t.p, t.len, 1);
+    } else { /* (packed: mcuda_pack.h; the run time unpacks it before it reads it) */
+        Buf z = {0};
+        ptx_pack(&z, t.p, t.len, prologue);
+        textsym = put_data(o, SEC_CONST, z.p, z.len, 1);
+        buf_free(&z);
+    }
 
     /* names, then pairs of (name, address) ending with a null pair */
     for (k = 0; k < nhost + nkern; k++) {

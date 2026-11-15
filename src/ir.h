@@ -310,6 +310,7 @@ extern int opt_dev_fn; /* the function being optimised is device code */
 extern int opt_fastmath; /* CUDA device code, nvcc's -use_fast_math: single precision flushes denormal numbers to zero
                             and divides and takes square roots approximately, as the GPU's quick instructions do */
 extern const char *opt_ptx_out; /* also write the module's text to this file */
+extern int opt_ptx_raw;          /* --cuda-ptx-raw: the module's text plain in the object, not packed (mcuda_pack.h) */
 void ptx_reset(void);
 int ptx_active(void);
 u32 ptx_module(Obj *o);

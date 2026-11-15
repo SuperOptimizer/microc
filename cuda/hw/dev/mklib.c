@@ -9,6 +9,7 @@
    A host object that the PTX names (a table) becomes a piece too, a .global with the object's bytes. Each
    piece lists the pieces it uses, so that the run time links only what a program calls. */
 #include <mcuda.h>
+#include <mcuda_pack.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,10 +118,15 @@ static const char *func_name(const char *p, size_t *len)
 
 static void take(struct __mcuda_module *m, int unit)
 {
-    const char *p = m->ptx, *e, *l, *q;
+    const char *p, *e, *l, *q;
     char buf[256];
     size_t n;
     int k = 0;
+    if (mcuda_ptx_plain(&m->ptx) || !m->ptx) {
+        fprintf(stderr, "mklib: %s: damaged packed PTX\n", m->name ? m->name : "?");
+        exit(1);
+    }
+    p = m->ptx;
     for (; *p; p = *e ? e + 1 : e) {
         e = strchr(p, '\n');
         if (!e)

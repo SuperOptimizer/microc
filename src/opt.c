@@ -804,6 +804,13 @@ static int cheap_block(u32 b)
                     return 0;
                 continue;
             }
+            if (op >= OP_SDIV && op <= OP_UREM && !opt_nodivcse) {
+                /* (an integer division does not trap on a GPU: done in vain it costs time only, about 4 instructions
+                   by a constant, a dozen by a value; gn_row's slab row behind its "if (!gp.ns)") */
+                if ((n += 4) > (u32)opt_ifc)
+                    return 0;
+                continue;
+            }
             if ((!is_pure(op) && (op != OP_SELECT || opt_noifcall)) || op == OP_FDIV || ++n > (u32)opt_ifc)
                 return 0;
             continue;

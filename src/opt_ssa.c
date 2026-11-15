@@ -844,7 +844,9 @@ static int select_loads(Func *f)
             for (k = 0; k < n; k++) {
                 Ins *o = &f->ins[ops[k]];
                 i64 off = (i64)(i32)o->b + (i64)d;
-                if ((sw[o->a] && !early) || off < 0 || (u64)off + size > f->slots[o->a].size)
+                /* (a choice made by a select is read where the load stood: the same bytes at the same moment,
+                   whatever is done with the locals elsewhere) */
+                if ((sw[o->a] && !early && f->ins[a].op != OP_SELECT) || off < 0 || (u64)off + size > f->slots[o->a].size)
                     ok = 0;
             }
             if (!ok)

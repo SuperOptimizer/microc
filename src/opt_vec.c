@@ -21,8 +21,8 @@ enum { K_NONE, K_IDX, K_ADDR, K_VEC, K_MASK, K_RED, K_SKIP, K_IVPHI, K_IVNEXT, K
 #define MAX_LINV 4
 #define MAX_RED 4
 #define MAX_IV 6
-#define MAX_BASES 8
-#define MAX_PAIRS 6
+#define MAX_BASES 12
+#define MAX_PAIRS 8
 #define MAX_SPLATS 8
 #define MAX_VECS 12 /* few enough that none is ever spilled */
 
@@ -547,12 +547,21 @@ static int try_loop(u32 l, u32 n0)
     /* sext (i + k) and sext (i - k) that only index: the addition is folded into where the array starts */
     for (v = f->blk[l].first; v; v = f->ins[v].next) {
         Ins *i = &f->ins[v], *a = &f->ins[i->a];
-        if (i->op == OP_SEXT32 && !INV(i->a) && kind[i->a] == K_IVNEXT && a->ty == IT_I32 && a->op == OP_ADD && a->a == iv_phi[iv_index(i->a)]) {
+        /* (zero-extended, i + k is that too when it cannot wrap: the counter runs from a constant that is not
+           negative to a constant bound, and bound + k is still a positive int) */
+        int zok = 0;
+        if (i->op == OP_ZEXT32 && !INV(i->a) && a->ty == IT_I32 && a->op == OP_ADD && f->ins[a->b].op == OP_CONST &&
+            f->ins[n].op == OP_CONST && (ci->op == OP_ULT || ci->op == OP_SLT) && f->ins[iv_init[c]].op == OP_CONST &&
+            iv_step[c] == 1) {
+            u64 kk = f->ins[a->b].a, bb = f->ins[n].a, i0 = f->ins[iv_init[c]].a;
+            zok = kk < 0x10000 && bb < 0x7fff0000 && i0 < 0x7fff0000 && !f->ins[a->b].b && !f->ins[n].b && !f->ins[iv_init[c]].b;
+        }
+        if ((i->op == OP_SEXT32 || zok) && !INV(i->a) && kind[i->a] == K_IVNEXT && a->ty == IT_I32 && a->op == OP_ADD && a->a == iv_phi[iv_index(i->a)]) {
             base[v] = a->a; /* a[i + 1] where i + 1 is the counter's next value */
             ioff[v] = a->b;
             continue;
         }
-        if (i->op != OP_SEXT32 || INV(i->a) || (a->op != OP_ADD && a->op != OP_SUB) || a->ty != IT_I32 || cnt[i->a] != 1)
+        if ((i->op != OP_SEXT32 && !zok) || INV(i->a) || (a->op != OP_ADD && a->op != OP_SUB) || a->ty != IT_I32 || cnt[i->a] != 1)
             continue;
         if (!INV(a->a) && kind[a->a] == K_IVPHI && INV(a->b) && f->ins[a->b].ty == IT_I32) {
             base[v] = a->a;
@@ -811,7 +820,7 @@ static int try_loop(u32 l, u32 n0)
         j += stored[k];
     if (!j && !nred)
         MISS("nothing is stored or summed");
-    if (nvec + nred * 5 > MAX_VECS)
+    if (opt_arch != ARCH_X64 && nvec + nred * 5 > MAX_VECS) /* (x86-64: counted below, by how many live at once) */
         MISS("too much going on for the vector registers");
     for (v = f->blk[l].first; v; v = f->ins[v].next)
         if ((kind[v] == K_VEC && !fits(f->ins[v].ty)) || (kind[v] == K_MASK && !fits(f->ins[f->ins[v].a].ty)))

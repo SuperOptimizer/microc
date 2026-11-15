@@ -302,7 +302,23 @@ static void addr_of(u32 v, Addr *a)
             x = i->b;
             y = i->a;
         }
-        a->base = reg_of(x);
+        if (fused[y] != FUSE_SKIP && fused[x] != FUSE_OFF && f->ins[x].op != OP_SLOT &&
+            (fused[y] == FUSE_OFF || f->ins[y].op == OP_SLOT)) {
+            x = i->b; /* the one with a constant part is the base */
+            y = i->a;
+        }
+        /* the base: a local, or a register, and constants added to it that are there for addresses only */
+        while (fused[x] == FUSE_OFF && const_of(f->ins[x].b, &c)) {
+            a->off += c;
+            x = f->ins[x].a;
+        }
+        if (f->ins[x].op == OP_SLOT) {
+            a->flags = XF_SLOT;
+            a->sym = f->ins[x].a;
+            a->off += (i32)f->ins[x].b;
+        } else {
+            a->base = reg_of(x);
+        }
         if (fused[y] == FUSE_SKIP) {
             u64 sh = 0;
             ir_is_const(f, f->ins[y].b, &sh);
@@ -1736,6 +1752,18 @@ static void estimate_freq(void)
     free(fr);
 }
 
+/* Of the folded sum v of a base and an index: the base, as addr_of takes it. */
+static u32 idx_base(u32 v)
+{
+    u32 x = f->ins[v].a, y = f->ins[v].b;
+    if (fused[x] == FUSE_SKIP)
+        return y;
+    if (fused[y] != FUSE_SKIP && f->ins[x].op != OP_SLOT && f->ins[x].op != OP_ADD &&
+        (f->ins[y].op == OP_ADD || f->ins[y].op == OP_SLOT))
+        return y;
+    return x;
+}
+
 /* Is v a shift that an address can have as the scale of its index? */
 static int is_scale(u32 v)
 {
@@ -1871,7 +1899,7 @@ static void prepare(void)
                         fused[i->a] = FUSE_OFF;
                     continue;
                 }
-                if (f->ins[a->a].op != OP_SLOT && f->ins[a->b].op != OP_SLOT && f->ins[a->a].op != OP_CONST) {
+                if (!(f->ins[a->a].op == OP_SLOT && f->ins[a->b].op == OP_SLOT) && f->ins[a->a].op != OP_CONST) {
                     /* base + index, the index optionally scaled */
                     u32 y = a->b;
                     fused[i->a] = FUSE_IDX;
@@ -1889,6 +1917,21 @@ static void prepare(void)
     for (v = 1; v < f->nins; v++) {
         if (cache_blk[v] && cache_blk[v] == uses[v])
             fused[v] = FUSE_SKIP;
+        cache_blk[v] = 0;
+    }
+    /* nor is "p + constant" that is nothing but the base of such addresses (and addresses itself): the
+       constant goes into each of them, and p is what the loop keeps in a register */
+    for (v = 1; v < f->nins; v++)
+        if (fused[v] == FUSE_IDX) {
+            u32 x = idx_base(v);
+            if (f->ins[x].op == OP_ADD && !fused[x])
+                cache_blk[x]++;
+        }
+    for (v = 1; v < f->nins; v++) {
+        i64 kc;
+        if (cache_blk[v] && f->ins[v].op == OP_ADD && !fused[v] && cache_blk[v] + cache_reg[v] == uses[v] &&
+            const_of(f->ins[v].b, &kc) && kc > -0x40000000L && kc < 0x40000000L && f->ins[f->ins[v].a].op != OP_CONST)
+            fused[v] = FUSE_OFF;
         cache_blk[v] = 0;
     }
     /* an and used once, to branch on whether it is zero, or by comparisons with zero that are
@@ -3922,6 +3965,8 @@ void x64_gen(Func *fn, Obj *o)
     f = fn;
     obj = o;
     fn_serial++;
+    if (getenv("MCC_DUMPIR") && strstr(intern_str(o->syms[fn->sym].name), getenv("MCC_DUMPIR")))
+        ir_dump(fn); /* (debugging: the IR a function is selected from; --ir shows it before the whole-unit passes) */
     sel_loc = opt_debug ? dwarf_get_func_loc(f->sym) : 0;
     prepare();
     select_all();

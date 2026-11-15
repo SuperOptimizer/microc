@@ -64,10 +64,14 @@ static u8 *fused; /* a product that became part of a fused operation: not comput
 static u32 *slotoff;
 static const char *fname;
 
+static u32 xseg; /* counts the labels written: a value worked out again since the last one need not be once more */
+
 static void P(const char *fmt, ...)
 {
     char tmp[2048];
     va_list ap;
+    if (strstr(fmt, ":\n"))
+        xseg++;
     va_start(ap, fmt);
     vsprintf(tmp, fmt, ap);
     va_end(ap);
@@ -285,18 +289,63 @@ static const char *addr_const(u32 v);
 static const char *param_const(u32 v);
 static int premat; /* a kernel's parameters are read where they are used (MCC_PREMAT), not held from the start */
 
+static u32 *xc_seg;         /* where (xseg) a value was last worked out again, */
+static char (*xc_name)[24]; /* and into which register */
+static u32 redir_v; /* the value that is being worked out again, into redir_name */
+static const char *redir_name;
+static void emit_ins(u32 v);
+
 static const char *reg(u32 v)
 {
     char *s;
     int c;
     v = RV(v);
+    if (v == redir_v && v)
+        return redir_name;
     if (remat && (PF->ins[v].op == OP_SLOT || PF->ins[v].op == OP_ADDR))
         return addr_const(v);
     if (remat && premat && PF->ins[v].op == OP_PARAM)
         return param_const(v);
-    if (remat && xrem && xrem[v]) {
-        const char *t = temp(cls_of(IT_I64)), *a = reg(PF->ins[v].a);
-        P("\tcvt.%s %s, %s;\n", PF->ins[v].op == OP_SEXT32 ? "s64.s32" : "u64.u32", t, a);
+    if (remat && xrem && xrem[v] && (xrem[v] != 3 || redir_v)) {
+        Ins *xi = &PF->ins[v];
+        const char *t = temp(cls_of(xi->ty)), *a = reg(xi->a);
+        int w = xi->ty == IT_I64 ? 64 : 32;
+        u64 c = 0;
+        if (xi->op == OP_SEXT32 || xi->op == OP_ZEXT32) {
+            P("\tcvt.%s %s, %s;\n", xi->op == OP_SEXT32 ? "s64.s32" : "u64.u32", t, a);
+            return t;
+        }
+        if (xrem[v] >= 2) { /* any instruction: written as it would be, into a register of its own */
+            u32 sv = redir_v;
+            const char *sn = redir_name;
+            char *r;
+            u8 was = xrem[v];
+            if (xc_seg[v] == xseg) {
+                r = obuf();
+                strcpy(r, xc_name[v]);
+                return r;
+            }
+            redir_v = v;
+            redir_name = t;
+            xrem[v] = 0;
+            emit_ins(v);
+            xrem[v] = was;
+            redir_v = sv;
+            redir_name = sn;
+            r = obuf();
+            strcpy(r, t);
+            xc_seg[v] = xseg;
+            strcpy(xc_name[v], r);
+            return r;
+        }
+        (void)ir_is_const(PF, RV(xi->b), &c);
+        if (xi->op == OP_ADD)
+            P("\tadd.s%d %s, %s, %ld;\n", w, t, a, w == 64 ? (long)(i64)c : (long)(i32)c);
+        else if (xi->op == OP_AND)
+            P("\tand.b%d %s, %s, %ld;\n", w, t, a, w == 64 ? (long)(i64)c : (long)(i32)c);
+        else
+            P("\t%s%d %s, %s, %u;\n", xi->op == OP_SHL ? "shl.b" : xi->op == OP_SAR ? "shr.s" : "shr.u", w, t, a,
+              (unsigned)(c & (u64)(w - 1)));
         return t;
     }
     s = obuf();
@@ -837,6 +886,32 @@ static int pred_bool(u32 v, int depth)
            pred_bool(i->b, depth - 1);
 }
 
+/* What the tree of truth values v compares is put in registers before any of its predicates is set: a value
+   that is worked out where it is read (xrem) may be a choice, which sets predicates of its own; done first,
+   it is found in its register when the comparison reads it. */
+static void pred_warm(u32 v, int root, int depth)
+{
+    Ins *i;
+    u32 k;
+    v = RV(v);
+    i = &PF->ins[v];
+    if (!xrem || depth > 16)
+        return;
+    if (is_compare(i->op) && i->blk) {
+        for (k = 0; k < 2; k++) {
+            u32 x = RV(k ? i->b : i->a);
+            int d;
+            for (d = 0; d < 8 && xrem[x] == 1; d++)
+                x = RV(PF->ins[x].a);
+            if (xrem[x] >= 2 && PF->ins[x].blk)
+                (void)reg(x);
+        }
+    } else if (ptree[v] == 2 || (root && ptree[v])) {
+        pred_warm(i->a, 0, depth + 1);
+        pred_warm(i->b, 0, depth + 1);
+    }
+}
+
 /* Sets %p0 to "v is not zero"; a comparison is done over again here, its operands being still at hand. */
 static void cond_pred(u32 v)
 {
@@ -844,7 +919,7 @@ static void cond_pred(u32 v)
     if (is_compare(PF->ins[v].op) && PF->ins[v].blk)
         set_pred(v);
     else if (ptree[v] == 2)
-        pred_into(v, 0, 0);
+        pred_warm(v, 0, 0), pred_into(v, 0, 0);
     else
         P("\tsetp.ne.%s %%p0, %s, 0;\n", ity(PF->ins[v].ty, 'b'), ropnd(v));
 }
@@ -1422,6 +1497,8 @@ static void emit_ins(u32 v)
 
     if (sh_s && ty == IT_I64 && sh_emit(v))
         return;
+    if (xrem && xrem[v] && xrem[v] != 3)
+        return; /* worked out where it is read */
     switch (i->op) {
     case OP_NOP: case OP_COPY: case OP_PARAM: case OP_ASMOUT:
         return;
@@ -1464,6 +1541,7 @@ static void emit_ins(u32 v)
         if (ptree[v] == 2)
             return;
         if (ptree[v]) {
+            pred_warm(v, 1, 0);
             pred_into(v, 0, 1);
             P("\tselp.b32 %s, 1, 0, %%p0;\n", reg(v));
             return;
@@ -2192,6 +2270,345 @@ static void proto(Buf *b, PSig *s, const char *name, int with_names)
 }
 
 /* Writes function f, a kernel (entry) or a device function. */
+/* Is x an address in shared memory, or part of one, that is kept as 32 bits? Those are written in their own way. */
+static int sh_any(u32 x)
+{
+    x = RV(x);
+    return sh_s && (sh_s[x] || sh_t32[x]);
+}
+
+/* Value x is read in block b: if it is cheap to work out again from a value and a constant, and was made in another
+   block, it is made again where it is read, and so holds no register in between (the value it is made from is then
+   read in b; so are the operands of a comparison, which is always done where its result is wanted). */
+static void xrem_mark(Func *f, u32 x, u32 b, int depth)
+{
+    Ins *xi;
+    x = RV(x);
+    xi = &f->ins[x];
+    if (!x || !xi->blk || depth > 8)
+        return;
+    if (is_compare(xi->op) || ptree[x]) { /* (a tree of truth values is worked out where a branch or a choice reads it) */
+        xrem_mark(f, xi->a, b, depth + 1);
+        xrem_mark(f, xi->b, b, depth + 1);
+        return;
+    }
+    if (xrem[x]) {
+        xrem_mark(f, xi->a, b, depth + 1);
+        return;
+    }
+    if (xi->blk == b || !used[x] || xlate[x] || f->ins[RV(xi->a)].op == OP_CONST)
+        return;
+    if (xi->op == OP_SEXT32 || xi->op == OP_ZEXT32 ||
+        (opt_noxrem != 2 && (xi->ty == IT_I32 || xi->ty == IT_I64) && f->ins[RV(xi->b)].op == OP_CONST && !fused[x] &&
+         !sh_any(x) && !sh_any(xi->a) &&
+         !ptree[x] && !(nuse[x] < 255 && nuse[x] == ause[x]) &&
+         (xi->op == OP_ADD || xi->op == OP_AND || xi->op == OP_SHR || xi->op == OP_SAR ||
+          (xi->op == OP_SHL && xi->ty == IT_I32)))) {
+        xrem[x] = 1;
+        xrem_mark(f, xi->a, b, depth + 1);
+    }
+}
+
+/* The leaves of value x for xrem_live: x itself, or what it is made from where it is itself worked out where read. */
+static u32 xrem_leaf(Func *f, u32 x)
+{
+    int d;
+    x = RV(x);
+    for (d = 0; d < 8 && x && xrem[x] == 1; d++)
+        x = RV(f->ins[x].a);
+    return x;
+}
+
+/* The second kind of value that is worked out where it is read: one instruction on two values (a sum, a product, ...),
+   made in one block and read in others, where at each of those both values are alive in any case. The register it held
+   between is then free at no cost but the instruction, done again. Which values are alive where is found for the
+   operands of such instructions only (sets of them per block, by the usual iteration). Where a value is read is where
+   its reader is written: for a comparison or a value of the first kind, where that in turn is read (xl_walk). */
+typedef struct XTree {
+    u32 leaf[4]; /* what the value is made from: values that are not themselves worked out again */
+    u32 in[16];  /* and by way of which instructions, read cnt times in the tree */
+    u8 cnt[16];
+    u8 nl, ni;
+} XTree;
+static u32 *xl_num, *xl_gen, *xl_in, xl_w, *xl_ci;
+static u8 *xl_bad;
+static XTree *xl_t;
+
+static int xl_alive(Func *f, u32 o, u32 b)
+{
+    if (f->ins[o].op == OP_PARAM)
+        return 1; /* (ptxas reads a parameter where it is wanted) */
+    return xl_num[o] && (xl_in[(size_t)b * xl_w + (xl_num[o] >> 5)] >> (xl_num[o] & 31) & 1);
+}
+
+/* Can instruction x be done again where its result is read? */
+static int xl_cheap(Func *f, u32 x)
+{
+    Ins *i = &f->ins[x];
+    if (!i->blk || !used[x] || xrem[x] || (i->ty != IT_I32 && i->ty != IT_I64) || fused[x] || ptree[x] || xlate[x] ||
+        sh_any(x) || sh_any(i->a) || sh_any(i->b) || (i->op == OP_SELECT && sh_any(i->c)) ||
+        (nuse[x] < 255 && nuse[x] == ause[x]))
+        return 0;
+    switch (i->op) {
+    case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR: case OP_SELECT:
+        return 1;
+    case OP_MUL:
+        return i->ty == IT_I32;
+    case OP_SHL:
+        return i->ty == IT_I32 && f->ins[RV(i->b)].op == OP_CONST;
+    case OP_SHR: case OP_SAR:
+        return f->ins[RV(i->b)].op == OP_CONST;
+    default:
+        return 0;
+    }
+}
+
+static int xl_expand(Func *f, XTree *t, u32 x, int depth);
+
+/* The leaves of what instruction x reads. A condition is worked out where it is wanted from what it compares. */
+static int xl_cond(Func *f, XTree *t, u32 c, int depth)
+{
+    Ins *ci;
+    c = RV(c);
+    ci = &f->ins[c];
+    if (depth < 12 && ci->blk && (is_compare(ci->op) || ptree[c]))
+        return (ptree[c] ? xl_cond(f, t, ci->a, depth + 1) && xl_cond(f, t, ci->b, depth + 1)
+                         : xl_expand(f, t, ci->a, depth + 1) && xl_expand(f, t, ci->b, depth + 1));
+    return xl_expand(f, t, c, depth);
+}
+
+static int xl_operands(Func *f, XTree *t, u32 x, int depth)
+{
+    Ins *i = &f->ins[x];
+    if (i->op == OP_SELECT)
+        return xl_cond(f, t, i->a, depth) && xl_expand(f, t, i->b, depth) && xl_expand(f, t, i->c, depth);
+    return xl_expand(f, t, i->a, depth) && xl_expand(f, t, i->b, depth);
+}
+
+/* The leaves of x, an operand (at some depth) of the tree t. */
+static int xl_expand(Func *f, XTree *t, u32 x, int depth)
+{
+    u32 k;
+    x = xrem_leaf(f, x);
+    if (!x || xrem[x])
+        return 0;
+    if (!f->ins[x].blk && f->ins[x].op != OP_PARAM)
+        return 1; /* a constant or an address: written where it is read */
+    for (k = 0; k < t->ni; k++)
+        if (t->in[k] == x) {
+            t->cnt[k]++;
+            return 1;
+        }
+    if (depth < 7 && nuse[x] <= 3 && t->ni < 16 && xl_cheap(f, x)) {
+        t->cnt[t->ni] = 1;
+        t->in[t->ni++] = x;
+        return xl_operands(f, t, x, depth + 1);
+    }
+    for (k = 0; k < t->nl; k++)
+        if (t->leaf[k] == x)
+            return 1;
+    if (t->nl == 4)
+        return 0;
+    t->leaf[t->nl++] = x;
+    return 1;
+}
+
+/* x is read in block b. mode 0: note a value read in its own block; 1: note what is read from another block;
+   2: note a value read where its operands are not both alive. */
+static void xl_walk(Func *f, u32 x, u32 b, int mode, int depth)
+{
+    Ins *xi;
+    x = RV(x);
+    xi = &f->ins[x];
+    if (!x || !xi->blk || depth > 8)
+        return;
+    if (is_compare(xi->op) || ptree[x]) {
+        xl_walk(f, xi->a, b, mode, depth + 1);
+        xl_walk(f, xi->b, b, mode, depth + 1);
+        return;
+    }
+    if (xrem[x] == 1 || (sh_s && sh_t32[x] && sh_ext(x) && !sh_g64[x])) { /* (the second: read by sums of 32 bits) */
+        xl_walk(f, xi->a, b, mode, depth + 1);
+        return;
+    }
+    if (mode == 0) {
+        if (xi->blk == b)
+            xl_bad[x] = 1;
+    } else if (mode == 1) {
+        if (xl_num[x] && xi->blk != b)
+            xl_gen[(size_t)b * xl_w + (xl_num[x] >> 5)] |= (u32)1 << (xl_num[x] & 31);
+    } else if (xi->blk != b && xl_ci[x]) {
+        XTree *t = &xl_t[xl_ci[x] - 1];
+        u32 k;
+        for (k = 0; k < t->nl; k++)
+            if (!xl_alive(f, t->leaf[k], b))
+                xl_bad[x] = 1;
+    }
+}
+
+/* Every read of a value by the body of block b (not by phis), given to xl_walk. */
+static void xl_block(Func *f, u32 b, int mode)
+{
+    Block *bb = &f->blk[b];
+    u32 v, k, n, *p;
+    for (v = bb->first; v; v = f->ins[v].next) {
+        Ins *i = &f->ins[v];
+        if (is_compare(i->op) || ptree[v] == 2 || xrem[v] == 1 || (sh_s && sh_t32[v] && sh_ext(v) && !sh_g64[v]))
+            continue; /* read where v is read */
+        IR_OPS(f, i, p, n);
+        for (k = 0; k < n; k++)
+            xl_walk(f, p[k], b, mode, 0);
+    }
+    if (bb->arg)
+        xl_walk(f, bb->arg, b, mode, 0);
+}
+
+static void xrem_live(Func *f, const u8 *live)
+{
+    u32 nb = f->nblk, b, v, k, n, *p, ns = 0, w, *num, *in, *out, *gen, *def, *cand, nc = 0, c, ct = 0, *ci;
+    u8 *bad;
+    int ch;
+    xl_t = 0;
+    ci = (u32 *)xmalloc((size_t)(f->nins + 1) * sizeof(u32));
+    memset(ci, 0, (size_t)(f->nins + 1) * sizeof(u32));
+    xl_ci = ci;
+    num = (u32 *)xmalloc((size_t)(f->nins + 1) * sizeof(u32));
+    cand = (u32 *)xmalloc((size_t)(f->nins + 1) * sizeof(u32));
+    bad = (u8 *)xmalloc((size_t)f->nins + 1);
+    memset(num, 0, (size_t)(f->nins + 1) * sizeof(u32));
+    memset(bad, 0, (size_t)f->nins + 1);
+    /* a value read in its own block, by a phi, or by an instruction that is written who knows where stays as it is */
+    xl_bad = bad;
+    xl_num = num;
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                bad[RV(f->xargs[f->ins[v].a + k])] = 2;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            int far = ptree[v] == 1 || fused[v] || xlate[v] || (sh_s && sh_t32[v] && sh_ext(v) && sh_g64[v]) || special_load(v);
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                if (far)
+                    bad[RV(p[k])] = 3;
+            if (i->op == OP_CALL)
+                bad[RV(i->c)] = 4;
+        }
+        xl_block(f, b, 0);
+    }
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            XTree *t;
+            if (bad[v] || nuse[v] > 8 || !xl_cheap(f, v))
+                continue;
+            if (nc == ct) {
+                XTree *nt = (XTree *)xmalloc((size_t)(ct ? 2 * ct : 64) * sizeof(XTree));
+                if (ct)
+                    memcpy(nt, xl_t, (size_t)ct * sizeof(XTree));
+                free(xl_t);
+                xl_t = nt;
+                ct = ct ? 2 * ct : 64;
+            }
+            t = &xl_t[nc];
+            t->nl = t->ni = 0;
+            if (!xl_operands(f, t, v, 1) || !t->nl)
+                continue;
+            for (k = 0; k < t->nl; k++)
+                if (!num[t->leaf[k]])
+                    num[t->leaf[k]] = ++ns;
+            cand[nc++] = v;
+            ci[v] = nc;
+        }
+    }
+    if (!nc) {
+        free(num);
+        free(cand);
+        free(bad);
+        free(ci);
+        free(xl_t);
+        return;
+    }
+    w = (ns + 32) / 32;
+    in = (u32 *)xmalloc(4 * (size_t)nb * w * sizeof(u32));
+    out = in + (size_t)nb * w;
+    gen = out + (size_t)nb * w;
+    def = gen + (size_t)nb * w;
+    memset(in, 0, 4 * (size_t)nb * w * sizeof(u32));
+    xl_gen = gen;
+    xl_in = in;
+    xl_w = w;
+#define XBIT(set, blk, x) ((set)[(size_t)(blk) * w + (num[x] >> 5)] |= (u32)1 << (num[x] & 31))
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++) {
+                u32 x = xrem_leaf(f, f->xargs[f->ins[v].a + k]);
+                if (num[x] && live[bb->preds[k]])
+                    XBIT(out, bb->preds[k], x);
+            }
+        xl_block(f, b, 1);
+    }
+    for (v = 1; v < f->nins; v++)
+        if (num[v])
+            XBIT(def, f->ins[v].blk, v); /* a value is not alive on the way into the block that makes it */
+    /* (out[b] also holds what the phis of its successors read) */
+    do {
+        ch = 0;
+        for (b = nb - 1; b >= 1; b--) {
+            Block *bb = &f->blk[b];
+            int ns2 = bb->term == TERM_BR ? 2 : bb->term == TERM_JMP ? 1 : 0, j;
+            if (!live[b])
+                continue;
+            for (j = 0; j < ns2; j++) {
+                u32 t = bb->succ[j];
+                for (k = 0; k < w; k++) {
+                    u32 o = out[(size_t)b * w + k] | in[(size_t)t * w + k];
+                    if (o != out[(size_t)b * w + k]) {
+                        out[(size_t)b * w + k] = o;
+                        ch = 1;
+                    }
+                }
+            }
+            for (k = 0; k < w; k++) {
+                u32 o = in[(size_t)b * w + k] | ((gen[(size_t)b * w + k] | out[(size_t)b * w + k]) & ~def[(size_t)b * w + k]);
+                if (o != in[(size_t)b * w + k]) {
+                    in[(size_t)b * w + k] = o;
+                    ch = 1;
+                }
+            }
+        }
+    } while (ch);
+#undef XBIT
+    /* the candidates whose every reader stands where both operands are alive */
+    memset(bad, 0, (size_t)f->nins + 1);
+    for (b = 1; b < nb; b++)
+        if (live[b])
+            xl_block(f, b, 2);
+    for (c = 0; c < nc; c++)
+        if (!bad[cand[c]]) {
+            xrem[cand[c]] = 2;
+            for (k = 0; k < xl_t[c].ni; k++) {
+                u32 x = xl_t[c].in[k]; /* read from outside the tree too: kept as well (3) */
+                if (xrem[x] != 2)
+                    xrem[x] = xl_t[c].cnt[k] == nuse[x] && !xrem[x] ? 2 : 3;
+            }
+        }
+    free(in);
+    free(num);
+    free(cand);
+    free(bad);
+    free(ci);
+    free(xl_t);
+}
+
 /* The thread's and the block's numbers (threadIdx.x and the like) are read once, in the first block: reading
    one is a slow instruction, a register holds it for nothing, and a load where the source reads it is done
    again after every store and in every trip around a loop. Only with MCC_SPECIAL1: it measured the same. */
@@ -2343,33 +2760,6 @@ void ptx_gen(Func *f, Obj *o, int entry)
         if (bb->term == TERM_BR)
             mark_cond(bb->arg);
     }
-    xrem = 0;
-    if (!opt_noxrem) {
-        xrem = (u8 *)xmalloc((size_t)f->nins + 1);
-        memset(xrem, 0, (size_t)f->nins + 1);
-        for (b = 1; b < nb; b++) {
-            Block *bb = &f->blk[b];
-            if (!live[b])
-                continue;
-#define XREM(x) \
-    do { \
-        u32 x_ = RV(x); \
-        Ins *xi_ = &f->ins[x_]; \
-        if (x_ && (xi_->op == OP_SEXT32 || xi_->op == OP_ZEXT32) && xi_->blk && xi_->blk != b && used[x_] && !xlate[x_] && \
-            !(sh_s && sh_t32[x_]) && f->ins[RV(xi_->a)].op != OP_CONST) \
-            xrem[x_] = 1; \
-    } while (0)
-            for (v = bb->first; v; v = f->ins[v].next) {
-                Ins *i = &f->ins[v];
-                IR_OPS(f, i, p, n);
-                for (k = 0; k < n; k++)
-                    XREM(p[k]);
-            }
-            if (bb->arg)
-                XREM(bb->arg);
-#undef XREM
-        }
-    }
     /* the trees of truth values; a tree that is only read as a condition, in one or two places, is done
        over again there and has no register (pass one: readers before what they read) */
     for (v = f->nins - 1; v >= 1 && !opt_nopred; v--) {
@@ -2400,7 +2790,6 @@ void ptx_gen(Func *f, Obj *o, int entry)
     for (v = 1; v < f->nins; v++)
         if (f->ins[v].op == OP_PHI && f->ins[v].blk && live[f->ins[v].blk])
             used[v] = 1; /* kept simple: every phi of a live block is given its moves */
-
     if (opt_fmad) {
         frank = (u32 *)xmalloc((f->nins + 1) * sizeof(u32));
         memset(frank, 0, (f->nins + 1) * sizeof(u32));
@@ -2414,6 +2803,33 @@ void ptx_gen(Func *f, Obj *o, int entry)
     }
     if (sh_s)
         sh_find(live);
+    /* (after the trees: what a tree reads is read where the tree is worked out; and after the addresses in shared
+       memory, which are written in their own way and left alone) */
+    xrem = 0;
+    if (opt_noxrem != 1) {
+        xrem = (u8 *)xmalloc((size_t)f->nins + 1);
+        memset(xrem, 0, (size_t)f->nins + 1);
+        xc_seg = (u32 *)xmalloc((size_t)(f->nins + 1) * sizeof(u32));
+        memset(xc_seg, 0, (size_t)(f->nins + 1) * sizeof(u32));
+        xc_name = (char (*)[24])xmalloc((size_t)(f->nins + 1) * 24);
+        xseg = 1;
+        for (b = 1; b < nb; b++) {
+            Block *bb = &f->blk[b];
+            if (!live[b])
+                continue;
+            for (v = bb->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                IR_OPS(f, i, p, n);
+                for (k = 0; k < n; k++)
+                    xrem_mark(f, p[k], b, 0);
+            }
+            if (bb->arg)
+                xrem_mark(f, bb->arg, b, 0);
+        }
+        if (opt_noxrem < 2)
+            xrem_live(f, live);
+    }
+
     lc_s = 0;
     if (!opt_nolocal) {
         lc_s = (u8 *)xmalloc((size_t)f->nins + 1);
@@ -2592,6 +3008,10 @@ void ptx_gen(Func *f, Obj *o, int entry)
     free(gl_s);
     free(xrem);
     xrem = 0;
+    free(xc_seg);
+    free(xc_name);
+    xc_seg = 0;
+    xc_name = 0;
     free(lc_s);
     lc_s = 0;
     gl_s = 0;

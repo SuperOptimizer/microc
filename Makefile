@@ -91,6 +91,10 @@ test-cuda: cuda
 test-lto: $(MCC) $(LIBC)
 	@sh tests/ltoglibc.sh build/stage$(STAGE)
 
+# CUDA / C++ diagnostics and C++17 inline variables (tests/cuerr.sh)
+test-cuerr: $(MCC) $(LIBC)
+	@sh tests/cuerr.sh build/stage$(STAGE)
+
 # kernel names (tests/mangle.sh): the Itanium C++ ABI's, as nvcc writes them, so profiles of mcc and nvcc builds match
 test-mangle: cuda
 	@sh tests/mangle.sh build/stage$(STAGE)
@@ -110,4 +114,4 @@ STAGE = 0
 clean:
 	rm -rf build
 
-.PHONY: all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto bootstrap clean
+.PHONY: all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean

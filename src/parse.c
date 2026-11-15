@@ -6106,8 +6106,9 @@ static void primary(Expr *e)
         }
     }
     if (!s) {
-        /* C89: a call to an undeclared function declares it as int f() */
-        if (peek()->kind != T_LPAREN)
+        /* C89: a call to an undeclared function declares it as int f(); C++ / CUDA have no implicit declarations (nvcc and
+           clang stop here: a missing header showed up only at the link, as an undefined int-returning function) */
+        if (peek()->kind != T_LPAREN || (opt_cxx && !getenv("MCC_IMPLICIT_CXX")))
             error_at(loc, "'%s' undeclared", intern_str(tok.v));
         names_reserve(tok.v);
         s = gsyms[tok.v];
@@ -9245,6 +9246,10 @@ static void sym_attrs(Sym *s, const Attr *a, int is_inline, int storage)
     }
     if (is_inline)
         s->is_inline = 1;
+    /* C++17 inline variable: one object for the program though every unit that includes it defines it (ufsm_dev.cuh's map):
+       a weak definition, where a strong one in each object was a duplicate symbol at the link */
+    if (is_inline && opt_cxx && s->kind == SK_VAR && s->ty && s->ty->kind != TY_FUNC && storage != KW(KW_STATIC))
+        s->aflags |= AT_WEAK;
     if (storage == KW(KW_EXTERN))
         s->is_extern = 1;
     if (storage == KW(KW_REGISTER))

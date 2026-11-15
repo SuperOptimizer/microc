@@ -67,7 +67,14 @@ __device__ static __forceinline__ unsigned __byte_perm(unsigned x, unsigned y, u
 __device__ static __forceinline__ float __fmul_rn(float a, float b) { float r; asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ static __forceinline__ float __fadd_rn(float a, float b) { float r; asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ static __forceinline__ float __fsub_rn(float a, float b) { float r; asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+/* the fast division (nvcc: div.approx, ~2 ulp; 0 for |b| in (2^126, 2^128)) and the memory fences. Without them a call compiled as
+   an implicit extern (int __fdividef() with double arguments) that no module defines: ufsm's tanh_silu, kc16_k */
+__device__ static __forceinline__ float __fdividef(float a, float b) { float r; asm("div.approx.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ static __forceinline__ void __threadfence_block(void) { asm volatile("membar.cta;" ::: "memory"); }
+__device__ static __forceinline__ void __threadfence(void) { asm volatile("membar.gl;" ::: "memory"); }
+__device__ static __forceinline__ void __threadfence_system(void) { asm volatile("membar.sys;" ::: "memory"); }
 __device__ static __forceinline__ float __fdiv_rn(float a, float b) { float r; asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ static __forceinline__ float __frcp_rn(float a) { float r; asm("rcp.rn.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
 __device__ static __forceinline__ float __fsqrt_rn(float a) { float r; asm("sqrt.rn.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
 __device__ static __forceinline__ float __fmaf_rn(float a, float b, float c) { float r; asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); return r; }
 __device__ static __forceinline__ double __dmul_rn(double a, double b) { double r; asm("mul.rn.f64 %0, %1, %2;" : "=d"(r) : "d"(a), "d"(b)); return r; }

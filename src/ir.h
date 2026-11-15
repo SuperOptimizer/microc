@@ -194,6 +194,7 @@ u32 ir_new_slot(Func *f, u64 size, u32 align);
 u32 ir_add_param(Func *f, int ty); /* returns the OP_PARAM value */
 
 int ir_is_const(Func *f, u32 v, u64 *val); /* integer constant */
+u64 ir_umax32(Func *f, u32 v);             /* a bound of the 32-bit v read as unsigned (0xffffffff: none known) */
 int ir_is_fconst(Func *f, u32 v, double *val);
 
 extern u32 ir_loc; /* the source location new instructions are given: the parser's token; 0 while optimising */

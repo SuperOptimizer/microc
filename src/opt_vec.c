@@ -1594,6 +1594,7 @@ static u32 sh_, sb_, sp_, snx_, svp_, sblk_; /* the loop's blocks, its counter a
 static u32 slanesz, snl;
 static u32 sl_base[8], sl_c[8], sl_k[8], snld; /* the reads: where the array starts, the constant added to the counter, log2 size */
 static u32 sv_of[64], sv_val[64], snv;
+static int sdry; /* s_vec only checks: nothing is built, a value it takes is 1 */
 #define SIN(x) (f->ins[x].blk == sh_ || f->ins[x].blk == sb_)
 
 /* x is the counter plus a constant: *c */
@@ -1673,14 +1674,20 @@ static u32 s_vec(u32 x, u32 civ)
         int ty = i->ty;
         if (ty != IT_I32 && ty != IT_I64 && ty != IT_F32 && ty != IT_F64)
             return 0;
-        if (slanesz < 4 && !(ir_is_const(f, x, &c) && c < 256)) /* (bytes: only constants that a byte can be) */
-            return 0;
-        v = mk(svp_, OP_VSPLAT, IT_V128, x, 0);
-        f->ins[v].mem = (u8)s_lk(ty);
+        if (slanesz < 4 && !(ir_is_const(f, x, &c) ? c < 256 : slanesz == 1 && ty == IT_I32 && ir_umax32(f, x) < 256))
+            return 0; /* (bytes: only values a byte can be, e.g. b[0] read before the loop) */
+        if (sdry)
+            v = 1;
+        else {
+            v = mk(svp_, OP_VSPLAT, IT_V128, x, 0);
+            f->ins[v].mem = (u8)s_lk(ty);
+        }
     } else if (i->op == OP_LOAD) {
         u32 sz = (u32)mem_size(i->mem), n1 = snld, ea;
         if (i->flags || sz != slanesz || (sz < 4 && i->mem != M_8U && i->mem != M_16U) || !s_addr(i->a, sz))
             return 0;
+        if (sdry)
+            goto done;
         /* base + ((i + c) << k), i the chunk's first counter */
         ea = f->ins[sp_].ty == IT_I32 ? mk(sblk_, OP_SEXT32, IT_I64, civ, 0) : civ;
         if (sl_c[n1])
@@ -1718,9 +1725,14 @@ static u32 s_vec(u32 x, u32 civ)
         b = a ? s_vec(i->b, civ) : 0;
         if (!b)
             return 0;
+        if (sdry)
+            goto done;
         v = mk(sblk_, op, IT_V128, a, b);
         f->ins[v].mem = (u8)s_lk(ty);
     }
+done:
+    if (sdry)
+        v = 1;
     sv_of[snv] = x;
     sv_val[snv++] = v;
     return v;
@@ -1826,6 +1838,16 @@ static int try_search(u32 h, u32 n0)
     slanesz = 0;
     snld = 0;
     if (!SIN(dc) || !s_ok(dc, 0) || !slanesz || slanesz == 2)
+        return 0;
+    /* s_ok only finds the lane size: s_vec, dry, must take the whole test before anything is built (it refuses what
+       s_ok lets through, e.g. a byte compared with a value fixed for the loop but not a constant; volcomp's
+       b[i] != b[0] then summed a register nothing set: z3w.c, test_fiberraster 2026-11-15) */
+    sdry = 1;
+    snv = 0;
+    snld = 0;
+    k = s_vec(dc, sp_);
+    sdry = 0;
+    if (!k)
         return 0;
 
     /* the loop's values are used after it only by the phis of the blocks it leaves to (the copy would not dominate

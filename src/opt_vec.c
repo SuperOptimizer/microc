@@ -1572,6 +1572,420 @@ static int try_loop(u32 l, u32 n0)
     return 1;
 }
 
+/* ---- search loops: while (i < n && a[i] != x) i++, for (...) if (a[i] > t) break ----
+   A loop of two blocks, each ending in a branch out of it: one tests the counter against a bound fixed for the loop,
+   the other tests elements read at the counter (plus a constant); nothing is stored, nothing called, and the counter
+   is the only value carried round. In front of it goes a loop that tests 16 bytes of elements at a time and moves
+   the counter on while every element of the chunk would carry on; at the first chunk where one would leave (or
+   when too few are left) the original loop takes over from the chunk's start and finds the exact element. Reading
+   ahead of the scalar loop must not fault where it would not: every read starts 16-byte aligned (checked once,
+   before the loop: the chunks keep it), so a chunk never crosses into another page, and its first element is one
+   the scalar loop reads. */
+static u32 sh_, sb_, sp_, snx_, svp_, sblk_; /* the loop's blocks, its counter and next counter, the vector preheader, the block built in */
+static u32 slanesz, snl;
+static u32 sl_base[8], sl_c[8], sl_k[8], snld; /* the reads: where the array starts, the constant added to the counter, log2 size */
+static u32 sv_of[64], sv_val[64], snv;
+#define SIN(x) (f->ins[x].blk == sh_ || f->ins[x].blk == sb_)
+
+/* x is the counter plus a constant: *c */
+static int s_ctr(u32 x, i64 *c)
+{
+    Ins *i = &f->ins[x];
+    u64 k;
+    if (x == sp_) {
+        *c = 0;
+        return 1;
+    }
+    if (i->op == OP_ADD && i->a == sp_ && ir_is_const(f, i->b, &k)) {
+        *c = i->ty == IT_I32 ? (i64)(i32)(u32)k : (i64)k;
+        return *c >= -64 && *c <= 64;
+    }
+    return 0;
+}
+
+/* the read at address a: base + ((counter + c) << k), widened if the counter is 32 bits */
+static int s_addr(u32 a, u32 sz)
+{
+    Ins *i = &f->ins[a], *o;
+    u32 base, off, k = 0, q;
+    i64 c;
+    if (i->op != OP_ADD || i->ty != IT_I64)
+        return 0;
+    base = SIN(i->a) ? i->b : i->a;
+    off = base == i->a ? i->b : i->a;
+    if (SIN(base) || !SIN(off))
+        return 0;
+    o = &f->ins[off];
+    if (o->op == OP_SHL) {
+        u64 kk;
+        if (!ir_is_const(f, o->b, &kk) || kk > 3)
+            return 0;
+        k = (u32)kk;
+        off = o->a;
+        o = &f->ins[off];
+    }
+    if ((u32)1 << k != sz)
+        return 0;
+    q = off;
+    if (o->op == OP_SEXT32 || o->op == OP_ZEXT32) {
+        if (f->ins[sp_].ty != IT_I32)
+            return 0;
+        q = o->a;
+    } else if (f->ins[sp_].ty != IT_I64) {
+        return 0;
+    }
+    if (!s_ctr(q, &c) || snld == 8)
+        return 0;
+    sl_base[snld] = base;
+    sl_c[snld] = (u32)(i32)c;
+    sl_k[snld] = k;
+    snld++;
+    return 1;
+}
+
+static int s_lk(int ty)
+{
+    return ty == IT_F32 ? M_F32 : ty == IT_F64 ? M_F64 : slanesz == 1 ? M_8U : slanesz == 2 ? M_16U : slanesz == 4 ? M_32 : M_64;
+}
+
+/* The vector of x's values for the chunk's lanes (built in sblk_; spread values in svp_), 0 if it has none. */
+static u32 s_vec(u32 x, u32 civ)
+{
+    Ins *i = &f->ins[x];
+    u32 k, a, b, v = 0;
+    for (k = 0; k < snv; k++)
+        if (sv_of[k] == x)
+            return sv_val[k];
+    if (snv == 64)
+        return 0;
+    if (!SIN(x)) {
+        /* fixed for the loop: in every lane */
+        u64 c;
+        int ty = i->ty;
+        if (ty != IT_I32 && ty != IT_I64 && ty != IT_F32 && ty != IT_F64)
+            return 0;
+        if (slanesz < 4 && !(ir_is_const(f, x, &c) && c < 256)) /* (bytes: only constants that a byte can be) */
+            return 0;
+        v = mk(svp_, OP_VSPLAT, IT_V128, x, 0);
+        f->ins[v].mem = (u8)s_lk(ty);
+    } else if (i->op == OP_LOAD) {
+        u32 sz = (u32)mem_size(i->mem), n1 = snld, ea;
+        if (i->flags || sz != slanesz || (sz < 4 && i->mem != M_8U && i->mem != M_16U) || !s_addr(i->a, sz))
+            return 0;
+        /* base + ((i + c) << k), i the chunk's first counter */
+        ea = f->ins[sp_].ty == IT_I32 ? mk(sblk_, OP_SEXT32, IT_I64, civ, 0) : civ;
+        if (sl_c[n1])
+            ea = mk(sblk_, OP_ADD, IT_I64, ea, ir_const(f, IT_I64, (u64)(i64)(i32)sl_c[n1]));
+        if (sl_k[n1])
+            ea = mk(sblk_, OP_SHL, IT_I64, ea, ir_const(f, IT_I64, sl_k[n1]));
+        v = mk(sblk_, OP_VLOAD, IT_V128, sl_base[n1], ea);
+        f->ins[v].mem = (u8)s_lk(i->ty);
+    } else {
+        int op = i->op, ty;
+        switch (op) {
+        case OP_ADD: case OP_SUB: case OP_AND: case OP_OR: case OP_XOR:
+        case OP_FADD: case OP_FSUB: case OP_FMUL:
+            if (slanesz < 4 && op != OP_AND && op != OP_OR)
+                return 0; /* (byte lanes: only the masks' and / or) */
+            ty = i->ty;
+            break;
+        case OP_EQ: case OP_NE:
+        case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE:
+            ty = f->ins[i->a].ty;
+            break;
+        case OP_SLT: case OP_SLE: case OP_SGT: case OP_SGE:
+            if (slanesz < 4)
+                return 0;
+            ty = f->ins[i->a].ty;
+            break;
+        default:
+            return 0;
+        }
+        if ((ty == IT_I32 || ty == IT_F32) ? slanesz > 4 : (ty == IT_I64 || ty == IT_F64) ? slanesz != 8 : 1)
+            return 0;
+        if (op >= OP_EQ && op <= OP_SGE && slanesz == 8 && ty == IT_I64 && op != OP_EQ && op != OP_NE)
+            return 0;
+        a = s_vec(i->a, civ);
+        b = a ? s_vec(i->b, civ) : 0;
+        if (!b)
+            return 0;
+        v = mk(sblk_, op, IT_V128, a, b);
+        f->ins[v].mem = (u8)s_lk(ty);
+    }
+    sv_of[snv] = x;
+    sv_val[snv++] = v;
+    return v;
+}
+
+/* Does the tree of d (in the loop) read and compute only what s_vec takes? A dry run: nothing is built. */
+static int s_ok(u32 x, int depth)
+{
+    Ins *i = &f->ins[x];
+    if (!SIN(x))
+        return 1;
+    if (depth > 24 || x == sp_ || x == snx_)
+        return 0;
+    if (i->op == OP_LOAD) {
+        u32 sz = (u32)mem_size(i->mem), n1 = snld;
+        if (!slanesz)
+            slanesz = sz;
+        if (sz != slanesz || !s_addr(i->a, sz))
+            return 0;
+        snld = n1; /* (counted again when built) */
+        return 1;
+    }
+    if (ir_opcount_tab[i->op] != 2)
+        return 0;
+    return s_ok(i->a, depth + 1) && s_ok(i->b, depth + 1);
+}
+
+static int try_search(u32 h, u32 n0)
+{
+    Block *hb = &f->blk[h];
+    u32 b, P, k, v, init, cc, dc, n, ph, VP, Vh, Vb, Hin, civ, nxt, ok, al, m, sum, lanes32, h2, b2, A2;
+    int hk, bk, cont_c, cont_d, uns, ty;
+    i64 coff;
+    if (opt_arch != ARCH_X64 || hb->term != TERM_BR || hb->npreds != 2 || !hb->phis || f->ins[hb->phis].next)
+        return 0;
+    for (hk = 0; hk < 2; hk++) {
+        b = hb->succ[hk];
+        if (b != h && f->blk[b].term == TERM_BR && f->blk[b].npreds == 1 && (f->blk[b].succ[0] == h) != (f->blk[b].succ[1] == h) &&
+            !f->blk[b].phis)
+            break;
+    }
+    if (hk == 2)
+        return 0;
+    bk = f->blk[b].succ[0] == h ? 0 : 1;
+    if (hb->succ[1 - hk] == h || hb->succ[1 - hk] == b || f->blk[b].succ[1 - bk] == b)
+        return 0;
+    k = hb->preds[0] == b ? 1 : 0;
+    if (hb->preds[1 - k] != b)
+        return 0;
+    P = hb->preds[k];
+    if (P == h || P == b || f->blk[P].term != TERM_JMP)
+        return 0;
+    sh_ = h;
+    sb_ = b;
+    ph = sp_ = hb->phis;
+    ty = f->ins[ph].ty;
+    init = f->xargs[f->ins[ph].a + k];
+    snx_ = f->xargs[f->ins[ph].a + (1 - k)];
+    {
+        i64 one;
+        if ((ty != IT_I32 && ty != IT_I64) || !SIN(snx_) || !s_ctr(snx_, &one) || one != 1 || ph >= n0)
+            return 0;
+    }
+    /* nothing stored, called, or made in another way than s_vec takes; every instruction older than this pass */
+    for (v = hb->first; v; v = f->ins[v].next)
+        if (v >= n0 || f->ins[v].op == OP_STORE || f->ins[v].op == OP_CALL || f->ins[v].op == OP_XI || f->ins[v].op >= OP_VLOAD)
+            return 0;
+    for (v = f->blk[b].first; v; v = f->ins[v].next)
+        if (v >= n0 || f->ins[v].op == OP_STORE || f->ins[v].op == OP_CALL || f->ins[v].op == OP_XI || f->ins[v].op >= OP_VLOAD)
+            return 0;
+    /* which test is on the counter: q < n (or n > q), carrying on when it holds; the other tests the elements */
+    for (k = 0; k < 2; k++) {
+        u32 c = k ? f->blk[b].arg : hb->arg, q, bnd;
+        Ins *ci = &f->ins[c];
+        int op = ci->op, cont = k ? bk == 0 : hk == 0;
+        if (!SIN(c) || ir_opcount_tab[op] != 2)
+            continue;
+        q = ci->a;
+        bnd = ci->b;
+        if (SIN(bnd) && !SIN(q)) {
+            u32 t = q;
+            q = bnd;
+            bnd = t;
+            op = op == OP_SGT ? OP_SLT : op == OP_UGT ? OP_ULT : op == OP_SLT ? OP_SGT : op == OP_ULT ? OP_UGT : op == OP_SGE ? OP_SLE :
+                 op == OP_UGE ? OP_ULE : op == OP_SLE ? OP_SGE : op == OP_ULE ? OP_UGE : op;
+        }
+        if (!cont) /* leaving when q >= n is carrying on while q < n */
+            op = op == OP_SGE ? OP_SLT : op == OP_UGE ? OP_ULT : 0;
+        if ((op != OP_SLT && op != OP_ULT) || SIN(bnd) || f->ins[bnd].ty != ty || !s_ctr(q, &coff))
+            continue;
+        cc = c;
+        n = bnd;
+        uns = op == OP_ULT;
+        break;
+    }
+    if (k == 2)
+        return 0;
+    dc = k ? hb->arg : f->blk[b].arg;
+    cont_d = k ? hk == 0 : bk == 0;
+    cont_c = 1;
+    (void)cont_c;
+    (void)cc;
+    slanesz = 0;
+    snld = 0;
+    if (!SIN(dc) || !s_ok(dc, 0) || !slanesz || slanesz == 2)
+        return 0;
+
+    /* the loop's values are used after it only by the phis of the blocks it leaves to (the copy would not dominate
+       another use) */
+    {
+        u32 xh = hb->succ[1 - hk], xb = f->blk[b].succ[1 - bk], q, no, bb;
+        for (bb = 1; bb < f->nblk; bb++) {
+            Block *bl = &f->blk[bb];
+            if (bb == h || bb == b)
+                continue;
+            if ((bl->term == TERM_BR || bl->term == TERM_RET) && bl->arg && SIN(bl->arg))
+                return 0;
+            for (v = bl->first; v; v = f->ins[v].next) {
+                no = ir_opcount(f, v);
+                for (q = 0; q < no; q++)
+                    if (SIN(*ir_opref(f, v, q)))
+                        return 0;
+            }
+            for (v = bl->phis; v; v = f->ins[v].next) {
+                for (q = 0; q < bl->npreds; q++)
+                    if (SIN(f->xargs[f->ins[v].a + q]) && !((bb == xh && bl->preds[q] == h) || (bb == xb && bl->preds[q] == b)))
+                        return 0;
+            }
+        }
+    }
+
+    /* ---- build: P -> h2 / b2 (a copy of the loop, until the reads are 16-byte aligned) -> A2 -> VP -> (Vh <-> Vb)
+       -> Hin -> h (the loop, which finishes) ---- */
+    {
+        u32 blk2[2], src[2], bb, x, nv;
+        h2 = ir_new_block(f);
+        b2 = ir_new_block(f);
+        A2 = ir_new_block(f);
+        VP = ir_new_block(f);
+        Vh = ir_new_block(f);
+        Vb = ir_new_block(f);
+        Hin = ir_new_block(f);
+        hb = &f->blk[h];
+        f->blk[h2].freq = f->blk[b2].freq = f->blk[A2].freq = f->blk[VP].freq = f->blk[Hin].freq = f->blk[P].freq;
+        f->blk[Vh].freq = f->blk[Vb].freq = hb->freq;
+        /* the copy: every instruction of h and b, operands from the loop mapped to their copies */
+        src[0] = h;
+        src[1] = b;
+        blk2[0] = h2;
+        blk2[1] = b2;
+        ir_add_pred(f, h2, P);
+        ir_add_pred(f, h2, A2);
+        map[ph] = ir_phi(f, h2, ty);
+        for (bb = 0; bb < 2; bb++)
+            for (v = f->blk[src[bb]].first; v; v = f->ins[v].next) {
+                Ins in = f->ins[v];
+                x = ir_raw(f, in.op, in.ty, in.a, in.b);
+                f->ins[x].c = in.c;
+                f->ins[x].mem = in.mem;
+                f->ins[x].flags = in.flags;
+                f->ins[x].loc = in.loc;
+                ir_append(f, blk2[bb], x);
+                map[v] = x;
+            }
+        for (bb = 0; bb < 2; bb++)
+            for (x = f->blk[blk2[bb]].first; x; x = f->ins[x].next) {
+                u32 no = ir_opcount(f, x), q;
+                for (q = 0; q < no; q++) {
+                    u32 *r = ir_opref(f, x, q);
+                    if (SIN(*r))
+                        *r = map[*r];
+                }
+            }
+        /* h2 branches as h does, b2 as b, but b2 carries on to A2 */
+        f->blk[h2].term = TERM_BR;
+        f->blk[h2].arg = map[hb->arg];
+        f->blk[h2].succ[hk] = b2;
+        f->blk[h2].succ[1 - hk] = hb->succ[1 - hk];
+        f->blk[b2].term = TERM_BR;
+        f->blk[b2].arg = map[f->blk[b].arg];
+        f->blk[b2].succ[bk] = A2;
+        f->blk[b2].succ[1 - bk] = f->blk[b].succ[1 - bk];
+        ir_add_pred(f, b2, h2);
+        ir_add_pred(f, A2, b2);
+        for (bb = 0; bb < 2; bb++) {
+            /* the exits gain the copy as a predecessor: their phis take the copied values */
+            u32 from = src[bb], to = blk2[bb], X = f->blk[to].succ[bb ? 1 - bk : 1 - hk], pi;
+            for (pi = 0; f->blk[X].preds[pi] != from; pi++)
+                ;
+            ir_add_pred(f, X, to);
+            for (x = f->blk[X].phis; x; x = f->ins[x].next) {
+                u32 val = f->xargs[f->ins[x].a + pi];
+                ir_phi_add_arg(f, x, SIN(val) ? map[val] : val);
+            }
+        }
+        f->blk[P].succ[0] = h2;
+        nv = map[snx_];
+        f->xargs[f->ins[map[ph]].a] = init;
+        f->xargs[f->ins[map[ph]].a + 1] = nv;
+        /* A2: on to the vectors once every read of the next round starts 16-byte aligned */
+        f->blk[A2].term = TERM_BR;
+        f->blk[A2].succ[0] = VP;
+        f->blk[A2].succ[1] = h2;
+        ir_add_pred(f, VP, A2);
+        f->blk[VP].term = TERM_JMP;
+        f->blk[VP].succ[0] = Vh;
+        ir_add_pred(f, Vh, VP);
+        ir_add_pred(f, Vh, Vb);
+        f->blk[Vh].term = TERM_BR;
+        f->blk[Vh].succ[0] = Vb;
+        f->blk[Vh].succ[1] = Hin;
+        ir_add_pred(f, Vb, Vh);
+        f->blk[Vb].term = TERM_BR;
+        f->blk[Vb].succ[0] = Vh;
+        f->blk[Vb].succ[1] = Hin;
+        ir_add_pred(f, Hin, Vh);
+        ir_add_pred(f, Hin, Vb);
+        f->blk[Hin].term = TERM_JMP;
+        f->blk[Hin].succ[0] = h;
+        hb = &f->blk[h];
+        for (k = 0; hb->preds[k] != P; k++)
+            ;
+        hb->preds[k] = Hin;
+        init = nv;
+    }
+
+    civ = ir_phi(f, Vh, ty);
+    /* the vector of the element test, in Vb */
+    svp_ = VP;
+    sblk_ = Vb;
+    snv = 0;
+    snld = 0;
+    m = s_vec(dc, civ);
+    al = 0;
+    for (k = 0; k < snld; k++) {
+        u32 ea = ty == IT_I32 ? mk(A2, OP_SEXT32, IT_I64, init, 0) : init, t;
+        if (sl_c[k])
+            ea = mk(A2, OP_ADD, IT_I64, ea, ir_const(f, IT_I64, (u64)(i64)(i32)sl_c[k]));
+        if (sl_k[k])
+            ea = mk(A2, OP_SHL, IT_I64, ea, ir_const(f, IT_I64, sl_k[k]));
+        t = mk(A2, OP_AND, IT_I64, mk(A2, OP_ADD, IT_I64, sl_base[k], ea), ir_const(f, IT_I64, 15));
+        al = al ? mk(A2, OP_OR, IT_I64, al, t) : t;
+    }
+    f->blk[A2].arg = mk(A2, OP_EQ, IT_I32, al, ir_const(f, IT_I64, 0));
+    /* Vh: room for a whole chunk: the last lane's counter test holds (in 64 bits: no wrap) */
+    snl = 16 / slanesz;
+    {
+        u32 i64v = ty == IT_I32 ? mk(Vh, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, civ, 0) : civ;
+        u32 n64 = ty == IT_I32 ? mk(Vh, uns ? OP_ZEXT32 : OP_SEXT32, IT_I64, n, 0) : n;
+        u32 last = mk(Vh, OP_ADD, IT_I64, i64v, ir_const(f, IT_I64, (u64)((i64)snl - 1 + coff)));
+        ok = mk(Vh, uns && ty == IT_I64 ? OP_ULT : OP_SLT, IT_I32, last, n64);
+        if (coff < 0 || (i64)snl - 1 + coff < 0) /* (a counter test on i - k: that the first lane's holds too) */
+            ok = mk(Vh, OP_AND, IT_I32, ok, mk(Vh, uns && ty == IT_I64 ? OP_ULT : OP_SLT, IT_I32,
+                                               mk(Vh, OP_ADD, IT_I64, i64v, ir_const(f, IT_I64, (u64)coff)), n64));
+        if (uns && ty == IT_I64)
+            ok = mk(Vh, OP_AND, IT_I32, ok, mk(Vh, OP_UGE, IT_I32, last, i64v)); /* (no wrap past 2^64) */
+    }
+    f->blk[Vh].arg = ok;
+    /* Vb: every lane carries on: the mask's lanes, read as 32-bit numbers, sum to -4 (all ones) or 0 */
+    lanes32 = 4;
+    sum = mk(Vb, OP_VSUM, IT_I32, m, 0);
+    f->ins[sum].mem = M_32;
+    f->blk[Vb].arg = mk(Vb, OP_EQ, IT_I32, sum, ir_const(f, IT_I32, cont_d ? (u64)(i64)-(i64)lanes32 : 0));
+    nxt = mk(Vb, OP_ADD, ty, civ, ir_const(f, ty, snl));
+    f->xargs[f->ins[civ].a] = init;
+    f->xargs[f->ins[civ].a + 1] = nxt;
+    for (k = 0; f->blk[h].preds[k] != Hin; k++)
+        ;
+    f->xargs[f->ins[ph].a + k] = civ;
+    if (opt_vec_report)
+        fprintf(stderr, "%s: search loop vectorised (%u elements at a time)\n", f->name, snl);
+    return 1;
+}
+
 int opt_vectorise(Func *fn)
 {
     u32 b, nblk = fn->nblk, n0 = fn->nins;
@@ -1591,7 +2005,7 @@ int opt_vectorise(Func *fn)
     ioff = lpos + n0;
     for (b = 1; b < nblk; b++)
         if (f->blk[b].term == TERM_BR)
-            done += try_loop(b, n0);
+            done += try_loop(b, n0) || try_search(b, n0);
     free(kind);
     free(base);
     return done;

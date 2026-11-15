@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_norange, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
 u32 ptx_maxntid;
@@ -2451,6 +2451,319 @@ static void special_once(Func *f)
     }
 }
 
+/* ---- the ranges of 32-bit values, for the sign corrections of divisions by a constant ----
+   ir.c divides by a constant as it builds the code, before anything is known of the values: a signed quotient
+   gets x >> 31 added (one more when x is negative), a signed remainder by 2^k a bias from x >> 31. Most of what
+   kernels divide is a loop counter, a thread number or a sum of them, never negative: nvcc writes none of those
+   corrections in lp_s2 (mul.hi.u32), mcc wrote 1352. A value's range here comes from constants, the arithmetic
+   on them, the special registers, and a loop counter's start and the comparison that keeps the loop going (no
+   assumption that a sum does not wrap: a range that leaves 32 bits is no range). MCC_NORANGE: off. */
+#define RG_MIN (-(i64)0x80000000L)
+#define RG_MAX ((i64)0x7fffffffL)
+static i64 *rg_lo, *rg_hi;
+static u8 *rg_st; /* 0 not yet, 1 being worked out (a cycle: no range), 2 known */
+static u32 rg_depth;
+
+static void rg_of(u32 v, i64 *lo, i64 *hi);
+
+/* floor(x / 2^k), for k < 63, without shifting a negative number */
+static i64 rg_fl(i64 x, u32 k)
+{
+    i64 d = (i64)1 << k;
+    return x >= 0 ? x / d : -((-x + d - 1) / d);
+}
+
+static int rg_fit(i64 lo, i64 hi)
+{
+    return lo >= RG_MIN && hi <= RG_MAX && lo <= hi;
+}
+
+/* the most x can be when condition w is true (sense 1) or false (sense 0); RG_MAX when it says nothing */
+static i64 rg_cond_ub(u32 w, int sense, u32 x)
+{
+    Ins *c = &PF->ins[RV(w)];
+    u32 l, r;
+    i64 nlo, nhi;
+    int op;
+    if (c->op < OP_SLT || c->op > OP_UGE)
+        return RG_MAX;
+    l = RV(c->a);
+    r = RV(c->b);
+    if (PF->ins[l].ty != IT_I32 || PF->ins[r].ty != IT_I32)
+        return RG_MAX;
+    op = c->op;
+    if (r == x) { /* N op x: as x op' N */
+        u32 t = l;
+        l = r;
+        r = t;
+        op = op == OP_SLT ? OP_SGT : op == OP_SLE ? OP_SGE : op == OP_SGT ? OP_SLT : op == OP_SGE ? OP_SLE :
+             op == OP_ULT ? OP_UGT : op == OP_ULE ? OP_UGE : op == OP_UGT ? OP_ULT : OP_ULE;
+    }
+    if (l != x)
+        return RG_MAX;
+    if (!sense) /* not (x op N) */
+        op = op == OP_SLT ? OP_SGE : op == OP_SLE ? OP_SGT : op == OP_SGT ? OP_SLE : op == OP_SGE ? OP_SLT :
+             op == OP_ULT ? OP_UGE : op == OP_ULE ? OP_UGT : op == OP_UGT ? OP_ULE : OP_ULT;
+    rg_of(r, &nlo, &nhi);
+    switch (op) {
+    case OP_SLT: return nhi - 1;
+    case OP_SLE: return nhi;
+    case OP_ULT: return nlo >= 0 ? nhi - 1 : RG_MAX; /* (below a non-negative N unsigned: 0 .. N - 1) */
+    case OP_ULE: return nlo >= 0 ? nhi : RG_MAX;
+    }
+    return RG_MAX;
+}
+
+/* phi p of block h: a loop counter (each way back brings p + c, c > 0) whose way back is taken only while a
+   comparison of p or p + c with a bounded value holds */
+static int rg_phi(u32 p, i64 *lo, i64 *hi)
+{
+    Func *f = PF;
+    Ins *pi = &f->ins[p];
+    Block *hb = &f->blk[pi->blk];
+    i64 l = RG_MAX, h = RG_MIN, a, b;
+    u32 k, j, nb = f->nblk;
+    int ivs = 0;
+    for (k = 0; k < pi->b; k++) {
+        u32 x = RV(f->xargs[pi->a + k]), pr = hb->preds[k];
+        Ins *xi = &f->ins[x];
+        u64 c;
+        if (x == p)
+            continue;
+        if (xi->op == OP_ADD && RV(xi->a) == p && ir_is_const(f, RV(xi->b), &c) && (i64)(i32)(u32)c > 0) {
+            /* the way back: what keeps it going bounds p + c */
+            i64 cc = (i64)(i32)(u32)c, ub = RG_MAX, t;
+            Block *pb = &f->blk[pr];
+            if (pb->term == TERM_BR && (pb->succ[0] == pi->blk) != (pb->succ[1] == pi->blk)) {
+                int sense = pb->succ[0] == pi->blk;
+                t = rg_cond_ub(pb->arg, sense, x);
+                ub = t < ub ? t : ub;
+                t = rg_cond_ub(pb->arg, sense, p);
+                ub = t < RG_MAX && t + cc < ub ? t + cc : ub;
+            }
+            for (j = 1; j < nb && ub == RG_MAX; j++) {
+                Block *bb = &f->blk[j];
+                int s;
+                if (bb->term != TERM_BR || bb->succ[0] == bb->succ[1])
+                    continue;
+                for (s = 0; s < 2; s++) {
+                    u32 sb = bb->succ[s];
+                    if (f->blk[sb].npreds != 1 || sb == pi->blk || !opt_dominates(sb, pr))
+                        continue;
+                    t = rg_cond_ub(bb->arg, s == 0, x);
+                    ub = t < ub ? t : ub;
+                    t = rg_cond_ub(bb->arg, s == 0, p);
+                    ub = t < RG_MAX && t + cc < ub ? t + cc : ub;
+                }
+            }
+            if (ub >= RG_MAX)
+                return 0;
+            h = ub > h ? ub : h;
+            if (h + cc > RG_MAX)
+                return 0; /* (p + c could wrap: then the comparison bounds nothing) */
+            ivs = 1;
+            continue;
+        }
+        rg_of(x, &a, &b);
+        l = a < l ? a : l;
+        h = b > h ? b : h;
+    }
+    if (!ivs || l > h)
+        return 0;
+    for (k = 0; k < pi->b; k++) { /* (every step again, against the final h) */
+        Ins *xi = &f->ins[RV(f->xargs[pi->a + k])];
+        u64 c;
+        if (xi->op == OP_ADD && RV(xi->a) == p && ir_is_const(f, RV(xi->b), &c) && h + (i64)(i32)(u32)c > RG_MAX)
+            return 0;
+    }
+    *lo = l;
+    *hi = h;
+    return 1;
+}
+
+static void rg_of(u32 v, i64 *lo, i64 *hi)
+{
+    Func *f = PF;
+    Ins *i;
+    i64 a0, a1, b0, b1, l = RG_MIN, h = RG_MAX;
+    u64 c;
+    int sp;
+    v = RV(v);
+    i = &f->ins[v];
+    *lo = RG_MIN;
+    *hi = RG_MAX;
+    if (i->op == OP_CONST) {
+        *lo = *hi = (i64)(i32)(u32)i->a;
+        return;
+    }
+    if (i->ty != IT_I32 || rg_st[v] == 1 || rg_depth > 200)
+        return;
+    if (rg_st[v] == 2) {
+        *lo = rg_lo[v];
+        *hi = rg_hi[v];
+        return;
+    }
+    rg_st[v] = 1;
+    rg_depth++;
+    switch (i->op) {
+    case OP_ADD: case OP_SUB: case OP_MUL:
+        rg_of(i->a, &a0, &a1);
+        rg_of(i->b, &b0, &b1);
+        { /* (i64 holds any of these of two i32 bounds; rg_fit below drops what leaves 32 bits) */
+            if (i->op == OP_ADD)
+                l = a0 + b0, h = a1 + b1;
+            else if (i->op == OP_SUB)
+                l = a0 - b1, h = a1 - b0;
+            else {
+                i64 p[4];
+                int k;
+                p[0] = a0 * b0, p[1] = a0 * b1, p[2] = a1 * b0, p[3] = a1 * b1;
+                l = h = p[0];
+                for (k = 1; k < 4; k++)
+                    l = p[k] < l ? p[k] : l, h = p[k] > h ? p[k] : h;
+            }
+        }
+        break;
+    case OP_SHL:
+        rg_of(i->a, &a0, &a1);
+        if (ir_is_const(f, RV(i->b), &c) && c < 31)
+            l = a0 * ((i64)1 << c), h = a1 * ((i64)1 << c);
+        break;
+    case OP_SHR: case OP_SAR:
+        if (!ir_is_const(f, RV(i->b), &c) || (c &= 31) == 0)
+            break;
+        rg_of(i->a, &a0, &a1);
+        if (i->op == OP_SAR || a0 >= 0)
+            l = rg_fl(a0, (u32)c), h = rg_fl(a1, (u32)c);
+        else
+            l = 0, h = (i64)(0xffffffffUL >> c);
+        break;
+    case OP_AND:
+        rg_of(i->a, &a0, &a1);
+        rg_of(i->b, &b0, &b1);
+        if (a0 >= 0 || b0 >= 0)
+            l = 0, h = a0 >= 0 && b0 >= 0 ? (a1 < b1 ? a1 : b1) : a0 >= 0 ? a1 : b1;
+        break;
+    case OP_OR: case OP_XOR:
+        rg_of(i->a, &a0, &a1);
+        rg_of(i->b, &b0, &b1);
+        if (a0 >= 0 && b0 >= 0) {
+            i64 m = a1 > b1 ? a1 : b1, p = 1;
+            while (p <= m)
+                p <<= 1;
+            l = 0, h = p - 1;
+        }
+        break;
+    case OP_SMULH: case OP_UMULH:
+        rg_of(i->a, &a0, &a1);
+        if (ir_is_const(f, RV(i->b), &c)) {
+            i64 k = i->op == OP_SMULH ? (i64)(i32)(u32)c : (i64)(u32)c;
+            if (i->op == OP_UMULH && a0 < 0)
+                break;
+            if (a0 == RG_MIN || a1 == RG_MAX)
+                break;
+            l = rg_fl(a0 * k, 32), h = rg_fl(a1 * k, 32);
+            if (l > h) {
+                i64 t = l;
+                l = h, h = t;
+            }
+        }
+        break;
+    case OP_SELECT:
+        rg_of(i->b, &a0, &a1);
+        rg_of(i->c, &b0, &b1);
+        l = a0 < b0 ? a0 : b0, h = a1 > b1 ? a1 : b1;
+        break;
+    case OP_EQ: case OP_NE: case OP_SLT: case OP_SLE: case OP_SGT: case OP_SGE: case OP_ULT: case OP_ULE: case OP_UGT:
+    case OP_UGE: case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE:
+        l = 0, h = 1;
+        break;
+    case OP_ZEXT8: l = 0, h = 255; break;
+    case OP_ZEXT16: l = 0, h = 65535; break;
+    case OP_SEXT8: l = -128, h = 127; break;
+    case OP_SEXT16: l = -32768, h = 32767; break;
+    case OP_CLZ: case OP_CTZ: case OP_POPCNT: l = 0, h = 32; break;
+    case OP_LOAD:
+        if (i->mem == M_8U)
+            l = 0, h = 255;
+        else if (i->mem == M_16U)
+            l = 0, h = 65535;
+        else if (i->mem == M_32 && f->ins[RV(i->a)].op == OP_ADDR && (sp = special_of(f->ins[RV(i->a)].a)) >= 0)
+            l = sp & 1 ? 1 : 0, h = sp == 0 ? 1023 : sp == 2 ? 1024 : RG_MAX; /* tid, ctaid, ntid, nctaid */
+        break;
+    case OP_PHI:
+        if (!rg_phi(v, &l, &h)) {
+            l = RG_MIN;
+            h = RG_MAX;
+        }
+        break;
+    }
+    if (!rg_fit(l, h))
+        l = RG_MIN, h = RG_MAX;
+    rg_depth--;
+    rg_lo[v] = l;
+    rg_hi[v] = h;
+    rg_st[v] = 2;
+    *lo = l;
+    *hi = h;
+}
+
+/* x >> 31 (logical or arithmetic) of an x known not to be negative is 0, and so is what it is the bias of */
+static void range_fold(Func *f)
+{
+    u32 v, n = f->nins, any = 0;
+    u8 *zero;
+    i64 lo, hi;
+    if (opt_norange)
+        return;
+    rg_lo = (i64 *)xmalloc((size_t)(n + 1) * sizeof(i64));
+    rg_hi = (i64 *)xmalloc((size_t)(n + 1) * sizeof(i64));
+    rg_st = (u8 *)xmalloc((size_t)n + 1);
+    zero = (u8 *)xmalloc((size_t)n + 1);
+    memset(rg_st, 0, (size_t)n + 1);
+    memset(zero, 0, (size_t)n + 1);
+    rg_depth = 0;
+    opt_dom(f);
+    for (v = 1; v < n; v++) {
+        Ins *i = &f->ins[v];
+        u64 c;
+        if (!i->blk || i->ty != IT_I32 || (i->op != OP_SHR && i->op != OP_SAR) || !ir_is_const(f, RV(i->b), &c) || (c & 31) != 31)
+            continue;
+        rg_of(i->a, &lo, &hi);
+        if (lo >= 0) {
+            zero[v] = 1;
+            any = 1;
+        }
+    }
+    if (any) {
+        /* (x >> 31) >> k, x + (x >> 31): what reads them, in the order made */
+        for (v = 1; v < n; v++) {
+            Ins *i = &f->ins[v];
+            u32 a, b;
+            if (!i->blk || i->ty != IT_I32 || zero[v])
+                continue;
+            a = RV(i->a);
+            b = RV(i->b);
+            if ((i->op == OP_SHR || i->op == OP_SAR || i->op == OP_SHL || i->op == OP_AND) && a < n && zero[a])
+                zero[v] = 1;
+            else if ((i->op == OP_ADD || i->op == OP_OR || i->op == OP_XOR) && b < n && zero[b])
+                ir_replace(f, v, a);
+            else if ((i->op == OP_ADD || i->op == OP_OR || i->op == OP_XOR) && a < n && zero[a])
+                ir_replace(f, v, b);
+        }
+        for (v = 1; v < n; v++)
+            if (zero[v])
+                ir_replace(f, v, ir_const(f, IT_I32, 0));
+        f->copies = 1;
+        ir_resolve_all(f);
+        opt_dce(f);
+    }
+    free(rg_lo);
+    free(rg_hi);
+    free(rg_st);
+    free(zero);
+}
+
 void ptx_gen(Func *f, Obj *o, int entry)
 {
     u32 b, v, k, n, *p, frame = 0, nb = f->nblk, last_loc = 0;
@@ -2467,6 +2780,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     fname = name;
     if (entry && opt_nospecial1)
         special_once(f);
+    range_fold(f);
     if (entry) {
         if (nkern == capkern) {
             capkern = capkern ? capkern * 2 : 32;

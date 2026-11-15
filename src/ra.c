@@ -187,6 +187,27 @@ static int fixed_conflict(u32 pr, u32 r)
     return 0;
 }
 
+/* ra_run again over the same function after it was changed (x64.c's loop splits): the first run's renumbering is kept
+   composed with the second's, so ra_dense still answers for instruction selection's numbers. */
+void ra_rerun(MFunc *m, const MTarget *t)
+{
+    static u32 *prev;
+    static u32 capprev;
+    u32 n = dense_n, k;
+    if (capprev < n + 1) {
+        capprev = n * 2 + 1;
+        prev = (u32 *)xrealloc(prev, capprev * sizeof(u32));
+    }
+    if (n)
+        memcpy(prev, dense_map, n * sizeof(u32));
+    ra_run(m, t); /* dense_map: the first run's numbers -> the second's */
+    for (k = 0; k < n; k++)
+        prev[k] = prev[k] == NOREG || prev[k] >= dense_n ? NOREG : dense_map[prev[k]];
+    /* the composition lives in prev from now on; ra_run's map buffer is reused on the next function */
+    dense_map = prev;
+    dense_n = n;
+}
+
 /* Debug information, after ra_run: the number a virtual register (VREG0 + r as instruction selection made it)
    was allocated under (an index of MFunc.loc), or NOREG if it is not used. */
 u32 ra_dense(u32 r)
@@ -547,7 +568,8 @@ void ra_run(MFunc *m, const MTarget *t)
             MBlock *mb = &m->blk[b];
             for (i = mb->first; i < mb->first + mb->n; i++) {
                 MIns *in = &m->ins[i];
-                if (in->op == t->move_op && in->d != NOREG && in->d >= VREG0 && in->s0 != NOREG && in->s0 >= VREG0)
+                if (in->op == t->move_op && in->d != NOREG && in->d >= VREG0 && in->s0 != NOREG && in->s0 >= VREG0 &&
+                    !(in->flags & MF_SPLIT)) /* (a split is made to keep the two apart) */
                     copies[ncopy++] = i | (u32)(depth[b] < 3 ? depth[b] : 3) << 30;
             }
         }

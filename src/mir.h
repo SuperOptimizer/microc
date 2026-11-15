@@ -16,6 +16,7 @@
 #define MF_LO12 16 /* memory access: base holds the page of symbol sym + imm; add the offset within it */
 #define MF_TIED 0x40  /* two-address: d is written over s0 (x86), so s0's register is the place for d when s0 dies here */
 #define MF_COMMUT 0x08 /* with MF_TIED: s0 and s1 commute, so s1's register will do as well */
+#define MF_SPLIT 0x20 /* a copy x64.c's loop splitting made (the loop's own register for a spilled one) */
 #define MF_NOTS1 0x80 /* two-address, not commutative: d had better not get s1's register (it would take a copy of s1 first) */
 
 typedef struct MIns {
@@ -58,6 +59,7 @@ typedef struct MTarget {
 } MTarget;
 
 void ra_run(MFunc *m, const MTarget *t);
+void ra_rerun(MFunc *m, const MTarget *t); /* again, after the function changed (keeps ra_dense's numbering) */
 u32 ra_dense(u32 r);                                    /* -g: after ra_run */
 u32 ra_ranges(u32 d, u32 *start, u32 *end, u32 max);
 

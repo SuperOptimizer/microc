@@ -396,6 +396,8 @@ static void target_macros(void)
         "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2",
         "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", 0};
     int k;
+    if (getenv("MCC_NOLDGV"))
+        pp_define("__MCC_NOLDGV"); /* mcuda_device.h: __ldg of the vector types field by field (for the GPU A/B) */
     if (std_c99)
         pp_define("restrict=__restrict");
     if (opt_c23)

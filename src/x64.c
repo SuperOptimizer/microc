@@ -106,6 +106,7 @@ enum {
     X_CPUID,                 /* rax = register cc of cpuid(imm, imm >> 32) */
     X_RAW,                   /* the bytes of imm, most significant first */
     X_PREFETCH,              /* prefetch [s0 + s1 * scale + imm] with hint digit cc */
+    X_KMOVK,                 /* k1 = the general register s0 (kmovw), for the next instruction's mask */
     X_KTEST                  /* general d = the mask of vptestm (encoding imm) on s0, s1: k1, then kmov of cc bytes */
 };
 
@@ -1102,10 +1103,10 @@ static MIns *emit_vex(u32 enc, int form, u32 d, u32 s0, u32 s1, u32 s2, int imm8
 }
 
 /* the internal form of a test: reg = s0, rm = s1, nothing written but the flags */
-#define XF_TEST 8
+#define XF_TEST 16
 /* ... and of -ffp-contract's vfmadd: d = s0 * s1 + s2 by a 213 encoding; the product commutes, so the 231 form (d the
    addend) or either factor in d's place saves the move */
-#define XF_FMA 9
+#define XF_FMA 17
 
 /* May the r/m operand of VEX instruction enc be memory? Not for the mask moves (the memory form is no instruction) nor
    for vmovhlps / vmovlhps (whose memory forms are other instructions). */
@@ -1728,6 +1729,10 @@ static void sel_xi(u32 v)
         if (!fits32(a.off))
             die("%s: address offset out of range", f->name);
         m->imm = (i64)((u64)enc << 32 | (u32)a.off);
+        return;
+    case XK_MASKOP:
+        emit(X_KMOVK, 0, NOREG, reg_of(args[1]), NOREG);
+        emit_vex(enc, XF_DVMK, d, reg_of(args[0]), reg_of(args[2]), reg_of(args[3]), imm);
         return;
     case XK_KTEST:
         m = emit(X_KTEST, 0, d, reg_of(args[0]), reg_of(args[1]));
@@ -3538,7 +3543,7 @@ static void evex_prefix(u32 enc, u32 reg, u32 vvvv, u32 idx, u32 base, u32 aaa)
 static void vex_rr(u32 enc, u32 reg, u32 vvvv, u32 rm)
 {
     if (XE_Z(enc)) {
-        evex_prefix(enc, reg, vvvv, NOREG, rm, 0);
+        evex_prefix(enc, reg, vvvv, NOREG, rm, (u32)XE_K1(enc));
         b1(0xc0 | (reg & 7) << 3 | (rm & 7));
         return;
     }
@@ -3556,9 +3561,9 @@ static void vex_mem(u32 enc, u32 reg, u32 vvvv, const EA *ea, u32 immbytes)
         if (e.sym == NOSLOT && e.base != NOREG && (e.disp != 0 || (e.base & 7) == 5))
             e.force32 = 1;
         if (e.sym != NOSLOT)
-            evex_prefix(enc, reg, vvvv, NOREG, NOREG, 0);
+            evex_prefix(enc, reg, vvvv, NOREG, NOREG, (u32)XE_K1(enc));
         else
-            evex_prefix(enc, reg, vvvv, e.idx, e.base, 0);
+            evex_prefix(enc, reg, vvvv, e.idx, e.base, (u32)XE_K1(enc));
         mem_tail(reg, &e, immbytes);
         return;
     }
@@ -4363,6 +4368,7 @@ static void enc_vex(MIns *i)
         imm8 = (int)((ra & 15) << 4);
         break;
     case XF_DVM:
+    case XF_DVMK:
         /* d = s0, then d = s1 * d + s2 (the 213 forms); d must not be where s1 or s2 still is */
         dl = loc_of(i->d);
         al = loc_of(i->s0);
@@ -4374,6 +4380,10 @@ static void enc_vex(MIns *i)
         if (al != dr)
             mov_locw(dr, al, vw_of(i->s0));
         vex_rr(enc, dr, rv, rm);
+        if (imm8 >= 0) { /* (vpternlog) before the copy below */
+            b1((u32)imm8);
+            imm8 = -1;
+        }
         if (dr == FSCR0 && !is_spill(dl)) {
             vmov_rr(dl, dr, vw_of(i->d));
             dr = NOREG;
@@ -4523,6 +4533,10 @@ static void encode(MIns *i)
             vmov_rr(loc_of(i->d), FSCR0, vw_of(i->d));
         return;
     }
+    case X_KMOVK:
+        a = use(i->s0, SCR0);
+        vex_rr(VE(0x92, 1, 0, 0), 1, NOREG, a); /* kmovw k1, r32 */
+        return;
     case X_KTEST:
         a = xuse(i->s0, 0);
         b = xuse(i->s1, 1);

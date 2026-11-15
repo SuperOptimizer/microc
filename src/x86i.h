@@ -42,7 +42,8 @@ enum {
     XK_CPUID,    /* a register of cpuid(leaf, subleaf) */
     XK_RAW,      /* fixed bytes (enc, most significant first) */
     XK_PREFETCH, /* prefetch hint imm of the address */
-    XK_KTEST     /* vptestm[bwdq] into a mask register, whose bits are the result (kmov) */
+    XK_KTEST,    /* vptestm[bwdq] into a mask register, whose bits are the result (kmov) */
+    XK_MASKOP    /* (src, mask, a, b): the operation on a and b where the mask has a 1, src elsewhere (k1, XF_DVMK) */
 };
 
 /* where the operands of an XK_VEX instruction go: d is the result, a0 a1 a2 the arguments that are not
@@ -55,7 +56,8 @@ enum {
     XF_MR,   /* reg = a0, rm = d (vextracti128, vcvtps2ph, vmovd to a general register) */
     XF_VMI,  /* vvvv = d, rm = a0, reg = the digit in enc (shifts by an immediate) */
     XF_RVMR, /* reg = d, vvvv = a0, rm = a1, imm[7:4] = a2 (vblendvps) */
-    XF_DVM   /* d = a0 first, then reg = d, vvvv = a1, rm = a2 (FMA 213: d = a0 * a1 + a2) */
+    XF_DVM,  /* d = a0 first, then reg = d, vvvv = a1, rm = a2 (FMA 213: d = a0 * a1 + a2) */
+    XF_DVMK  /* the same, the operands in that order whatever they are (vpternlog; a masked operation merged into a0) */
 };
 
 /* enc: the opcode byte, then map (1 0f, 2 0f38, 3 0f3a), pp (0 none, 1 66, 2 f3, 3 f2), W, L, /digit, Z (512 bits, EVEX;
@@ -67,6 +69,7 @@ enum {
 #define XE_L(e) ((e) >> 13 & 1)
 #define XE_DIGIT(e) ((e) >> 14 & 7)
 #define XE_Z(e) ((e) >> 17 & 1) /* 512 bits: EVEX encoded */
+#define XE_K1(e) ((e) >> 18 & 1) /* EVEX: masked by k1 (merging) */
 
 typedef struct X86I {
     const char *name; /* without the leading underscore */

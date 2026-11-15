@@ -43,9 +43,11 @@ static int mixed;  /* x86-64: elements of different sizes, all in lanes of four 
 int opt_x64_avx2;  /* x86-64: AVX2 (256-bit integer lanes): opt_vec uses 32-byte vectors in AVX functions */
 int opt_x64_sse41; /* x86-64: SSE4.1 may be used (pmulld, pmaxsd, ...); -msse4.1, -mavx2, -march=native ... */
 Obj *opt_obj;
-/* Loops that read through an index computed lane by lane. With AVX2 (32-byte vectors) on unless -fno-vec-gather (-1): the
-   gather is vpgatherdd / vgatherdps. Without, only on -fvec-gather (1): with SSE4.1 the gather is four extract / load /
-   insert steps, measured slower than the scalar loop (clamped row 1.02 vs 1.37 ns, halving 1.20 vs 0.87 ns an element). */
+/* Loops that read through an index computed lane by lane: only with -fvec-gather. With AVX2 the gather is vpgatherdd /
+   vgatherdps (clamped row 0.544 -> 0.259 ns an element in isolation), but a gather takes no store-to-load forwarding:
+   one that reads what was just stored waits for the stores to retire. ufsm's reg.c filt_axis fills a row by a clamped
+   index from data the previous pass wrote: test_reg 45.9 -> 53.2 Gcycles with gathers, and no other ufsm test gained
+   (suite 675.4 vs 681.9). With SSE4.1 the gather is four extract / load / insert steps, slower than scalar. */
 int opt_vec_gather;
 static u32 *base, *cnt, *map, *lpos;
 static u32 *ioff; /* an index or address (K_IDX, K_ADDR): the value from outside the loop added to the counter before it
@@ -835,7 +837,7 @@ static int try_loop(u32 l, u32 n0)
                 shift[v] = 0;
                 break;
             }
-            if (i->op == OP_SEXT32 && opt_arch == ARCH_X64 && (vw == 32 ? opt_vec_gather >= 0 : !f->avx && opt_x64_sse41 && opt_vec_gather > 0) && !INV(i->a) && kind[i->a] != K_IVPHI &&
+            if (i->op == OP_SEXT32 && opt_arch == ARCH_X64 && (vw == 32 ? opt_vec_gather > 0 : !f->avx && opt_x64_sse41 && opt_vec_gather > 0) && !INV(i->a) && kind[i->a] != K_IVPHI &&
                 f->ins[i->a].ty == IT_I32 && is_vec(i->a)) {
                 kind[v] = K_GIDX; /* an index computed lane by lane: the load it addresses gathers */
                 shift[v] = 0;

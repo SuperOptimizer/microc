@@ -2286,10 +2286,16 @@ static int bool_regroup(void)
     return changed;
 }
 
+/* x86-64 host: a pure math call (IF_PURE) neither writes memory nor stops a load's hoisting, and one of loop-invariant
+   arguments that every trip makes goes before the loop (clang: readnone calls). MCC_NOPURELICM: off */
+static int opt_nopurelicm = -1;
+
 static int licm(void)
 {
     u32 *mark, *stack, k, j, p, v, nx, sp, nblk0 = f->nblk;
     int any_replaced = 0;
+    if (opt_nopurelicm < 0)
+        opt_nopurelicm = getenv("MCC_NOPURELICM") != 0;
     compute_dom();
     mark = (u32 *)xmalloc(cap_blocks * 2 * sizeof(u32));
     stack = mark + cap_blocks;
@@ -2435,8 +2441,8 @@ static int licm(void)
             }
             for (v = f->blk[b].first; v; v = f->ins[v].next) {
                 Ins *i = &f->ins[v];
-                if (i->op == OP_CALL || i->op == OP_MEMCPY || i->op == OP_MEMZERO || i->op == OP_VSTORE ||
-                    (i->op == OP_XI && (i->flags & XI_EFFECT))) {
+                if ((i->op == OP_CALL && !(i->flags & IF_PURE && !opt_nopurelicm)) || i->op == OP_MEMCPY || i->op == OP_MEMZERO ||
+                    i->op == OP_VSTORE || (i->op == OP_XI && (i->flags & XI_EFFECT))) {
                     clobbers_all = 1;
                 } else if (i->op == OP_STORE) {
                     if (nstores == 16) {
@@ -2499,6 +2505,13 @@ static int licm(void)
                         else if (!f->ins[i->a].blk && (ir_opcount(f, v) < 2 || !f->ins[i->b].blk))
                             ok = 0;
                     }
+                } else if (i->op == OP_CALL && (i->flags & IF_PURE) && !opt_nopurelicm && always) {
+                    /* a math function of loop-invariant arguments in a block every trip runs (so it is not
+                       made speculative: the loop's first trip would have called it) */
+                    u32 n = ir_opcount(f, v), q;
+                    ok = 1;
+                    for (q = 0; ok && q < n; q++)
+                        ok = defined_outside(*ir_opref(f, v, q), mark, h);
                 } else if (i->op == OP_LOAD && !clobbers_all) {
                     /* only loads that cannot fault where the loop would not have:
                        fixed stack or global addresses, addresses used just

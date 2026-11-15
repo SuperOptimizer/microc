@@ -136,6 +136,8 @@ struct __mcuda_module;
 /* The device address of the device global whose host object is at p (or inside it): 0 if p is no such
    object. Loads the modules that use it. *left: the bytes from p to the end of the object. */
 CUdeviceptr hw_symbol(const void *p, size_t *left);
+/* After n bytes were copied to the block of the device global at p: the same into the kernels' copies of a __constant__ one. */
+int hw_symbol_sync(const void *p, size_t n, int async, CUhandle s);
 /* The function of the kernel whose host stub is at p, 0 if unknown. */
 CUhandle hw_kernel_of(const void *p);
 void hw_precompile(int n); /* MCUDA_PRECOMPILE: mod.c */

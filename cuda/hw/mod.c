@@ -6,7 +6,10 @@
    A device global is, for the compiler, a host object that the PTX names (.extern .global) and the module
    record lists with its address. Here the object on the device is another one: a data module of the group
    defines it, it starts with the bytes of the host object, and the host address is only its name for
-   cudaMemcpyToSymbol and the like. */
+   cudaMemcpyToSymbol and the like.
+   A __constant__ object (.extern .const) is one too, but kernels read it from the constant bank (ld.const): each
+   kernel's module defines its own .const copy, filled from the device's block at the kernel's first launch (on the
+   launch's stream), and a copy to the symbol writes the block and every loaded copy on that device. */
 #include "hw.h"
 #include <mcuda.h>
 #include <stdio.h>
@@ -27,6 +30,9 @@ typedef struct {
     unsigned align;
     CUdeviceptr dev[HW_MAXDEV]; /* on each device (each starts with the host object's bytes) */
     int mod; /* a module that names it */
+    int cnst; /* __constant__: the kernels' modules have copies of their own */
+    CUdeviceptr *cc[HW_MAXDEV]; /* those copies on each device */
+    int ncc[HW_MAXDEV], capcc[HW_MAXDEV];
 } Glob;
 
 /* a definition or a declaration in a module's text */
@@ -43,6 +49,10 @@ typedef struct Kern {
     CUhandle module, f;
     int tried, err;
     struct Kern *more;
+    int nkc;          /* its __constant__ copies: globs kc[i] at kcd[i], */
+    int *kc;
+    CUdeviceptr *kcd;
+    int kcinit;       /* to be filled from the device's blocks at the next launch */
 } Kern;
 
 typedef struct {
@@ -246,7 +256,7 @@ static void *host_of(struct __mcuda_module *m, const char *name, int len)
     return 0;
 }
 
-static int glob_get(int mod, const char *name, int len, char *host, size_t size, unsigned align)
+static int glob_get(int mod, const char *name, int len, char *host, size_t size, unsigned align, int cnst)
 {
     int i, clash = 0;
     for (i = 0; i < nglobs; i++) {
@@ -255,6 +265,7 @@ static int glob_get(int mod, const char *name, int len, char *host, size_t size,
                 globs[i].size = size;
             if (align > globs[i].align)
                 globs[i].align = align;
+            globs[i].cnst |= cnst;
             return i;
         }
         if ((int)strlen(globs[i].name) == len && memcmp(globs[i].name, name, (size_t)len) == 0)
@@ -276,6 +287,7 @@ static int glob_get(int mod, const char *name, int len, char *host, size_t size,
     globs[nglobs].size = size;
     globs[nglobs].align = align;
     globs[nglobs].mod = mod;
+    globs[nglobs].cnst = cnst;
     return nglobs++;
 }
 
@@ -337,8 +349,9 @@ static void scan(int i)
                 kdefs[nkdefs].len = len;
                 kdefs[nkdefs++].mod = i;
             }
-        } else if (ext && starts(l, ".global")) {
-            /* .extern .global .align A .b8 name[size]; */
+        } else if (ext && (starts(l, ".global") || starts(l, ".const"))) {
+            /* .extern .global .align A .b8 name[size]; (.const: __constant__) */
+            int cnst = l[1] == 'c';
             unsigned align = 0;
             size_t size = 0;
             char *host;
@@ -371,7 +384,7 @@ static void scan(int i)
                 M->globname = (char **)xrealloc(M->globname, (size_t)capglob * sizeof *M->globname);
             }
             M->globname[M->nglob] = xstrndup(l, (size_t)len);
-            M->glob[M->nglob++] = glob_get(i, l, len, host, size, align);
+            M->glob[M->nglob++] = glob_get(i, l, len, host, size, align, cnst);
         }
     }
     M->body = p;
@@ -1359,8 +1372,8 @@ static void index_mod(int i)
                 item_add(M, &cap, entry ? IT_ENTRY : IT_FUNC, q, len, p, e);
             }
         } else if (starts(l, ".global") || starts(l, ".shared") || starts(l, ".const")) {
-            if (ext && l[1] == 'g')
-                continue; /* a device global: through the table */
+            if (ext && (l[1] == 'g' || l[1] == 'c'))
+                continue; /* a device global: through the table (__constant__: the kernel's own copy) */
             for (q = l; q < e && *q != '[' && *q != ';' && *q != '=' && *q != '\n'; q++)
                 ;
             while (q > l && q[-1] == ' ')
@@ -1408,6 +1421,8 @@ typedef struct {
     int nstack, capstack;
     int *kg; /* the device globals, in the order of the table */
     int nkg;
+    int *kc; /* the __constant__ objects (the kernel's module defines a copy of each) */
+    int nkc;
     char **need; /* of the library */
     int nneed, capneed;
     int bad;
@@ -1518,7 +1533,26 @@ static void take_fn(Build *B, int pi, int item)
             }
             q = t;
         }
-        if (g) {
+        if (g && globs[M->glob[gk]].cnst) {
+            /* mov.u64 %r, NAME; -> the copy's name in the kernel's module (the address in the .const space, or made generic
+               by the cvta.const that follows) */
+            int k;
+            if (!(g[glen] == ';' && g > l + 6 && g[-1] == ' ' && g[-2] == ',' && (starts(l, "\tmov.u64 %") || starts(l, "\tmov.b64 %")))) {
+                fprintf(stderr, "mcuda: %s: a use of __constant__ %s that the run time does not know: %.*s", M->m->name ? M->m->name : "?",
+                        M->globname[gk], (int)(le - l), l);
+                B->bad = 1;
+            } else {
+                for (k = 0; k < B->nkc && B->kc[k] != M->glob[gk]; k++)
+                    ;
+                if (k == B->nkc) {
+                    B->kc = (int *)xrealloc(B->kc, (size_t)(B->nkc + 1) * sizeof *B->kc);
+                    B->kc[B->nkc++] = M->glob[gk];
+                }
+                put(&B->part[pi].body, copied, (size_t)(g - copied));
+                puts_(&B->part[pi].body, globs[M->glob[gk]].devname);
+                copied = g + glen;
+            }
+        } else if (g) {
             if (starts(l, "\tmov.u64 %") && g[glen] == ';' && g > l + 11 && g[-1] == ' ' && g[-2] == ',') {
                 char at[64];
                 int k;
@@ -1576,6 +1610,7 @@ typedef struct {
     const char **tname;
     int ntext;
     int *kg, nkg; /* its device globals, in the order of its table */
+    int *kc, nkc; /* its __constant__ objects */
     char path[1100], kname[300];
     int have_path, r;
     size_t bytes;
@@ -1592,6 +1627,7 @@ static void job_free(Job *J)
     free(J->texts);
     free((void *)J->tname);
     free(J->kg);
+    free(J->kc);
 }
 
 /* Kernel `item` of module mod as a job; J->r if its text cannot be made. Lock held. */
@@ -1626,6 +1662,12 @@ static void job_prep(Job *J, int mod, int item)
         if (B.nkg) {
             char line[80];
             sprintf(line, ".extern .global .align 8 .u64 __mcuda_gt[%d];\n", B.nkg);
+            puts_(&s, line);
+        }
+        for (k = 0; k < B.nkc; k++) {
+            char line[400];
+            const Glob *G = &globs[B.kc[k]];
+            sprintf(line, ".extern .const .align %u .b8 %.300s[%lu];\n", G->align, G->devname, (unsigned long)G->size);
             puts_(&s, line);
         }
         for (k = 0; k < M->nitems; k++)
@@ -1720,12 +1762,19 @@ static void job_prep(Job *J, int mod, int item)
         J->texts[J->ntext].cap = 0;
         J->tname[J->ntext++] = "mcuda device library";
     }
-    /* the table of its device globals */
-    if (B.nkg) {
-        char line[80];
+    /* the table of its device globals, and its copies of the __constant__ objects */
+    if (B.nkg || B.nkc) {
+        char line[400];
         header(&J->data, mods[mod].m->ptx ? mods[mod].m->ptx : "");
-        sprintf(line, ".visible .global .align 8 .u64 __mcuda_gt[%d];\n", B.nkg);
-        puts_(&J->data, line);
+        if (B.nkg) {
+            sprintf(line, ".visible .global .align 8 .u64 __mcuda_gt[%d];\n", B.nkg);
+            puts_(&J->data, line);
+        }
+        for (k = 0; k < B.nkc; k++) {
+            const Glob *G = &globs[B.kc[k]];
+            sprintf(line, ".visible .const .align %u .b8 %.300s[%lu];\n", G->align, G->devname, (unsigned long)G->size);
+            puts_(&J->data, line);
+        }
         J->texts[J->ntext] = J->data;
         J->texts[J->ntext].cap = 0;
         J->tname[J->ntext++] = "mcuda device globals";
@@ -1759,6 +1808,8 @@ out:
     free(B.stack);
     J->kg = B.kg;
     J->nkg = B.nkg;
+    J->kc = B.kc;
+    J->nkc = B.nkc;
     J->r = r;
 }
 
@@ -1912,6 +1963,30 @@ static void kload(Kern *K, int mod, int item)
         if (r)
             fprintf(stderr, "mcuda: %s: the table of its device globals: error %d\n", J.kname, r);
         free(addr);
+    }
+    if (!r && J.nkc) {
+        int d = hw_cur();
+        K->kc = (int *)xrealloc(0, (size_t)J.nkc * sizeof *K->kc);
+        K->kcd = (CUdeviceptr *)xrealloc(0, (size_t)J.nkc * sizeof *K->kcd);
+        for (j = 0; !r && j < J.nkc; j++) {
+            Glob *G = &globs[J.kc[j]];
+            size_t gb = 0;
+            r = glob_dev(J.kc[j]);
+            if (!r)
+                r = hw.ModuleGetGlobal(&K->kcd[j], &gb, K->module, G->devname);
+            if (r) {
+                fprintf(stderr, "mcuda: %s: its copy of __constant__ %s: error %d\n", J.kname, G->name, r);
+                break;
+            }
+            K->kc[j] = J.kc[j];
+            if (G->ncc[d] == G->capcc[d]) {
+                G->capcc[d] = G->capcc[d] ? 2 * G->capcc[d] : 16;
+                G->cc[d] = (CUdeviceptr *)xrealloc(G->cc[d], (size_t)G->capcc[d] * sizeof *G->cc[d]);
+            }
+            G->cc[d][G->ncc[d]++] = K->kcd[j];
+        }
+        K->nkc = r ? 0 : J.nkc;
+        K->kcinit = !r;
     }
     if (r && K->module) {
         hw.ModuleUnload(K->module);
@@ -2076,6 +2151,7 @@ typedef struct {
     struct __mcuda_module *m;
     int dev;            /* the device whose module f is in */
     CUhandle f;
+    Kern *K;            /* (its __constant__ copies) */
     unsigned maxdyn;
     unsigned long calls; /* MCUDA_PROFILE: launches, and the seconds they ran */
     double secs;
@@ -2119,6 +2195,7 @@ static Fn *fn_get(struct __mcuda_module *m, const char *kernel, int *err)
         h = (h + 1) & (capfns - 1);
     f = &fns[h];
     f->f = g->f;
+    f->K = g;
     f->kernel = kernel;
     f->m = m;
     f->dev = dev;
@@ -2186,6 +2263,15 @@ int __mcuda_launch(struct __mcuda_module *m, const char *kernel, const unsigned 
     if (!r) {
         hw_lock();
         f = fn_get(m, kernel, &r);
+        if (f && f->K && f->K->kcinit) { /* its __constant__ copies, from the device's blocks, in the launch's stream order */
+            Kern *K = f->K;
+            int j;
+            for (j = 0; !r && j < K->nkc; j++)
+                r = hw.MemcpyDtoDAsync(K->kcd[j], globs[K->kc[j]].dev[hw_cur()], globs[K->kc[j]].size, stream);
+            K->kcinit = 0;
+            if (r)
+                f = 0;
+        }
         if (f) {
             fh = f->f;
             if (shared_bytes > f->maxdyn && shared_bytes < 0x7fffffffUL) {
@@ -2253,6 +2339,30 @@ CUdeviceptr hw_symbol(const void *p, size_t *left)
         }
     hw_unlock();
     return d;
+}
+
+/* After a copy of n bytes to the block of the device global at p: the same bytes into every loaded kernel's copy of it, if
+   it is __constant__ (async: in stream s's order). 0 or the driver's error. */
+int hw_symbol_sync(const void *p, size_t n, int async, CUhandle s)
+{
+    const char *c = (const char *)p;
+    int j, k, r = 0, d = hw_cur();
+    hw_lock();
+    take();
+    for (j = 0; j < nglobs; j++)
+        if (c >= globs[j].host && c < globs[j].host + globs[j].size) {
+            const Glob *G = &globs[j];
+            size_t off = (size_t)(c - G->host);
+            if (!G->cnst || !G->dev[d])
+                break;
+            if (n > G->size - off)
+                n = G->size - off;
+            for (k = 0; !r && k < G->ncc[d]; k++)
+                r = async ? hw.MemcpyDtoDAsync(G->cc[d][k] + off, G->dev[d] + off, n, s) : hw.MemcpyDtoD(G->cc[d][k] + off, G->dev[d] + off, n);
+            break;
+        }
+    hw_unlock();
+    return r;
 }
 
 void *__mcuda_symbol(struct __mcuda_module *m, const char *name)

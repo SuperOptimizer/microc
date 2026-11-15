@@ -654,6 +654,7 @@ static cudaError_t symcopy(const void *sym, void *host, size_t n, size_t off, en
 {
     CUdeviceptr d;
     size_t left = 0;
+    int e;
     if ((unsigned)kind > (unsigned)cudaMemcpyDefault)
         return ret(cudaErrorInvalidMemcpyDirection);
     ENTER();
@@ -668,13 +669,17 @@ static cudaError_t symcopy(const void *sym, void *host, size_t n, size_t off, en
         return ret(cudaErrorInvalidValue);
     d += off;
     if (kind == cudaMemcpyDeviceToDevice || (kind == cudaMemcpyDefault && memtype(host) == 2)) {
-        if (to)
-            return ret(async ? hw.MemcpyDtoDAsync(d, DP(host), n, s) : hw.MemcpyDtoD(d, DP(host), n));
-        return ret(async ? hw.MemcpyDtoDAsync(DP(host), d, n, s) : hw.MemcpyDtoD(DP(host), d, n));
+        if (!to)
+            return ret(async ? hw.MemcpyDtoDAsync(DP(host), d, n, s) : hw.MemcpyDtoD(DP(host), d, n));
+        e = async ? hw.MemcpyDtoDAsync(d, DP(host), n, s) : hw.MemcpyDtoD(d, DP(host), n);
+    } else {
+        if (!to)
+            return ret(async ? hw.MemcpyDtoHAsync(host, d, n, s) : hw.MemcpyDtoH(host, d, n));
+        e = async ? hw.MemcpyHtoDAsync(d, host, n, s) : hw.MemcpyHtoD(d, host, n);
     }
-    if (to)
-        return ret(async ? hw.MemcpyHtoDAsync(d, host, n, s) : hw.MemcpyHtoD(d, host, n));
-    return ret(async ? hw.MemcpyDtoHAsync(host, d, n, s) : hw.MemcpyDtoH(host, d, n));
+    if (!e) /* a __constant__ object: the kernels' copies too */
+        e = hw_symbol_sync((const char *)sym + off, n, async, s);
+    return ret(e);
 }
 
 cudaError_t cudaMemcpyToSymbol(const void *sym, const void *src, size_t n, size_t off, enum cudaMemcpyKind kind)

@@ -309,6 +309,7 @@ void ptx_reset(void);
 int ptx_active(void);
 u32 ptx_module(Obj *o);
 void ptx_shared(u32 sym, u64 size, u32 align, int ext);
+void ptx_constant(u32 sym); /* CUDA: sym is a __constant__ object (constant memory: .const, ld.const) */
 void ptx_gen(Func *f, Obj *o, int entry);
 extern u32 ptx_maxntid; /* of the kernel ptx_gen is about to write: the threads of a block at most, 0: not stated */
 u32 ptx_next_needed(void);

@@ -741,6 +741,8 @@ static u32 sym_obj(Sym *s)
             O->syms[s->objsym].trap = 1;
         if (s->is_tls) /* (also when only declared: an -flto object names it from its IR, with no TLS relocation to say so) */
             O->syms[s->objsym].kind = 3;
+        if (opt_cuda && (s->aflags & AT_CONSTANT) && s->kind == SK_VAR && s->ty && s->ty->kind != TY_FUNC)
+            ptx_constant(s->objsym);
         sym_align(s->objsym, s->ty);
         if (buf != tmp)
             free(buf);
@@ -9258,6 +9260,8 @@ static void sym_attrs(Sym *s, const Attr *a, int is_inline, int storage)
         O->syms[s->objsym].trap = 1;
     if ((s->aflags & AT_WEAK) && !s->local && s->objsym != NOSYM)
         O->syms[s->objsym].weak = 1; /* the symbol was made by an earlier use */
+    if (opt_cuda && (s->aflags & AT_CONSTANT) && s->objsym != NOSYM && s->kind == SK_VAR && s->ty && s->ty->kind != TY_FUNC)
+        ptx_constant(s->objsym); /* (made by an earlier use) */
 }
 
 static int declaration(int file_scope)

@@ -44,6 +44,8 @@ static u32 *kernsyms, nkern, capkern; /* the unit's kernels */
 static u32 nhost, caphost;
 static PShared *shared;
 static u32 nshared, capshared;
+static u32 *constsyms; /* the unit's __constant__ objects: .const in the PTX, read by ld.const */
+static u32 nconst, capconst;
 static u32 modsym = 0xffffffffU;
 static u32 *need;      /* called functions that still want a body or a declaration */
 static u32 nneed, capneed;
@@ -91,7 +93,7 @@ static void BP(Buf *b, const char *fmt, ...)
 void ptx_reset(void)
 {
     body.len = 0;
-    nsigs = nhost = nshared = nneed = nkern = 0;
+    nsigs = nhost = nshared = nneed = nkern = nconst = 0;
     modsym = 0xffffffffU;
 }
 
@@ -146,6 +148,28 @@ static int is_shared(u32 sym)
     u32 k;
     for (k = 0; k < nshared; k++)
         if (shared[k].sym == sym)
+            return 1;
+    return 0;
+}
+
+void ptx_constant(u32 sym)
+{
+    u32 k;
+    for (k = 0; k < nconst; k++)
+        if (constsyms[k] == sym)
+            return;
+    if (nconst == capconst) {
+        capconst = capconst ? capconst * 2 : 16;
+        constsyms = (u32 *)xrealloc(constsyms, capconst * sizeof(u32));
+    }
+    constsyms[nconst++] = sym;
+}
+
+static int is_constsym(u32 sym)
+{
+    u32 k;
+    for (k = 0; k < nconst; k++)
+        if (constsyms[k] == sym)
             return 1;
     return 0;
 }
@@ -403,7 +427,9 @@ static const char *ropnd(u32 v)
 
 static int special_of(u32 sym);
 static int is_shared(u32 sym);
+static int is_constsym(u32 sym);
 static void host_ref(u32 sym);
+static u8 *cn_s; /* the value is an address in the .const space (cn_find) */
 static u8 *ause;
 static u8 *xlate; /* a 32-bit number made wider that a wide product reads as it was, where the product is */
 
@@ -420,6 +446,13 @@ static const char *addr_const(u32 v)
     } else {
         if (is_shared(i->a)) {
             P("\tmov.u64 %s, %s;\n\tcvta.shared.u64 %s, %s;\n", t, pname(i->a), t, t);
+        } else if (is_constsym(i->a)) {
+            /* constant memory: the address in the .const space where only ld.const reads it (cn_find), else the generic one */
+            host_ref(i->a);
+            if (cn_s && cn_s[v])
+                P("\tmov.u64 %s, %s;\n", t, pname(i->a));
+            else
+                P("\tmov.u64 %s, %s;\n\tcvta.const.u64 %s, %s;\n", t, pname(i->a), t, t);
         } else {
             host_ref(i->a);
             P("\tmov.u64 %s, %s;\n", t, pname(i->a));
@@ -1224,6 +1257,88 @@ static const char *lc_addr(const char *a)
     return out;
 }
 
+/* ---- constant memory ----
+   An address worked out from a __constant__ object's (plus or minus whole numbers, one of several that all are) is
+   one in the .const space when every reader is a load through it or such a sum: those loads are ld.const (LDC, an
+   operand from the constant bank, as nvcc's) and the addresses stay in the .const space. One that goes anywhere
+   else (a call, a store of the pointer, a comparison, a copy) makes all the addresses it is joined with generic
+   (cvta.const) and their loads plain ld. */
+static void cn_find(Func *f)
+{
+    u32 v, k, n, *p;
+    int changed;
+    u8 *esc;
+    memset(cn_s, 0, f->nins + 1);
+    if (!nconst)
+        return;
+    for (v = 1; v < f->nins; v++)
+        if (f->ins[v].op == OP_ADDR && is_constsym(f->ins[v].a) && special_of(f->ins[v].a) < 0)   /* (addresses float: no block) */
+            cn_s[v] = 1;
+    do {
+        changed = 0;
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            int is = 0;
+            if (cn_s[v] || !i->blk || i->ty != IT_I64)
+                continue;
+            if (i->op == OP_ADD)
+                is = !cn_s[RV(i->a)] != !cn_s[RV(i->b)];
+            else if (i->op == OP_SUB)
+                is = cn_s[RV(i->a)] && !cn_s[RV(i->b)];
+            else if (i->op == OP_SELECT)
+                is = cn_s[RV(i->b)] && cn_s[RV(i->c)] && !cn_s[RV(i->a)];
+            else if (i->op == OP_PHI && i->b) {
+                is = 1;
+                for (k = 0; k < i->b; k++)
+                    is &= cn_s[RV(f->xargs[i->a + k])];
+            }
+            if (is) {
+                cn_s[v] = 1;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    esc = (u8 *)xmalloc((size_t)f->nins + 1);
+    memset(esc, 0, f->nins + 1);
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        if (!i->blk || i->op == OP_ADDR)
+            continue;
+        IR_OPS(f, i, p, n);
+        for (k = 0; k < n; k++) {
+            u32 x = RV(p[k]);
+            int ok;
+            if (!x || x >= f->nins || !cn_s[x])
+                continue;
+            ok = (i->op == OP_LOAD && p + k == &i->a) ||
+                 (cn_s[v] && (i->op == OP_ADD || i->op == OP_SUB || i->op == OP_PHI || (i->op == OP_SELECT && p + k != &i->a)));
+            if (!ok)
+                esc[x] = 1;
+        }
+    }
+    /* a generic address anywhere in a joined set makes the whole set generic */
+    do {
+        changed = 0;
+        for (v = 1; v < f->nins; v++) {
+            Ins *i = &f->ins[v];
+            if (!cn_s[v] || i->op == OP_ADDR)
+                continue;
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++) {
+                u32 x = RV(p[k]);
+                if (!x || x >= f->nins || !cn_s[x] || esc[x] == esc[v])
+                    continue;
+                esc[x] = esc[v] = 1;
+                changed = 1;
+            }
+        }
+    } while (changed);
+    for (v = 1; v < f->nins; v++)
+        if (esc[v])
+            cn_s[v] = 0;
+    free(esc);
+}
+
 /* (a pointer that is one of several is of global memory when the others are, or are null: a null arm is
    neutral, level 2) */
 #define GL_LEVEL(x) (f->ins[x].op == OP_CONST && !f->ins[x].a && !f->ins[x].b ? 2 : gl_s[x])
@@ -1878,6 +1993,10 @@ static void emit_ins(u32 v)
         }
         if ((a = local_maddr(i->a)) != 0) {
             P("\tld.local.%s %s, [%s];\n", lt[i->mem], reg(v), a);
+            return;
+        }
+        if (cn_s && cn_s[RV(i->a)]) {
+            P("\tld.const.%s %s, [%s];\n", lt[i->mem], reg(v), maddr(i->a));
             return;
         }
         a = maddr(i->a);
@@ -3473,6 +3592,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
         lc_s = (u8 *)xmalloc((size_t)f->nins + 1);
         lc_find(f);
     }
+    cn_s = (u8 *)xmalloc((size_t)f->nins + 1);
+    cn_find(f);
     gl_s = 0;
     if (entry && !opt_noglobal) {
         gl_s = (u8 *)xmalloc((size_t)f->nins + 1);
@@ -3665,6 +3786,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
     xc_name = 0;
     free(lc_s);
     lc_s = 0;
+    free(cn_s);
+    cn_s = 0;
     gl_s = 0;
     free(slotoff);
     free(byoff);
@@ -3727,10 +3850,11 @@ void ptx_finish(Obj *o)
         /* with its size and alignment when the declaration gave them: a run time that makes the object on a
            device needs both */
         ObjSym *hs = &o->syms[hostsyms[k]];
+        const char *sp = is_constsym(hostsyms[k]) ? "const" : "global";
         if (hs->dsize)
-            BP(&t, ".extern .global .align %u .b8 %s[%lu];\n", 1U << hs->align, pname(hostsyms[k]), (unsigned long)hs->dsize);
+            BP(&t, ".extern .%s .align %u .b8 %s[%lu];\n", sp, 1U << hs->align, pname(hostsyms[k]), (unsigned long)hs->dsize);
         else
-            BP(&t, ".extern .global .align 1 .b8 %s[];\n", pname(hostsyms[k]));
+            BP(&t, ".extern .%s .align 1 .b8 %s[];\n", sp, pname(hostsyms[k]));
     }
     /* (declared once, as the C library has it: the code may call it by name too) */
     BP(&t, ".extern .func (.param .b64 func_retval0) __mcuda_memcpy (.param .b64 __mcuda_memcpy_param_0, "

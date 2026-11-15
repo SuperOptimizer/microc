@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_norange, opt_nodivcse, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_norange, opt_shsym, opt_nocondrec, opt_nodivcse, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
 u32 ptx_maxntid;
@@ -640,6 +640,38 @@ static void sh_find(const u8 *live)
     sh_lows(live);
 }
 
+/* The shared symbols a function's addresses are made from, each in a register set once at its start: "mov.b32 r,
+   smem" is a cluster-window address, which ptxas makes with S2R SR_CgaCtaId and a LEA wherever it stands, and it did
+   not merge them (lp_s2: 5415 such movs; the GroupNorm bank select of lp_s2.cu:166 alone 480 S2R). Opt-in, MCC_SHSYM=1:
+   161 kernels ALL -6.8k, but ptxas then unrolls conv_fwd_s2_f8_k's tap loops into the z-step loop (554 -> 729 there);
+   the GPU A/B decides. */
+#define SHSYM_MAX 8
+static u32 shsym[SHSYM_MAX], nshsym;
+static char shsym_reg[SHSYM_MAX][16];
+
+static const char *sh_name(u32 v);
+
+static void sh_syms(void)
+{
+    u32 v, k;
+    nshsym = 0;
+    if (!sh_s || !opt_shsym)
+        return;
+    for (v = 1; v < PF->nins; v++) {
+        Ins *i = &PF->ins[v];
+        if (i->op != OP_ADDR || !sh_s[v] || !used[v])
+            continue;
+        for (k = 0; k < nshsym && shsym[k] != i->a; k++)
+            ;
+        if (k < nshsym || nshsym == SHSYM_MAX)
+            continue;
+        shsym[nshsym] = i->a;
+        strcpy(shsym_reg[nshsym], sh_name(v));
+        P("\tmov.b32 %s, %s;\n", shsym_reg[nshsym], pname(i->a));
+        nshsym++;
+    }
+}
+
 static const char *sh_name(u32 v)
 {
     char *s = obuf();
@@ -663,6 +695,16 @@ static const char *sh_low(u32 o)
         return s;
     }
     if (i->op == OP_ADDR && sh_s[o]) {
+        u32 k;
+        for (k = 0; k < nshsym && shsym[k] != i->a; k++)
+            ;
+        if (k < nshsym) { /* (the symbol's register, set once at the start: sh_syms) */
+            if (!i->b)
+                return shsym_reg[k];
+            t = temp(0);
+            P("\tadd.s32 %s, %s, %d;\n", t, shsym_reg[k], (int)(i32)i->b);
+            return t;
+        }
         t = temp(0);
         P("\tmov.b32 %s, %s;\n", t, pname(i->a));
         if (i->b)
@@ -3060,6 +3102,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
             P("\tmov.u32 %s, %s.z;\n\tst.u32 [%%SP+%u], %s;\n", tr, special_reg[k], special_off[k] + 8, tr);
         }
     /* (the addresses of locals and of global objects are worked out where they are read: addr_const) */
+    sh_syms();
     remat = 1;
 
     for (b = 1; b < nb; b++) {

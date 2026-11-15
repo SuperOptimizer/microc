@@ -6615,6 +6615,22 @@ static void cond_expr(Expr *e)
         e->konst = (u8)(kc && a.konst && b.konst);
         return;
     }
+    if (cur_fn_dev && !opt_nocondrec && type_is_record(t) && !VK(t) && !type_is_128(t) && type_size(t) <= 64) {
+        /* device code: a record chosen by ?: is copied into a temporary in each arm, not chosen by its address. The
+           address of one (a load from shared memory, a local made for make_float2(...)) left the local in memory and
+           every read a generic load through the chosen pointer; a copy is split into values (lp_s2.cu:166, the GroupNorm
+           bank of a plane: 10836 SASS instructions, nvcc 1186). MCC_NOCONDREC: the address */
+        slot = new_temp(t);
+        F->cur = ta;
+        emit_mem(OP_MEMCPY, slot, a.v, type_size(t), type_align(t));
+        ir_jmp(F, end);
+        F->cur = tbend;
+        emit_mem(OP_MEMCPY, slot, b.v, type_size(t), type_align(t));
+        ir_jmp(F, end);
+        F->cur = end;
+        set_expr(e, t, slot, 0);
+        return;
+    }
     if (t->kind != TY_VOID)
         slot = new_temp(type_is_record(t) ? type_ptr(t) : t);
     F->cur = ta;

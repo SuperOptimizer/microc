@@ -2169,6 +2169,8 @@ static void run_passes(Func *fn)
                 break;
         }
     }
+    if (opt_dev_fn && ptx_single_trip(f))
+        ir_resolve_all(f);
     if (simplify_cfg()) {
         int rounds = opt_level >= 3 ? 6 : 1;
         do {

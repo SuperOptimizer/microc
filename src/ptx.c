@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_norange, opt_noifasm, opt_shsym, opt_nocondrec, opt_nodivcse, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_norange, opt_nofastexp, opt_noifasm, opt_shsym, opt_nocondrec, opt_nodivcse, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
 u32 ptx_maxntid;
@@ -1082,6 +1082,25 @@ static const char *fast_tmpl(u32 v, const char *name, const char *tmpl)
     return "fma.rn.ftz.f32 $d, $0, $1, $2;";
 }
 
+/* -use_fast_math's exponentials and logarithms, as nvcc writes them (one MUFU op, an FMUL for the base): expf / __expf
+   ex2.approx(x log2 e), exp2f ex2.approx, logf / __logf lg2.approx(x) ln 2, log2f lg2.approx. Without this every call
+   went to the device library's accurate expf (41k calls in ufsm's PTX). MCC_NOFASTEXP: the library. */
+static const char *fast_libm(u32 v, const char *name)
+{
+    Ins *i = &PF->ins[v];
+    if (opt_nofastexp || i->ty != IT_F32 || i->b != 1)
+        return 0;
+    if (!strcmp(name, "expf"))
+        return "mul.ftz.f32 $d, $0, 0f3FB8AA3B; ex2.approx.ftz.f32 $d, $d;";
+    if (!strcmp(name, "exp2f"))
+        return "ex2.approx.ftz.f32 $d, $0;";
+    if (!strcmp(name, "logf"))
+        return "lg2.approx.ftz.f32 $d, $0; mul.ftz.f32 $d, $d, 0f3F317218;";
+    if (!strcmp(name, "log2f"))
+        return "lg2.approx.ftz.f32 $d, $0;";
+    return 0;
+}
+
 /* Writes a template, with $d, $0.. or %0.. replaced by operands. */
 static void expand(const char *t, char mark, const char *dst, const char **ops, u32 nops)
 {
@@ -1484,6 +1503,13 @@ static void emit_call(u32 v)
                 expand(opt_fastmath ? fast_tmpl(v, name, in->tmpl) : in->tmpl, '$', i->ty != IT_VOID ? reg(v) : "", args, i->b);
                 return;
             }
+        if (opt_fastmath && fast_libm(v, name)) {
+            if (!used[v])
+                return;
+            args[0] = opnd(PF->xargs[i->a]);
+            expand(fast_libm(v, name), '$', reg(v), args, 1);
+            return;
+        }
     }
     for (k = 0; k < i->b; k++) {
         ptys[k] = PF->ins[RV(PF->xargs[i->a + k])].ty;

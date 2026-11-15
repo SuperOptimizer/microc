@@ -715,6 +715,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             jobs = atoi(a + 2);
         else if (strncmp(a, "-finline-limit=", 15) == 0)
             opt_inline_limit = atoi(a + 15);
+        else if (strncmp(a, "-finline-hint=", 14) == 0)
+            opt_inline_hint = atoi(a + 14);
         else if (strcmp(a, "-nostdlib") == 0)
             nostdlib = 1;
         else if (strcmp(a, "-nostdinc") == 0)

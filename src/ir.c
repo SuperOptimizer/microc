@@ -607,6 +607,11 @@ static u64 umax_of(Func *f, u32 v, int depth)
     }
 }
 
+u64 ir_umax32(Func *f, u32 v)
+{
+    return umax_of(f, v, 4);
+}
+
 static u32 half_of(Func *f, u32 v, int high)
 {
     Ins *i = &f->ins[v];

@@ -921,7 +921,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_nolocal = getenv("MCC_NOLOCAL") != 0; /* PTX: the frame through generic [%SP] */
         opt_nored = getenv("MCC_NORED") != 0; /* PTX: atom for atomics whose old value is not read */
         opt_nonc = getenv("MCC_NONC") != 0; /* PTX: no ld.global.nc through const restrict kernel pointers */
-        opt_nolatch = getenv("MCC_NOLATCH") != 0; /* PTX: a loop's moves after its branch out, in a block of their own */
+        opt_nolatch = getenv("MCC_NOLATCH") != 0;
+        opt_norange = getenv("MCC_NORANGE") != 0; /* PTX: keep the sign corrections of divisions by a constant (range_fold) */ /* PTX: a loop's moves after its branch out, in a block of their own */
         opt_unrollpeel = getenv("MCC_UNROLLPEEL") != 0; /* #pragma unroll N: N copies, then a loop of one (before 11-14) */
         opt_nosplit = getenv("MCC_NOSPLIT") != 0;
         opt_noparamfwd = getenv("MCC_NOPARAMFWD") != 0;

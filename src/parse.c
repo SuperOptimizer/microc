@@ -183,6 +183,7 @@ static u32 rt_call(const char *name, Type *ret, Type *pt, u32 arg);
 static u32 new_temp(Type *t);
 static int vec_mem(Type *t);
 static int cur_fn_avx; /* the function being read has target("avx...") */
+static int lto_asm; /* -flto: the function being finished has inline assembly or is weak, so it is compiled, not saved as IR */
 static u32 xi_call(const char *name, int ty, u32 a, u32 b, u32 c, u32 n);
 static u32 h_round(u32 v);
 int opt_f16c;          /* x86-64: -mf16c, -march=...: _Float16 converts with vcvtph2ps / vcvtps2ph */
@@ -733,6 +734,8 @@ static u32 sym_obj(Sym *s)
             O->syms[s->objsym].weak = 1;
         if (s->aflags & AT_ERROR)
             O->syms[s->objsym].trap = 1;
+        if (s->is_tls) /* (also when only declared: an -flto object names it from its IR, with no TLS relocation to say so) */
+            O->syms[s->objsym].kind = 3;
         sym_align(s->objsym, s->ty);
         if (buf != tmp)
             free(buf);
@@ -11050,10 +11053,23 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         prof_instrument(F);
     else if (opt_prof_use)
         prof_apply(F, O->name);
+    lto_asm = 0;
     if (opt_lto && !opt_dump_ir) {
-        lto_save(F, O);
-        F = const_func;
-        return;
+        u32 v;
+        for (v = 1; v < F->nins && !lto_asm; v++)
+            lto_asm = F->ins[v].op == OP_CALL && (F->ins[v].flags & IF_ASM);
+        /* inline assembly lives in this unit's tables, not in the IR: such a function is compiled here and now, and
+           the link-time optimiser takes its code as it is. So is a weak definition: an object the optimiser does
+           not see (another compiler's, a library) may define the function for real, and the system's linker
+           chooses; the optimiser must neither inline the weak body nor drop it. */
+        if (s->aflags & AT_WEAK)
+            lto_asm = 1;
+        if (!lto_asm) {
+            if (!def_extern_inline) /* (gnu_inline extern inline: no definition here; calls go to the library's) */
+                lto_save(F, O);
+            F = const_func;
+            return;
+        }
     }
     if (opt_syntax_only) {
         F = const_func;
@@ -11079,7 +11095,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             F = const_func; /* its PTX is written at the end of the unit */
             return;
         }
-        if (opt_target != TARGET_LINUX || (!s->is_static && !def_extern_inline) || (s->aflags & AT_USED))
+        if (opt_target != TARGET_LINUX || (!s->is_static && !def_extern_inline) || (s->aflags & AT_USED) || lto_asm)
             lazy_generate(sym);
         F = const_func;
         return;

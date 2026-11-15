@@ -269,6 +269,56 @@ static void sys_temp(const char *out_path, Buf *obj)
     sys_obj(path);
 }
 
+/* Link-time optimisation before the system's linker (-flto objects carry their functions as IR in .mcc.ir, which
+   ld cannot read): every such object among the inputs is read back, lto_link merges and compiles them as one, and the
+   one object it gives takes the place of the first of them; objects of other compilers only say what must be kept
+   (their undefined symbols). MCC_LTO_TIME=1 prints how long it took. */
+static void sys_lto(const char *out_path, const char *entry)
+{
+    Obj **objs;
+    size_t n = 0, k, nir = 0, first = (size_t)-1;
+    u8 *isir;
+    int nkept = 0;
+    if (!nsys_objs || opt_arch != ARCH_X64)
+        return;
+    objs = (Obj **)xmalloc((size_t)nsys_objs * sizeof(Obj *));
+    isir = (u8 *)xmalloc((size_t)nsys_objs);
+    for (k = 0; k < (size_t)nsys_objs; k++) {
+        size_t len;
+        u8 *d = os_read_file(sys_objs[k], &len);
+        Obj *o = d ? elf_read_obj(sys_objs[k], d, len, 1) : 0;
+        isir[k] = o && o->sec[SEC_IR].len;
+        if (isir[k]) {
+            if (first == (size_t)-1)
+                first = k;
+            nir++;
+        } else if (d) {
+            o = elf_read_obj(sys_objs[k], d, len, 0); /* (only what it needs from the others) */
+        }
+        objs[n++] = o ? o : obj_new(sys_objs[k]);
+        free(d); /* (the object's sections are copies) */
+    }
+    if (nir) {
+        Buf out;
+        char *path = (char *)xmalloc(strlen(out_path) + 32);
+        lto_link(objs, &n, entry);
+        memset(&out, 0, sizeof out);
+        elf_write_obj(&out, objs[first]); /* (lto_link put its object where the first IR object was) */
+        sprintf(path, "%s.mcc%d.o", out_path, nsys_temps++);
+        os_write_file(path, out.p, out.len, 0);
+        buf_free(&out);
+        for (k = 0; k < (size_t)nsys_objs; k++) {
+            if (k == first)
+                sys_objs[nkept++] = path;
+            else if (!isir[k])
+                sys_objs[nkept++] = sys_objs[k];
+        }
+        nsys_objs = nkept;
+    }
+    free(isir);
+    free(objs);
+}
+
 /* x86-64 instruction set extensions the code may use (-mavx2, -march=...): what <immintrin.h> users test */
 enum { XF_SSE3 = 1, XF_SSSE3 = 2, XF_SSE41 = 4, XF_SSE42 = 8, XF_POPCNT = 16, XF_AVX = 32, XF_AVX2 = 64, XF_FMA = 128,
        XF_F16C = 256, XF_BMI = 512, XF_BMI2 = 1024 };
@@ -1075,8 +1125,11 @@ static int cc_main(const char *argv0, int argc, char **argv)
         return 0;
     if (!compile_only && sysroot) {
         /* for now the system's compiler driver does the link */
-        char **av = (char **)xmalloc((size_t)(nsys_objs + 2 * nlibdirs + nlibs + 20) * sizeof(char *));
+        char **av;
         int n = 0, code;
+        if (!relocatable)
+            sys_lto(out_path ? out_path : "a.out", entry ? entry : "main");
+        av = (char **)xmalloc((size_t)(nsys_objs + 2 * nlibdirs + nlibs + 20) * sizeof(char *));
         {
             /* MCC_CC: another driver for that, a full path (a machine with clang-22 and no cc) */
             const char *lcc = getenv("MCC_CC");

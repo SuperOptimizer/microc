@@ -1,6 +1,7 @@
 /* ELF relocatable object writer (aarch64, little endian, RELA). */
 #include "mcc.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 static void u16le(Buf *b, u32 v)
@@ -88,6 +89,8 @@ void elf_write_obj(Buf *out, Obj *o)
     u64 *relaoff;
     u64 symoff, stroff, shstroff, shoff;
     u32 symtab_idx, strtab_idx, shstr_idx, nsym, n_symtab, n_strtab, n_shstr, n_stack, stack_note;
+    u8 *irref; /* named by the IR section (-flto): kept as a symbol of its own even if local or anonymous, so that
+                  elf_read_obj gives the link-time optimiser the same symbols the compiler had */
 
     memset(&shstr, 0, sizeof shstr);
     memset(&str, 0, sizeof str);
@@ -95,6 +98,10 @@ void elf_write_obj(Buf *out, Obj *o)
     buf_u8(&shstr, 0);
     buf_u8(&str, 0);
     memset(used, 0, o->nsyms + 1);
+    irref = (u8 *)xmalloc(o->nsyms + 1);
+    memset(irref, 0, o->nsyms + 1);
+    for (k = 0; k < o->nrel[SEC_IR]; k++)
+        irref[o->rel[SEC_IR][k].sym] = 1;
     for (i = 0; i < nsec; i++)
         for (k = 0; k < o->nrel[i]; k++)
 {
@@ -172,7 +179,8 @@ void elf_write_obj(Buf *out, Obj *o)
                 ObjSym *s = &o->syms[k];
                 int defined = s->sec < 0xfff0, global = s->global || s->weak, bind, type;
                 u32 ndx;
-                if (!s->name || s->sec == SEC_NONE)
+                char anon[32];
+                if (s->sec == SEC_NONE || (!s->name && !irref[k]))
                     continue; /* anonymous: relocations use the section symbol */
                 if (s->sec == SEC_UNDEF) {
                     if (!used[k])
@@ -188,7 +196,9 @@ void elf_write_obj(Buf *out, Obj *o)
                 if (s->sec == SEC_UNDEF && used[k] == 2)
                     type = 6;
                 ndx = defined ? shndx[s->sec] : s->sec == SEC_COMMON ? 0xfff2 : 0;
-                buf_u32(&sym, str_add(&str, intern_str(s->name)));
+                if (!s->name)
+                    sprintf(anon, ".Lmcc.ir.%u", k);
+                buf_u32(&sym, str_add(&str, s->name ? intern_str(s->name) : anon));
                 buf_u8(&sym, (u32)(bind << 4 | type));
                 buf_u8(&sym, s->hidden ? 2 : 0);
                 u16le(&sym, ndx);
@@ -208,7 +218,8 @@ void elf_write_obj(Buf *out, Obj *o)
             ObjSym *s = &o->syms[r->sym];
             u32 si = symidx[r->sym];
             i64 addend = r->addend;
-            if (!si || (!s->global && !s->weak && s->sec < 0xfff0)) {
+            /* (in an object with IR every relocation names its symbol: the optimiser moves the functions) */
+            if (!si || (!o->sec[SEC_IR].len && !s->global && !s->weak && s->sec < 0xfff0)) {
                 /* a local: the section's symbol and where in it */
                 u32 j, n = 1;
                 if (s->sec >= 0xfff0)
@@ -306,6 +317,9 @@ void elf_write_obj(Buf *out, Obj *o)
             if (fl & SF_MERGE) ef |= 0x10;
             if (fl & SF_STRINGS) ef |= 0x20;
             if (fl & SF_TLS) ef |= 0x400;
+            if (i == SEC_IR)
+                ef |= 0x80000000u; /* SHF_EXCLUDE: a final link by the system's linker alone (no mcc driver: no sys_lto) drops the
+                                      IR and its relocations, which ld cannot resolve (R_X86_64_64 against printf@@GLIBC...); ld -r keeps it */
             buf_u32(out, shname[i]);
             buf_u32(out, type);
             buf_u64(out, ef);
@@ -387,8 +401,158 @@ void elf_write_obj(Buf *out, Obj *o)
     free(shndx);
     free(symidx);
     free(used);
+    free(irref);
     free(secoff);
     buf_free(&shstr);
     buf_free(&str);
     buf_free(&sym);
+}
+
+/* ---- reading an x86-64 ELF relocatable object back (link-time optimisation of -flto objects) ----
+   full: every section, symbol and relocation, as elf_write_obj wrote them (objects mcc made); otherwise only the names
+   the object needs from elsewhere (its undefined global symbols), which is all an object made by another compiler
+   contributes to the optimiser: what it must keep. 0 if the bytes are not such an object. */
+static u32 rd16(const u8 *p) { return (u32)p[0] | (u32)p[1] << 8; }
+
+static int x64_rel_kind(u32 t)
+{
+    switch (t) {
+    case 1: return R_ABS64;
+    case 2: return R_X64_PC32;
+    case 4: return R_X64_PLT32;
+    case 10: return R_X64_32;
+    case 11: return R_X64_32S;
+    case 12: return R_ABS16;
+    case 13: return R_PREL16;
+    case 15: return R_X64_PC8;
+    case 23: return R_X64_TPOFF32;
+    case 24: return R_PREL64;
+    }
+    return -1;
+}
+
+Obj *elf_read_obj(const char *name, const u8 *d, size_t len, int full)
+{
+    u64 shoff;
+    u32 shnum, shentsz, i, k, symsec = 0, nsyms, strsec;
+    const u8 *sh, *shstr, *symtab, *strtab;
+    u32 *secmap, *symmap;
+    Obj *o;
+#define SH(i) (d + shoff + (size_t)(i) * shentsz)
+    if (len < 64 || memcmp(d, "\177ELF\2\1", 6) != 0 || rd16(d + 16) != 1 || rd16(d + 18) != 62)
+        return 0;
+    shoff = get_u64le(d + 40);
+    shentsz = rd16(d + 58);
+    shnum = rd16(d + 60);
+    if (shentsz < 64 || shoff + (u64)shnum * shentsz > len || rd16(d + 62) >= shnum)
+        return 0;
+    sh = SH(rd16(d + 62));
+    shstr = d + get_u64le(sh + 24);
+    for (i = 1; i < shnum; i++)
+        if (get_u32le(SH(i) + 4) == 2) /* SHT_SYMTAB */
+            symsec = i;
+    if (!symsec)
+        return 0;
+    o = obj_new(name);
+    symtab = d + get_u64le(SH(symsec) + 24);
+    nsyms = (u32)(get_u64le(SH(symsec) + 32) / 24);
+    strsec = get_u32le(SH(symsec) + 40);
+    strtab = d + get_u64le(SH(strsec) + 24);
+    secmap = (u32 *)xmalloc((shnum + 1) * sizeof(u32));
+    symmap = (u32 *)xmalloc((nsyms + 1) * sizeof(u32));
+    for (i = 0; i < shnum; i++)
+        secmap[i] = SEC_NONE;
+    if (full) {
+        for (i = 1; i < shnum; i++) {
+            const u8 *h = SH(i);
+            u32 type = get_u32le(h + 4), fl = 0, idx;
+            u64 f = get_u64le(h + 8), size = get_u64le(h + 32), al = get_u64le(h + 48);
+            const char *sn = (const char *)shstr + get_u32le(h);
+            if (type != 1 && type != 8 && type != 7 && type != 14 && type != 15 && type != 0x70000001)
+                continue;
+            if (strcmp(sn, ".note.GNU-stack") == 0 || strncmp(sn, ".debug", 6) == 0 || strcmp(sn, ".eh_frame") == 0)
+                continue; /* (made again for the code the optimiser writes) */
+            if (f & 1) fl |= SF_WRITE;
+            if (f & 2) fl |= SF_ALLOC;
+            if (f & 4) fl |= SF_EXEC;
+            if (f & 0x10) fl |= SF_MERGE;
+            if (f & 0x20) fl |= SF_STRINGS;
+            if (f & 0x400) fl |= SF_TLS;
+            if (type == 8) fl |= SF_NOBITS;
+            if (strcmp(sn, ".mcc.ir") == 0)
+                idx = SEC_IR;
+            else if (strcmp(sn, ".text") == 0 || strcmp(sn, ".rodata") == 0 || strcmp(sn, ".data") == 0 || strcmp(sn, ".bss") == 0)
+                idx = (u32)obj_section(o, intern_cstr(sn), fl);
+            else
+                idx = (u32)obj_section_new(o, intern_cstr(sn), fl);
+            secmap[i] = idx;
+            o->align[idx] = al ? (u32)al : 1;
+            o->secent[idx] = (u32)get_u64le(h + 56);
+            if (type == 8)
+                o->sec[idx].len = (size_t)size;
+            else
+                buf_put(&o->sec[idx], d + get_u64le(h + 24), (size_t)size);
+        }
+    }
+    symmap[0] = 0xffffffffU;
+    for (k = 1; k < nsyms; k++) {
+        const u8 *e = symtab + (size_t)k * 24;
+        u32 nm = get_u32le(e), info = e[4], shndx = rd16(e + 6), bind = info >> 4, type = info & 15, sec, sy;
+        u64 value = get_u64le(e + 8), size = get_u64le(e + 16);
+        symmap[k] = 0xffffffffU;
+        if (!full) {
+            if (shndx == 0 && bind != 0 && nm && strtab[nm])
+                obj_add_sym(o, intern_cstr((const char *)strtab + nm), SEC_UNDEF, 0, 1);
+            continue;
+        }
+        if (type == 3) { /* a section's own symbol: relocations against the section */
+            if (shndx < shnum && secmap[shndx] != SEC_NONE)
+                symmap[k] = obj_add_sym(o, 0, (int)secmap[shndx], 0, 0);
+            continue;
+        }
+        if (type == 4) /* STT_FILE */
+            continue;
+        if (shndx == 0)
+            sec = SEC_UNDEF;
+        else if (shndx == 0xfff2)
+            sec = SEC_COMMON;
+        else if (shndx < shnum && secmap[shndx] != SEC_NONE)
+            sec = secmap[shndx];
+        else
+            continue;
+        sy = obj_add_sym(o, nm && strtab[nm] ? intern_cstr((const char *)strtab + nm) : 0, (int)sec, sec == SEC_COMMON ? size : value,
+                         bind == 1 || bind == 2);
+        o->syms[sy].weak = bind == 2;
+        o->syms[sy].hidden = (e[5] & 3) == 2;
+        o->syms[sy].kind = type == 2 ? 1 : type == 1 ? 2 : type == 6 ? 3 : 0;
+        o->syms[sy].size = sec == SEC_COMMON ? 0 : size;
+        if (sec == SEC_COMMON) {
+            u32 a = 0;
+            while (((u64)1 << a) < value && a < 30)
+                a++;
+            o->syms[sy].align = (u8)a;
+        }
+        symmap[k] = sy;
+    }
+    for (i = 1; full && i < shnum; i++) {
+        const u8 *h = SH(i);
+        u32 target = get_u32le(h + 44), n;
+        const u8 *r;
+        if (get_u32le(h + 4) != 4 || target >= shnum || secmap[target] == SEC_NONE)
+            continue; /* (SHT_RELA of a section that is kept) */
+        r = d + get_u64le(h + 24);
+        n = (u32)(get_u64le(h + 32) / 24);
+        for (k = 0; k < n; k++, r += 24) {
+            u64 info = get_u64le(r + 8);
+            u32 si = (u32)(info >> 32);
+            int t = x64_rel_kind((u32)info);
+            if (t < 0 || si >= nsyms || symmap[si] == 0xffffffffU)
+                die("%s: a relocation the link-time optimiser cannot read (type %u)", name, (u32)info);
+            obj_add_reloc(o, (int)secmap[target], (u32)get_u64le(r), t, symmap[si], (i64)get_u64le(r + 16));
+        }
+    }
+#undef SH
+    free(secmap);
+    free(symmap);
+    return o;
 }

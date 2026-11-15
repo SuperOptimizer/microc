@@ -95,13 +95,21 @@ static void dump(void)
     close(fd);
 }
 
+/* The first call of any function of a unit registers the unit's table. Threads may race here (ufsm's samplers start
+   many at once): the table is claimed by one of them, pushed onto the list without a lock, and dump() is registered
+   once. (The counters themselves are plain increments: under threads a few counts can be lost, which a profile can
+   afford.) */
+static int dump_set;
+
 void __mcc_prof_enter(word *d)
 {
-    if (d[0])
+    word *h;
+    if (__atomic_load_n(&d[0], __ATOMIC_ACQUIRE) || __atomic_exchange_n(&d[0], (word)1, __ATOMIC_ACQ_REL))
         return;
-    d[0] = 1;
-    d[1] = (word)head;
-    if (!head)
+    h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+    do
+        d[1] = (word)h;
+    while (!__atomic_compare_exchange_n(&head, &h, d, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    if (!__atomic_exchange_n(&dump_set, 1, __ATOMIC_ACQ_REL))
         atexit(dump);
-    head = d;
 }

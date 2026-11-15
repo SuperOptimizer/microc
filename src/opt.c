@@ -406,6 +406,40 @@ static u32 hoist_to(u32 o, u32 a, u32 b)
     return l;
 }
 
+/* gvn: the pure calls seen (IF_PURE), the latest of each kind last */
+#define PURE_CAP 64
+static u32 pure_tab[PURE_CAP], npure;
+
+static int pure_same(u32 x, u32 y)
+{
+    Ins *a = &f->ins[x], *b = &f->ins[y];
+    u32 k;
+    if (a->c != b->c || a->b != b->b || a->ty != b->ty || !b->blk)
+        return 0;
+    for (k = 0; k < a->b; k++)
+        if (ir_resolve(f, f->xargs[a->a + k]) != ir_resolve(f, f->xargs[b->a + k]))
+            return 0;
+    return 1;
+}
+
+static u32 pure_find(u32 v)
+{
+    u32 k;
+    for (k = npure; k-- > 0;)
+        if (pure_same(v, pure_tab[k]))
+            return pure_tab[k];
+    return 0;
+}
+
+static void pure_add(u32 v)
+{
+    if (npure == PURE_CAP) {
+        memmove(pure_tab, pure_tab + 1, (PURE_CAP - 1) * sizeof(u32));
+        npure--;
+    }
+    pure_tab[npure++] = v;
+}
+
 static void gvn(void)
 {
     u32 k, v, nx, n, j, mask;
@@ -439,6 +473,7 @@ static void gvn(void)
     }
     memset(vn_tab, 0, n * sizeof(u32));
     mask = n - 1; /* only this much of the table is in use for this function */
+    npure = 0;
 
     for (k = 0; k < nrpo; k++) {
         u32 b = rpo[k];
@@ -528,6 +563,18 @@ static void gvn(void)
                 mem_add(i->a, i->mem, i->b, 1);
                 continue;
             case OP_CALL:
+                if (i->flags & IF_PURE) {
+                    /* a math function of its arguments: memory is as it was, and an earlier call alike that
+                       dominates this one gave the same value */
+                    u32 o = pure_find(v);
+                    if (o && dominates(f->ins[o].blk, b))
+                        ir_replace(f, v, o);
+                    else
+                        pure_add(v);
+                    continue;
+                }
+                nmem = 0;
+                continue;
             case OP_MEMCPY:
             case OP_MEMZERO:
             case OP_VSTORE:

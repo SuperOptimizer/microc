@@ -2997,6 +2997,39 @@ static Sym *overload_pick(Sym *set, TArgs *given, Expr *av, u32 n, u32 loc)
     return best;
 }
 
+/* A C library math function whose result depends on its arguments alone: only errno is written, and not under
+   -fno-math-errno (these never set it). Two calls with the same arguments give the same value (clang: readnone). */
+static int pure_math_in(const char *n)
+{
+    static const char *const always[] = {"fabs", "floor", "ceil", "trunc", "round", "rint", "nearbyint", "copysign", "fmin", "fmax", 0};
+    static const char *const noerrno[] = {"sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
+                                          "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "pow",
+                                          "sqrt", "cbrt", "hypot", "erf", "erfc", "fmod", "remainder", 0};
+    int k;
+    for (k = 0; always[k]; k++)
+        if (strcmp(n, always[k]) == 0)
+            return 1;
+    if (opt_math_errno)
+        return 0;
+    for (k = 0; noerrno[k]; k++)
+        if (strcmp(n, noerrno[k]) == 0)
+            return 1;
+    return 0;
+}
+
+static int pure_math(const char *n)
+{
+    char base[16];
+    size_t len = strlen(n);
+    if (pure_math_in(n))
+        return 1;
+    if (len < 2 || len >= sizeof base || (n[len - 1] != 'f' && n[len - 1] != 'l'))
+        return 0;
+    memcpy(base, n, len - 1); /* sinf, sinl: sin */
+    base[len - 1] = 0;
+    return pure_math_in(base);
+}
+
 static void call(Expr *e)
 {
     Type *ft = e->ty, *ret;
@@ -3233,6 +3266,9 @@ static void call(Expr *e)
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
     v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? (vec_mem(ret) == M_V256 ? IT_V256 : IT_V128) : type_ir(ret), callee, args, nargs,
                 ft->variadic ? ft->nparams + (flags ? 1 : 0) : opt_arch == ARCH_X64 && ft->oldstyle ? nargs : 0xffffffffU, flags);
+    if (!flags && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && type_is_float(ret) && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && pure_math(intern_str(O->syms[F->ins[callee].a].name)))
+        F->ins[v].flags |= IF_PURE;
     if (!flags && vec_mem(ret)) {
         u32 tmp = new_temp(ret);
         ir_store(F, vec_mem(ret), tmp, v);
@@ -10783,6 +10819,8 @@ static LazyFn *lazy_fn(u32 sym)
     return &lazy[sym];
 }
 
+static u32 *defer_gen, ndefer_gen, capdefer_gen; /* functions to generate at the end of the unit, in order */
+
 static void lazy_generate(u32 sym)
 {
     u32 sec = lazy[sym].sec;
@@ -11104,8 +11142,18 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             F = const_func; /* its PTX is written at the end of the unit */
             return;
         }
-        if (opt_target != TARGET_LINUX || (!s->is_static && !def_extern_inline) || (s->aflags & AT_USED))
-            lazy_generate(sym);
+        if (opt_target != TARGET_LINUX || (!s->is_static && !def_extern_inline) || (s->aflags & AT_USED)) {
+            if (opt_arch == ARCH_X64 && opt_target == TARGET_LINUX && opt_level >= 2 && !lf->dev && !(s->aflags & AT_USED)) {
+                /* x86-64: at the end of the unit, when every call of each static function is known */
+                if (ndefer_gen == capdefer_gen) {
+                    capdefer_gen = capdefer_gen ? capdefer_gen * 2 : 64;
+                    defer_gen = (u32 *)xrealloc(defer_gen, capdefer_gen * sizeof(u32));
+                }
+                defer_gen[ndefer_gen++] = sym;
+            } else {
+                lazy_generate(sym);
+            }
+        }
         F = const_func;
         return;
     }
@@ -11401,6 +11449,28 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
     emit_deferred();
     if (opt_cuda && !opt_syntax_only && !opt_dump_ir)
         emit_ptx();
+    if (ndefer_gen) {
+        /* a static function called from one place only, whose address is used nowhere else, is inlined there
+           whatever its size (as clang does), and needs no code of its own */
+        u32 k, r, sec, n = O->nsyms, *calls = (u32 *)xmalloc((n + 1) * sizeof(u32));
+        u8 *esc = (u8 *)xmalloc(n + 1);
+        memset(calls, 0, (n + 1) * sizeof(u32));
+        memset(esc, 0, n + 1);
+        func_refs(calls, esc, n);
+        for (sec = 0; sec < O->nsec; sec++)
+            for (r = 0; r < O->nrel[sec]; r++)
+                if (O->rel[sec][r].sym < n)
+                    esc[O->rel[sec][r].sym] = 1;
+        for (k = 0; k < n && k < nlazy; k++)
+            if (calls[k] == 1 && !esc[k] && lazy[k].has && !lazy[k].done && !lazy[k].dev && !O->syms[k].global)
+                func_once(k);
+        free(calls);
+        free(esc);
+        for (k = 0; k < ndefer_gen; k++)
+            if (!lazy[defer_gen[k]].done)
+                lazy_generate(defer_gen[k]);
+        ndefer_gen = 0;
+    }
     if (opt_target == TARGET_LINUX) {
         u32 k;
         /* the targets of aliases are needed whether or not anything else uses them */

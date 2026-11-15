@@ -4070,6 +4070,17 @@ static int convert_x64(Expr *e, Type *vt)
     return 1;
 }
 
+/* a read-only vector constant of n bytes, aligned to its size (no load of it crosses a cache line) */
+static u32 vec_const_sym(const u8 *b, u32 n)
+{
+    u64 off = obj_reserve(O, SEC_CONST, n, n);
+    u32 sym;
+    buf_put(&O->sec[SEC_CONST], b, n);
+    sym = obj_add_sym(O, 0, SEC_CONST, off, 0);
+    O->syms[sym].dsize = n;
+    return sym;
+}
+
 /* the vector type of an intrinsic's operand or result */
 static Type *xt_type(int xt)
 {
@@ -4168,9 +4179,24 @@ static void x86_intrinsic(Expr *e, const char *name, u32 loc)
         break;
     case XK_SET:
     case XK_SETR: {
-        /* through memory: the lanes one by one, then the whole */
+        /* through memory: the lanes one by one, then the whole; all of them constants: read-only data */
         Type *et = xt_type(x->arg[0]);
         u64 es = type_size(et);
+        if (!xt_vec(x->arg[0]) && type_size(rt) <= 64) {
+            u8 b[64];
+            for (k = 0; k < n; k++) {
+                Ins *c = &F->ins[args[k]];
+                u64 bits = (u64)c->a | (u64)c->b << 32, j;
+                if (c->op != OP_CONST && c->op != OP_FCONST)
+                    break;
+                for (j = 0; j < es; j++)
+                    b[(u64)(x->kind == XK_SET ? n - 1 - k : k) * es + j] = (u8)(bits >> (8 * j));
+            }
+            if (k == n) {
+                v = ir_load(F, (int)rty, vec_memx(rt), ir_addr(F, vec_const_sym(b, (u32)type_size(rt)), 0));
+                break;
+            }
+        }
         tmp = new_temp(rt);
         for (k = 0; k < n; k++) {
             u32 at = ir_ins(F, OP_ADD, IT_I64, tmp, ir_const(F, IT_I64, (u64)(x->kind == XK_SET ? n - 1 - k : k) * es));

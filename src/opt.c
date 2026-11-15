@@ -994,6 +994,324 @@ static int forward_phi_blocks(void)
     return changed;
 }
 
+/* Jump threading through a block whose branch the incoming values decide. The test of an inlined function that
+   returns a truth value (if (!get(&r, n, &v)) ...: the callee's returns meet in a phi of constants) is the case:
+   each predecessor of block B knows which way B's branch goes, so it goes there directly, and B (phis, a few pure
+   instructions, the branch) disappears. Values B defines are used only in B, or (its phis) where its successors
+   dominate, which get them through a new phi of the predecessors that now come to them (or the one value when one
+   does), or as the arguments of the successors' own phis on B's edge. Not for a loop's head. MCC_NOJT: off. */
+static int opt_nojt = -1;
+
+static int jt_eval(int op, int ty, u64 a, u64 b, u64 *r)
+{
+    u64 v;
+    int w32 = ty == IT_I32;
+    i64 sa = w32 ? (i64)(i32)a : (i64)a, sb = w32 ? (i64)(i32)b : (i64)b;
+    u64 ua = w32 ? (u32)a : a, ub = w32 ? (u32)b : b;
+    switch (op) {
+    case OP_ADD: v = a + b; break;
+    case OP_SUB: v = a - b; break;
+    case OP_AND: v = a & b; break;
+    case OP_OR: v = a | b; break;
+    case OP_XOR: v = a ^ b; break;
+    case OP_NOT: v = ~a; break;
+    case OP_EQ: v = ua == ub; break;
+    case OP_NE: v = ua != ub; break;
+    case OP_SLT: v = sa < sb; break;
+    case OP_SLE: v = sa <= sb; break;
+    case OP_SGT: v = sa > sb; break;
+    case OP_SGE: v = sa >= sb; break;
+    case OP_ULT: v = ua < ub; break;
+    case OP_ULE: v = ua <= ub; break;
+    case OP_UGT: v = ua > ub; break;
+    case OP_UGE: v = ua >= ub; break;
+    case OP_ZEXT8: v = a & 0xff; break;
+    case OP_ZEXT16: v = a & 0xffff; break;
+    case OP_SEXT8: v = (u64)(i64)(signed char)a; break;
+    case OP_SEXT16: v = (u64)(i64)(short)a; break;
+    case OP_ZEXT32: v = (u32)a; break;
+    case OP_SEXT32: v = (u64)(i64)(i32)a; break;
+    case OP_TRUNC: v = a; break;
+    default: return 0;
+    }
+    if (w32 || op == OP_TRUNC)
+        v = (u64)(i64)(i32)v;
+    *r = v;
+    return 1;
+}
+
+/* the block a use is in: a phi's argument k is used at the end of predecessor k */
+static int jt_used_ok(u32 x, u32 B, u32 S1, u32 S2, int s1d, int s2d, u32 *nin)
+{
+    u32 bi, v, k, n, *ops;
+    for (bi = 1; bi < f->nblk; bi++) {
+        Block *ub = &f->blk[bi];
+        if (ub->term == TERM_NONE)
+            continue;
+        for (v = ub->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                if (ir_resolve(f, f->xargs[f->ins[v].a + k]) == x) {
+                    u32 at = ub->preds[k];
+                    if (at == B && (bi == S1 || bi == S2))
+                        continue; /* through B's edge into a successor's phi */
+                    if (rpo_num[at] == 0xffffffffU || at == B)
+                        return 0;
+                    if (!((s1d && dominates(S1, at)) || (s2d && dominates(S2, at))))
+                        return 0;
+                    ++*nin;
+                }
+        for (v = ub->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            int hit = 0;
+            IR_OPS(f, i, ops, n);
+            for (k = 0; k < n; k++)
+                if (ir_resolve(f, ops[k]) == x)
+                    hit = 1;
+            if (i->op == OP_CALL && ir_resolve(f, i->c) == x)
+                hit = 1;
+            if (!hit)
+                continue;
+            if (bi == B)
+                continue;
+            if (rpo_num[bi] == 0xffffffffU || !((s1d && dominates(S1, bi)) || (s2d && dominates(S2, bi))))
+                return 0;
+            ++*nin;
+        }
+        if (ub->arg && ir_resolve(f, ub->arg) == x && bi != B) {
+            if (rpo_num[bi] == 0xffffffffU || !((s1d && dominates(S1, bi)) || (s2d && dominates(S2, bi))))
+                return 0;
+            ++*nin;
+        }
+    }
+    return 1;
+}
+
+/* replace x by r in the blocks S dominates (phi arguments: by the edge's predecessor) */
+static void jt_rewrite(u32 x, u32 S, u32 r)
+{
+    u32 bi, v, k, n, *ops;
+    for (bi = 1; bi < f->nblk; bi++) {
+        Block *ub = &f->blk[bi];
+        if (ub->term == TERM_NONE || rpo_num[bi] == 0xffffffffU)
+            continue;
+        for (v = ub->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                if (ir_resolve(f, f->xargs[f->ins[v].a + k]) == x && rpo_num[ub->preds[k]] != 0xffffffffU &&
+                    dominates(S, ub->preds[k]))
+                    f->xargs[f->ins[v].a + k] = r;
+        if (!dominates(S, bi))
+            continue;
+        for (v = ub->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            IR_OPS(f, i, ops, n);
+            for (k = 0; k < n; k++)
+                if (ir_resolve(f, ops[k]) == x)
+                    ops[k] = r;
+            if (i->op == OP_CALL && ir_resolve(f, i->c) == x)
+                i->c = r;
+        }
+        if (ub->arg && ir_resolve(f, ub->arg) == x)
+            ub->arg = r;
+    }
+}
+
+#define JT_MAXP 16
+#define JT_MAXI 8
+static int jump_thread(void)
+{
+    u32 B, v, k, j;
+    int changed = 0;
+    if (opt_nojt < 0)
+        opt_nojt = getenv("MCC_NOJT") != 0;
+    if (opt_nojt || opt_dev_fn || opt_cuda)
+        return 0;
+    compute_dom();
+    for (B = 2; B < f->nblk; B++) {
+        Block *bb = &f->blk[B];
+        u32 S[2], np = bb->npreds, to[JT_MAXP], body[JT_MAXI], nb = 0, phis[JT_MAXI * 2], nphi = 0, cnt[2] = {0, 0};
+        u64 val[JT_MAXI];
+        int ok = 1, sd[2];
+        if (bb->term != TERM_BR || rpo_num[B] == 0xffffffffU || np < 2 || np > JT_MAXP || !bb->phis)
+            continue;
+        S[0] = bb->succ[0];
+        S[1] = bb->succ[1];
+        if (S[0] == S[1] || S[0] == B || S[1] == B || S[0] == 1 || S[1] == 1)
+            continue;
+        for (v = bb->first; v && ok; v = f->ins[v].next) {
+            if (nb == JT_MAXI || !is_pure(f->ins[v].op) || (f->ins[v].ty != IT_I32 && f->ins[v].ty != IT_I64))
+                ok = 0;
+            else
+                body[nb++] = v;
+        }
+        for (v = bb->phis; v && ok; v = f->ins[v].next)
+            if (nphi == JT_MAXI * 2)
+                ok = 0;
+            else
+                phis[nphi++] = v;
+        /* the branch must depend on the phis through the body only, and each predecessor must decide it */
+        for (k = 0; k < np && ok; k++) {
+            u32 p = bb->preds[k], c = ir_resolve(f, bb->arg), m;
+            u64 cv = 0;
+            Block *pb = &f->blk[p];
+            if (p == B || rpo_num[p] == 0xffffffffU || dominates(B, p) || (pb->term != TERM_JMP && pb->term != TERM_BR))
+                ok = 0;
+            for (j = 0; j < k && ok; j++)
+                if (bb->preds[j] == p)
+                    ok = 0;
+            if (pb->term == TERM_BR && (pb->succ[0] == S[0] || pb->succ[0] == S[1] || pb->succ[1] == S[0] || pb->succ[1] == S[1]))
+                ok = 0;
+            if (!ok)
+                break;
+            for (m = 0; m < nb && ok; m++) {
+                Ins *i = &f->ins[body[m]];
+                u32 *ops, n, q;
+                u64 a[3] = {0, 0, 0};
+                IR_OPS(f, i, ops, n);
+                if (n > 2) {
+                    ok = 0;
+                    break;
+                }
+                for (q = 0; q < n && ok; q++) {
+                    u32 o = ir_resolve(f, ops[q]), t;
+                    int found = 0;
+                    if (f->ins[o].op == OP_PHI && f->ins[o].blk == B)
+                        o = ir_resolve(f, f->xargs[f->ins[o].a + k]);
+                    for (t = 0; t < m; t++)
+                        if (body[t] == o) {
+                            a[q] = val[t];
+                            found = 1;
+                        }
+                    if (!found && !ir_is_const(f, o, &a[q]))
+                        ok = 0;
+                }
+                if (ok && !jt_eval(i->op, i->ty, a[0], a[1], &val[m]))
+                    ok = 0;
+            }
+            if (!ok)
+                break;
+            for (m = 0; m < nb; m++)
+                if (body[m] == c)
+                    break;
+            if (m < nb) {
+                cv = val[m];
+            } else if (f->ins[c].op == OP_PHI && f->ins[c].blk == B) {
+                if (!ir_is_const(f, ir_resolve(f, f->xargs[f->ins[c].a + k]), &cv))
+                    ok = 0;
+            } else {
+                ok = 0;
+            }
+            to[k] = cv ? 0 : 1;
+            cnt[to[k]]++;
+        }
+        if (!ok)
+            continue;
+        sd[0] = f->blk[S[0]].npreds == 1;
+        sd[1] = f->blk[S[1]].npreds == 1;
+        for (j = 0; j < 2 && ok; j++) {
+            u32 nq = 0;
+            for (v = f->blk[S[j]].phis; v; v = f->ins[v].next)
+                nq++;
+            if (nq > 64)
+                ok = 0;
+        }
+        /* the body's values: only in B */
+        for (k = 0; k < nb && ok; k++) {
+            u32 nin = 0;
+            ok = jt_used_ok(body[k], B, S[0], S[1], 0, 0, &nin);
+        }
+        for (k = 0; k < nb && ok; k++) {
+            /* (nor in the successors' phis) */
+            for (j = 0; j < 2 && ok; j++)
+                for (v = f->blk[S[j]].phis; v; v = f->ins[v].next) {
+                    u32 bi2 = pred_index(S[j], B);
+                    if (bi2 != 0xffffffffU && ir_resolve(f, f->xargs[f->ins[v].a + bi2]) == body[k])
+                        ok = 0;
+                }
+        }
+        for (k = 0; k < nphi && ok; k++) {
+            u32 nin = 0;
+            ok = jt_used_ok(phis[k], B, S[0], S[1], sd[0], sd[1], &nin);
+        }
+        if (!ok)
+            continue;
+        /* each successor: the predecessors that now come to it, its phis' arguments for them, and B's phis in what it
+           dominates */
+        for (j = 0; j < 2; j++) {
+            u32 s = S[j], bi = pred_index(s, B), first = 1, old[64], orig[64], nold = 0, q;
+            if (!cnt[j])
+                continue;
+            for (q = f->blk[s].phis; q && nold < 64; q = f->ins[q].next) {
+                orig[nold] = ir_resolve(f, f->xargs[f->ins[q].a + bi]); /* (B's edge, before it is rewritten) */
+                old[nold++] = q;
+            }
+            if (sd[j]) {
+                for (k = 0; k < nphi; k++) {
+                    u32 x = phis[k], r = 0;
+                    if (cnt[j] == 1) {
+                        for (v = 0; v < np; v++)
+                            if (to[v] == j)
+                                r = ir_resolve(f, f->xargs[f->ins[x].a + v]);
+                    } else {
+                        r = ir_raw(f, OP_PHI, f->ins[x].ty, 0, 0);
+                        for (v = 0; v < np; v++)
+                            if (to[v] == j)
+                                ir_phi_add_arg(f, r, ir_resolve(f, f->xargs[f->ins[x].a + v]));
+                        f->ins[r].blk = s;
+                        f->ins[r].next = f->blk[s].phis;
+                        f->blk[s].phis = r;
+                    }
+                    jt_rewrite(x, s, r);
+                }
+            }
+            /* the successor's own phis: B's edge becomes one per predecessor that comes */
+            for (v = 0; v < np; v++) {
+                u32 p = bb->preds[v], t;
+                if (to[v] != j)
+                    continue;
+                if (first) {
+                    f->blk[s].preds[bi] = p;
+                    for (t = 0; t < nold; t++) {
+                        u32 a = orig[t];
+                        if (f->ins[a].op == OP_PHI && f->ins[a].blk == B)
+                            a = ir_resolve(f, f->xargs[f->ins[a].a + v]);
+                        f->xargs[f->ins[old[t]].a + bi] = a;
+                    }
+                    first = 0;
+                } else {
+                    ir_add_pred(f, s, p);
+                    for (t = 0; t < nold; t++) {
+                        u32 a = orig[t];
+                        if (f->ins[a].op == OP_PHI && f->ins[a].blk == B)
+                            a = ir_resolve(f, f->xargs[f->ins[a].a + v]);
+                        ir_phi_add_arg(f, old[t], a);
+                    }
+                }
+                for (q = 0; q < 2; q++)
+                    if (f->blk[p].succ[q] == B && (q == 0 || f->blk[p].term == TERM_BR))
+                        f->blk[p].succ[q] = s;
+            }
+        }
+        for (j = 0; j < 2; j++)
+            if (!cnt[j])
+                remove_edge(B, S[j]);
+        /* B is gone */
+        bb = &f->blk[B];
+        for (v = bb->phis; v; v = f->ins[v].next)
+            f->ins[v].op = OP_NOP;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            f->ins[v].op = OP_NOP;
+            f->ins[v].blk = 0;
+        }
+        bb->phis = bb->first = bb->last = 0;
+        bb->term = TERM_NONE;
+        bb->arg = 0;
+        bb->npreds = 0;
+        changed = 1;
+        compute_dom();
+    }
+    return changed;
+}
+
 /* How many times each value is used, as things stand now. */
 static u32 *count_uses(u32 *nuses)
 {
@@ -1026,6 +1344,8 @@ static int simplify_cfg(void)
     u32 b, v, k;
     int changed = forward_phi_blocks(), again;
     u32 *uses = 0, nuses = 0;
+    if (opt_arch == ARCH_X64 && opt_level >= 2 && jump_thread())
+        changed = 1;
 
     do {
         again = 0;

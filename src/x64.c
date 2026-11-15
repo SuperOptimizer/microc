@@ -1146,6 +1146,8 @@ static u32 vec_mem_operand(u32 u)
             return r[0];
         return 0;
     }
+    if (fused[u] == FUSE_FMA || (fma_sum && fma_sum[u]))
+        return 0; /* (in a vfmadd: its operands are registers) */
     if (is_vec(x->ty) && ir_opcount(f, u) == 2 && vec_op_enc(x->op, x->mem) && x->a != x->b)
         return x->b;
     return 0;
@@ -1410,7 +1412,24 @@ static void sel_avx(u32 v)
     case OP_SELECT:
         sel_avx_more(v);
         return;
+    case OP_FMUL:
+        if (fused[v] == FUSE_FMA)
+            return; /* in its user's vfmadd */
+        goto binop;
+    case OP_FADD:
+    case OP_FSUB:
+        if (fused[i->a] == FUSE_FMA || fused[i->b] == FUSE_FMA) { /* (-ffp-contract) as the scalar a * b + c: one rounding */
+            int left = fused[i->a] == FUSE_FMA;
+            Ins *p = &f->ins[left ? i->a : i->b];
+            u32 c2 = left ? i->b : i->a;
+            /* (packed: vfmadd213ps / pd a8, vfmsub213 aa, vfnmadd213 ac; the scalar forms are one above) */
+            emit_vex(VE(op == OP_FADD ? 0xa8 : left ? 0xaa : 0xac, 2, 1, i->mem == M_F64) | L, XF_FMA, d, reg_of(p->a), reg_of(p->b),
+                     reg_of(c2), -1);
+            return;
+        }
+        goto binop;
     default:
+    binop:
         enc = vec_op_enc(op, i->mem);
         if (!enc) {
             if ((op >= OP_EQ && op <= OP_UGE) || (op >= OP_FEQ && op <= OP_FGE)) {
@@ -2001,9 +2020,26 @@ static void sel_vec(u32 v)
     case OP_AND: vbin(d, VP66 | 0xdb, ra, rb, 1); return;
     case OP_OR: vbin(d, VP66 | 0xeb, ra, rb, 1); return;
     case OP_XOR: vbin(d, VP66 | 0xef, ra, rb, 1); return;
-    case OP_FADD: vbin(d, (n == 8 ? VP66 : O_0F) | 0x58, ra, rb, 1); return;
-    case OP_FSUB: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5c, ra, rb, 0); return;
-    case OP_FMUL: vbin(d, (n == 8 ? VP66 : O_0F) | 0x59, ra, rb, 1); return;
+    case OP_FADD:
+    case OP_FSUB:
+        if (fused[i->a] == FUSE_FMA || fused[i->b] == FUSE_FMA) { /* (-ffp-contract) as the scalar a * b + c: one rounding */
+            int left = fused[i->a] == FUSE_FMA;
+            Ins *p = &f->ins[left ? i->a : i->b];
+            u32 c2 = left ? i->b : i->a, L = i->ty == IT_V512 ? VE_Z : i->ty == IT_V256 ? VE_L : 0;
+            u32 opc = i->op == OP_FADD ? 0xa8 : left ? 0xaa : 0xac; /* (packed) */
+            emit_vex(VE(opc, 2, 1, n == 8) | L, XF_FMA, d, reg_of(p->a), reg_of(p->b), reg_of(c2), -1);
+            return;
+        }
+        if (i->op == OP_FADD)
+            vbin(d, (n == 8 ? VP66 : O_0F) | 0x58, ra, rb, 1);
+        else
+            vbin(d, (n == 8 ? VP66 : O_0F) | 0x5c, ra, rb, 0);
+        return;
+    case OP_FMUL:
+        if (fused[v] == FUSE_FMA)
+            return; /* in its user's vfmadd */
+        vbin(d, (n == 8 ? VP66 : O_0F) | 0x59, ra, rb, 1);
+        return;
     case OP_FDIV: vbin(d, (n == 8 ? VP66 : O_0F) | 0x5e, ra, rb, 0); return;
     case OP_VSMAX: case OP_VSMIN: case OP_VUMAX: case OP_VUMIN:
         if (fl) { /* maxps maxpd minps minpd (-ffast-math reductions) */
@@ -3000,12 +3036,16 @@ static void prepare(void)
         for (v = f->blk[layout[k]].first; v; v = f->ins[v].next) {
             Ins *i = &f->ins[v];
             u32 side;
-            if ((i->op != OP_FADD && i->op != OP_FSUB) || (i->ty != IT_F32 && i->ty != IT_F64))
+            int vf = (i->ty == IT_V128 || i->ty == IT_V256 || i->ty == IT_V512) && (i->mem == M_F32 || i->mem == M_F64);
+            if ((i->op != OP_FADD && i->op != OP_FSUB) || (i->ty != IT_F32 && i->ty != IT_F64 && !vf))
                 continue;
+            /* (vector lanes too: a vectorised loop rounds a * b + c as its scalar remainder and the same loop left scalar do,
+               once; 2026-11-15 ufsm sample.c: write_x's vectorised noise row and write_x_ct's scalar gather of the same
+               ia * v + ib + isg * n differed in an fp16 ulp, test_gpu_input 411 cases) */
             for (side = 0; side < 2; side++) {
                 u32 u = side ? i->b : i->a;
                 Ins *p = &f->ins[u];
-                if (p->op == OP_FMUL && p->ty == i->ty && uses[u] == 1 && !fused[u] && p->blk && i->a != i->b) {
+                if (p->op == OP_FMUL && p->ty == i->ty && (!vf || p->mem == i->mem) && uses[u] == 1 && !fused[u] && p->blk && i->a != i->b) {
                     fused[u] = FUSE_FMA;
                     fma_sum[v] = 1;
                     break;

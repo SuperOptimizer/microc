@@ -121,6 +121,34 @@ static u32 ranges_join(u32 a, u32 b)
     return h;
 }
 
+/* The union of two range lists that do not intersect, as a new list (both stay as they are). */
+static u32 ranges_union(u32 a, u32 b)
+{
+    u32 h = 0, *link = &h, r, x;
+    while (a || b) {
+        if (a && (!b || rg_start[a] < rg_start[b])) {
+            x = a;
+            a = rg_next[a];
+        } else {
+            x = b;
+            b = rg_next[b];
+        }
+        if (nrg == caprg) {
+            caprg = caprg * 2;
+            rg_start = (u32 *)xrealloc(rg_start, caprg * sizeof(u32));
+            rg_end = (u32 *)xrealloc(rg_end, caprg * sizeof(u32));
+            rg_next = (u32 *)xrealloc(rg_next, caprg * sizeof(u32));
+        }
+        r = nrg++;
+        rg_start[r] = rg_start[x];
+        rg_end[r] = rg_end[x];
+        rg_next[r] = 0;
+        *link = r;
+        link = &rg_next[r];
+    }
+    return h;
+}
+
 /* Do the remaining ranges of a (from ra) and b (from rb) intersect? */
 static int intersects(u32 ra, u32 rb)
 {
@@ -713,6 +741,62 @@ void ra_run(MFunc *m, const MTarget *t)
         while (same[r] != r)
             r = same[r];
         m->loc[v] = m->loc[r];
+    }
+
+    /* Spill slots shared: the two sides of a copy that both went to memory, and are never live at once, get one
+       slot, so the copy goes (a value promoted in a loop, its phi and the value round the loop each in a slot of
+       its own were a load and a store per copy per trip). The copies in the innermost loops first. */
+    if (m->nspill > 1 && !getenv("MCC_NOSLOTCO")) {
+        u32 ns = m->nspill, *sroot = NEW(u32, ns), *shead = NEW(u32, ns), *renum = NEW(u32, ns), nn = 0;
+        u8 *scls = NEW(u8, ns);
+        for (k = 0; k < ns; k++) {
+            sroot[k] = k;
+            shead[k] = 0;
+            scls[k] = 0xff;
+            renum[k] = NOREG;
+        }
+        for (v = 0; v < nv; v++)
+            if (same[v] == v && head[v] && m->loc[v] != NOREG && m->loc[v] >= SPILL0) {
+                u32 sl = m->loc[v] - SPILL0;
+                shead[sl] = shead[sl] ? ranges_union(shead[sl], head[v]) : head[v];
+                scls[sl] = m->vclass[v];
+            }
+        for (dp = 6; dp >= 0; dp--)
+            for (b = 0; b < m->nblk; b++) {
+                MBlock *mb = &m->blk[b];
+                if (depth[b] != dp)
+                    continue;
+                for (i = mb->first; i < mb->first + mb->n; i++) {
+                    MIns *in = &m->ins[i];
+                    u32 x, y;
+                    if (in->op != t->move_op || in->d == NOREG || in->d < VREG0 || in->s0 == NOREG || in->s0 < VREG0)
+                        continue;
+                    x = m->loc[in->d - VREG0];
+                    y = m->loc[in->s0 - VREG0];
+                    if (x == NOREG || y == NOREG || x < SPILL0 || y < SPILL0)
+                        continue;
+                    x -= SPILL0;
+                    y -= SPILL0;
+                    while (sroot[x] != x)
+                        x = sroot[x];
+                    while (sroot[y] != y)
+                        y = sroot[y];
+                    if (x == y || scls[x] != scls[y] || scls[x] == 0xff || intersects(shead[x], shead[y]))
+                        continue;
+                    shead[x] = ranges_union(shead[x], shead[y]);
+                    sroot[y] = x;
+                }
+            }
+        for (v = 0; v < nv; v++)
+            if (m->loc[v] != NOREG && m->loc[v] >= SPILL0) {
+                u32 sl = m->loc[v] - SPILL0;
+                while (sroot[sl] != sl)
+                    sl = sroot[sl];
+                if (renum[sl] == NOREG)
+                    renum[sl] = nn++;
+                m->loc[v] = SPILL0 + renum[sl];
+            }
+        m->nspill = nn;
     }
 
 #undef BIT

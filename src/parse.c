@@ -4567,9 +4567,14 @@ static int builtin(Expr *e)
         /* values no constant in the language's own notation gives */
         double zero = 0, big = 1e300, val;
         Type *ft = b[strlen(b) - 1] == 'f' && strcmp(b, "inf") != 0 ? ty_float : ty_double;
-        val = b[0] == 'n' ? zero / zero : big * big;
-        if (b[0] == 'n' && val < 0)
-            val = -val; /* the quiet one with the sign clear */
+        val = big * big;
+        if (b[0] == 'n') {
+            /* the quiet NaN with the sign clear, as gcc and clang make it (0 / 0 on x86-64 is the negative one, and
+               no comparison tells the two apart, so its sign cannot be tested for) */
+            u64 bits = (u64)0x7ff8 << 48;
+            memcpy(&val, &bits, sizeof val);
+            (void)zero;
+        }
         next();
         expect(T_LPAREN);
         while (tok.kind == T_STR)

@@ -14,7 +14,7 @@ $CC -DRT_TEST_ENGINE $inc -o $T/rt_test $S/rt_test.c $D/linux/cuda/lib/libmcuda.
 pass=0; fail=0
 for t in $tests; do
     if [ -f $S/$t.cu ]; then
-        $CC $CU -c $S/$t.cu -o $T/$t.o 2> $T/$t.cerr && $CC -o $T/$t $T/$t.o -L$D/cuda/lib64 -lcudart -lcublasLt -lstdc++ 2>> $T/$t.cerr ||
+        $CC $CU $(sed -n '1s|^// mcc: ||p' $S/$t.cu) -c $S/$t.cu -o $T/$t.o 2> $T/$t.cerr && $CC -o $T/$t $T/$t.o -L$D/cuda/lib64 -lcudart -lcublasLt -lstdc++ 2>> $T/$t.cerr ||
             { echo "FAIL $t (build): $T/$t.cerr"; fail=$((fail + 1)); continue; }
         (cd $T && timeout 600 ./$t > $t.out 2> $t.err)
     elif [ $t = rt_test ]; then (cd $T && timeout 600 ./rt_test > rt_test.out 2> rt_test.err)

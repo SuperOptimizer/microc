@@ -3379,8 +3379,11 @@ static void select_all(void)
         mb->first = mf.n;
         mb->freq = bb->freq;
         /* constants and addresses already in registers stay usable in a
-           block entered only from the block just before it */
-        if (!(k > 0 && bb->npreds == 1 && bb->preds[0] == layout[k - 1]))
+           block entered only from the block just before it, unless that one ended in an and / or of comparisons
+           (FUSE_BR2): its later comparisons materialised theirs after the branches out of it, which this block
+           may be one of */
+        if (!(k > 0 && bb->npreds == 1 && bb->preds[0] == layout[k - 1] &&
+              !(f->blk[layout[k - 1]].term == TERM_BR && fused[f->blk[layout[k - 1]].arg] == FUSE_BR2)))
             cur_blk = b;
         if (k == 0) {
             if (va_slot != NOSLOT) {

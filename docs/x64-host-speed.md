@@ -54,7 +54,7 @@ clang -O3 -march=native -ffast-math -fno-finite-math-only -ffp-contract=fast.
 4. Smaller items: no shlx / shrx (variable shifts pin rcx), no induction-variable widening (movslq per iteration), jumps to
    jumps (relax() does not thread them), and the callee-saved registers are saved even on early exits.
 
-## Changes (each with a kill switch; gate green: tests/c in all variants, -g, -march=native, thr, as, abi, self-host)
+## Round 1 changes (each with a kill switch; gate green: tests/c in all variants, -g, -march=native, thr, as, abi, self-host)
 
 | branch | what | kill switch | ufsm effect |
 |---|---|---|---|
@@ -70,9 +70,139 @@ Whole CPU suite against main, 2 reps, outputs compared (pass / fail of every lin
 - with jthread as well (r3): total -2.9 %, geometric mean -1.9 %. test_label_versions and test_gt_gate fail: the opt_vec bug
   below shows up in vll_encode once the frame moves. At -O2 (no vectoriser) jthread passes them.
 
-## Open bug found on the way (mcc-vec)
+## Search-loop bug (fixed by mcc-scalar)
 
-An early-exit search loop, `for (i = 1; i < n; i++) if (b[i] != b[0]) break;`, is vectorised as `vsum i32 v0`: no load, no
-compare, so it sums leftover xmm0 contents. volcomp's lossless encoder has two such loops (vll_encode, vll_encode_block), so
-an mcc build can write corrupt chunks. Whether it does depends on the frame layout. Repro: /vesuvius/ufsm/microc/host/repro/vsum_v0.c
-(main -O3: 4080 instead of 112).
+An early-exit search loop, `for (i = 1; i < n; i++) if (b[i] != b[0]) break;`, was vectorised as `vsum i32 v0`: no load and no
+compare, so it summed whatever was left in xmm0. volcomp's lossless encoder has two such loops (vll_encode, vll_encode_block),
+so an mcc build could write corrupt chunks, depending on the frame layout. Repro: /vesuvius/ufsm/microc/host/repro/vsum_v0.c
+(main -O3: 4080 instead of 112). Fixed in microc 384e827 (vsearchfix-20261115, mcc-scalar; regression test tests/c/vsearch2).
+
+## Round 2 (2026-11-15, drain)
+
+All numbers below are on ufsm master a580a6c. The base is vsearchfix-20261115 ("vsf"), because main has the search-loop bug.
+
+| branch | state | ufsm effect (min of 5 unless noted) |
+|---|---|---|
+| jthread3-20261115 (a398d66) = jthread2 (my threading on vsf) + mcc-scalar's thread2-20261114 | gate green; handed to microc2. It replaces jthread-20261115 and thread2-20261114 | full CPU suite vsf vs jthread2, 2 reps: pass / fail identical (the same 6 lines fail on both builds), total -1.1 %. zcache 61.3 / 55.5 / 53.8 G cycles (base / jthread2 / +thread2), 341 / 286 / 276 G instructions; volcomp_fast 38.1 / 37.0 / 37.0; crush -4.5 %, scrollaug -3.4 % |
+| wip-purelicm-20261115 | gate green; WIP (no full-suite run) | a pure math call with loop-invariant arguments leaves the loop when every trip runs it. Instructions: reg -0.3 %, wind_sampler -0.1 %. The extra atan2 time in wind_sampler is the same number of calls each taking longer, not extra calls |
+| wip-edgew-20261115 | gate green; WIP (mixed) | layout weights a branch edge into a block of several predecessors by flow (b - other way), and relax threads a jump to a jump. Min of 3: papyrus 2.10 -> 1.49 G cycles (-29 %), eval -1 %, votes -2 %, but zcache +3.5 % instructions (+2 % cycles). Next step: bisect with MCC_NOEDGEW / MCC_NOJJ |
+
+Other findings:
+- Binary size (477 MB per mcc test binary vs 68 MB with clang): 461 MB of it is uncompressed PTX text in .rodata (168 modules,
+  159 distinct). Host .text is smaller under mcc (9.3 vs 10.3 MB in test_ink_pool). zstd -3 shrinks the rodata to 73 MB in
+  0.3 s. Handed to testspeed (link / embed side).
+- Small tests with the worst ratios are fixture loops: papyrus (6-deep brute-force min / max with an invariant `continue`;
+  clang unswitches it), eval / votes (dilation references; the uint8 stores alias the n[] bounds, so their loads stay inside
+  the loop; layout as in edgew).
+- Left to others: register allocation (live-range splitting, remat, slot sharing: mcc-scalar's rasplit / slotco) and scalar
+  loops clang vectorises (mcc-vec). These are the main remaining gap.
+
+## Appendix: every CPU-suite line, clang vs mcc main 475ac78 (round 1, G cycles, min of 3)
+
+| test | clang | mcc | mcc / clang | note |
+|---|---|---|---|---|
+| test_afv | 0.012 | 0.005 | 0.45 | |
+| test_annot | 0.075 | 0.112 | 1.49 | |
+| test_aug_preset | 0.322 | 0.523 | 1.62 | |
+| test_checkpoint_runtime | 0.005 | 0.004 | 0.99 | |
+| test_ckring | 0.005 | 0.005 | 0.99 | |
+| test_codes_grid | 0.140 | 0.096 | 0.68 | |
+| test_coreline | 0.763 | 1.117 | 1.46 | |
+| test_cover | 0.006 | 0.006 | 0.99 | |
+| test_ct_augment | 0.202 | 0.269 | 1.33 | |
+| test_dcache_batch | 0.177 | 0.269 | 1.52 | |
+| test_dcache_cap | 0.043 | 0.043 | 1.00 | |
+| test_dcache_phase | 11.171 | 11.700 | 1.05 | |
+| test_dino_pts | 0.067 | 0.104 | 1.54 | |
+| test_edt | 2.192 | 2.532 | 1.15 | |
+| test_eval | 1.618 | 4.057 | 2.51 | |
+| test_faces | 0.169 | 0.193 | 1.14 | |
+| test_fblend | 0.158 | 0.128 | 0.81 | mcc fails |
+| test_fiberjudge | 0.549 | 0.950 | 1.73 | |
+| test_fiber_link | 0.010 | 0.004 | 0.36 | |
+| test_fibertrace | 0.802 | 0.907 | 1.13 | |
+| test_fibertrace_dyad | 3.308 | 3.686 | 1.11 | |
+| test_fields_pack | 1.743 | 3.254 | 1.87 | |
+| test_fields_phase | 0.212 | 0.255 | 1.20 | mcc fails |
+| test_fit_dir | 20.572 | 25.138 | 1.22 | |
+| test_fit_emb | 21.525 | 31.482 | 1.46 | |
+| test_flatten | 12.079 | 19.328 | 1.60 | |
+| test_formats | 0.006 | 0.006 | 1.03 | clang fails mcc fails |
+| test_fuse | 0.174 | 0.275 | 1.59 | |
+| test_geom_check | 2.442 | 4.186 | 1.71 | |
+| test_gn_ema_avg | 0.075 | 0.014 | 0.19 | |
+| test_gns | 9.460 | 11.384 | 1.20 | |
+| test_gpuq | 0.857 | 0.844 | 0.98 | |
+| test_gt_gate | 0.323 | 0.462 | 1.43 | |
+| test_http_reader | 0.228 | 0.220 | 0.96 | clang fails mcc fails |
+| test_imgops | 0.043 | 0.037 | 0.86 | |
+| test_ingest_lut | 0.126 | 0.126 | 1.00 | clang fails mcc fails |
+| test_ink_blend | 0.096 | 0.097 | 1.01 | clang fails mcc fails |
+| test_ink_gate | 0.512 | 0.858 | 1.67 | mcc fails |
+| test_ink_pool | 1.295 | 2.123 | 1.64 | |
+| test_jpegpar | 2.077 | 3.135 | 1.51 | |
+| test_json | 0.069 | 0.100 | 1.45 | |
+| test_label_versions | 1.008 | 1.456 | 1.44 | |
+| test_mcc_compile | 0.005 | 0.005 | 1.02 | |
+| test_mgpu_lint | 10.261 | 10.028 | 0.98 | |
+| test_optcheck | 0.003 | 0.003 | 1.01 | |
+| test_pairacc | 1.029 | 1.168 | 1.13 | |
+| test_patchid | 19.541 | 25.669 | 1.31 | |
+| test_patchsolve | 1.069 | 1.146 | 1.07 | |
+| test_phase_check | 0.050 | 0.071 | 1.41 | |
+| test_phaselab | 0.619 | 0.928 | 1.50 | |
+| test_phasepack | 1.967 | 3.267 | 1.66 | |
+| test_podscripts | 0.016 | 0.016 | 1.00 | |
+| test_pyports | 0.089 | 0.031 | 0.35 | |
+| test_raster | 25.032 | 32.771 | 1.31 | |
+| test_recto | 1.875 | 2.462 | 1.31 | |
+| test_reg | 32.778 | 45.122 | 1.38 | |
+| test_reg_render | 2.687 | 3.934 | 1.46 | |
+| test_regz2 | 0.011 | 0.012 | 1.08 | |
+| test_render_absent | 0.021 | 0.024 | 1.15 | |
+| test_render_fill | 0.092 | 0.154 | 1.67 | mcc fails |
+| test_render_known | 0.877 | 0.682 | 0.78 | mcc fails |
+| test_render_stream | 11.330 | 16.305 | 1.44 | |
+| test_repair | 72.618 | 105.022 | 1.45 | |
+| test_replay_lean | 4.598 | 6.586 | 1.43 | |
+| test_retain | 0.322 | 0.323 | 1.01 | |
+| test_run_suite | 0.808 | 0.807 | 1.00 | |
+| test_sample_ops | 1.127 | 2.906 | 2.58 | |
+| test_sampler_safety | 0.091 | 0.088 | 0.98 | clang fails mcc fails |
+| test_scan_augment | 1.800 | 4.069 | 2.26 | |
+| test_score_par | 55.967 | 62.919 | 1.12 | |
+| test_seamless | 0.656 | 0.638 | 0.97 | clang fails mcc fails |
+| test_sheetcut | 0.048 | 0.042 | 0.89 | |
+| test_sheetpbr | 5.641 | 6.975 | 1.24 | |
+| test_sheetscore | 0.366 | 0.534 | 1.46 | |
+| test_side | 0.585 | 0.715 | 1.22 | |
+| test_sources_json | 0.010 | 0.010 | 1.04 | |
+| test_spatial_augment~part0of3 | 19.524 | 30.053 | 1.54 | |
+| test_spatial_augment~part1of3 | 30.892 | 57.841 | 1.87 | |
+| test_spatial_augment~part2of3 | 23.361 | 30.212 | 1.29 | |
+| test_sslstat | 0.005 | 0.015 | 3.11 | |
+| test_stitch | 2.243 | 2.909 | 1.30 | |
+| test_strip | 18.641 | 28.843 | 1.55 | |
+| test_stripdistort | 1.065 | 1.129 | 1.06 | |
+| test_surf | 1.419 | 1.599 | 1.13 | |
+| test_surflabels | 120.680 | 158.815 | 1.32 | mcc fails |
+| test_sysinfo | 0.006 | 0.006 | 1.00 | |
+| test_tfx | 2.933 | 6.657 | 2.27 | |
+| test_tiffw | 0.044 | 0.037 | 0.84 | |
+| test_typed_zarr | 3.114 | 5.577 | 1.79 | |
+| test_unroll_qa | 3.689 | 4.345 | 1.18 | |
+| test_uw_fixed_point | 0.079 | 0.015 | 0.19 | |
+| test_volcomp | 0.006 | 0.010 | 1.57 | |
+| test_volcomp_fast | 22.127 | 39.014 | 1.76 | |
+| test_votes | 1.546 | 4.405 | 2.85 | |
+| test_vwt_sample | 0.075 | 0.014 | 0.19 | |
+| test_wbench_stats | 0.388 | 0.062 | 0.16 | |
+| test_winauto | 0.003 | 0.003 | 1.02 | |
+| test_wind | 0.520 | 0.742 | 1.43 | |
+| test_wrap_check | 0.463 | 0.535 | 1.16 | |
+| test_wraprepair | 4.787 | 7.345 | 1.53 | |
+| test_wraps_core | 5.063 | 6.556 | 1.29 | |
+| test_wrapsnap | 5.512 | 9.281 | 1.68 | |
+| test_z3_autosub | 1.817 | 2.482 | 1.37 | |
+| test_z3_sink | 4.117 | 7.082 | 1.72 | |
+| test_zarr | 0.005 | 0.005 | 0.90 | |

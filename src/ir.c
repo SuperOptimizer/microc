@@ -1067,6 +1067,44 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
             }
             return ir_fconst(f, ty, d);
         }
+        if (!opt_dev_fn && !opt_dev_parse && (ty == IT_F32 || ty == IT_F64)) {
+            /* identities: exact for every x (NaNs, infinities, zeros of either sign) unless said otherwise */
+            int ca = ir_is_fconst(f, a, &dx), cb = ir_is_fconst(f, b, &dy);
+            int nb = cb && dy == 0 && 1 / dy < 0, pb = cb && dy == 0 && 1 / dy > 0;
+            if ((op == OP_FADD && (nb || (pb && opt_no_signed_zeros))) || (op == OP_FSUB && (pb || (nb && opt_no_signed_zeros))))
+                return a; /* x + -0, x - +0 (x + +0, x - -0: -fno-signed-zeros) */
+            if (op == OP_FADD && ca && dx == 0 && (1 / dx < 0 || opt_no_signed_zeros))
+                return b;
+            if (op == OP_FSUB && ca && dx == 0 && (1 / dx < 0 || opt_no_signed_zeros))
+                return ir_ins(f, OP_FNEG, ty, b, 0); /* -0 - x (0 - x: -fno-signed-zeros) */
+            if ((op == OP_FMUL || op == OP_FDIV) && cb && (dy == 1.0 || dy == -1.0))
+                return dy == 1.0 ? a : ir_ins(f, OP_FNEG, ty, a, 0);
+            if (op == OP_FMUL && ca && (dx == 1.0 || dx == -1.0))
+                return dx == 1.0 ? b : ir_ins(f, OP_FNEG, ty, b, 0);
+            if (op == OP_FDIV && cb && dy == dy && dy != 0 && dy - dy == 0) {
+                /* x / c as x * (1 / c): exactly the same when c and 1 / c are both normal powers of two of the
+                   type; any c under -freciprocal-math */
+                double r = 1.0 / dy;
+                u64 bc, br;
+                int exact;
+                if (ty == IT_F32) {
+                    float fc = (float)dy, fr = (float)r;
+                    u32 xc, xr;
+                    memcpy(&xc, &fc, 4);
+                    memcpy(&xr, &fr, 4);
+                    exact = !(xc & 0x7fffff) && !(xr & 0x7fffff) && (xc >> 23 & 0xff) && (xc >> 23 & 0xff) != 0xff &&
+                            (xr >> 23 & 0xff) && (xr >> 23 & 0xff) != 0xff;
+                    r = fr;
+                } else {
+                    memcpy(&bc, &dy, 8);
+                    memcpy(&br, &r, 8);
+                    exact = !(bc & (((u64)1 << 52) - 1)) && !(br & (((u64)1 << 52) - 1)) && (bc >> 52 & 0x7ff) && (bc >> 52 & 0x7ff) != 0x7ff &&
+                            (br >> 52 & 0x7ff) && (br >> 52 & 0x7ff) != 0x7ff;
+                }
+                if (exact || (opt_reciprocal_math && r - r == 0 && r != 0))
+                    return ir_ins(f, OP_FMUL, ty, a, ir_fconst(f, ty, r));
+            }
+        }
         if (op == OP_FMUL && !opt_dev_fn && !opt_dev_parse) {
             /* twice x is x + x, exactly, and an addition is quicker */
             if (ir_is_fconst(f, a, &dx) && dx == 2.0)

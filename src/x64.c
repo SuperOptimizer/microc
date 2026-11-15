@@ -139,11 +139,13 @@ static u32 *vuses;     /* ... of them as a value (not the condition of a branch 
 #define FUSE_BR2 10  /* an and / or of comparisons that only decides a branch: one conditional branch per comparison */
 #define BR2_MAX 8     /* (at most so many comparisons) */
 #define FUSE_DIVR 11 /* quotient or remainder that an earlier division of the same operands in its block also gave */
+#define FUSE_FMA 12  /* a product that its one user, a sum or difference, takes into one vfmadd (-ffp-contract) */
 static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk);
 static u32 div_pair(u32 v, int first);
 #define FUSE_NOT 0x80 /* while counting uses: the value is used as a value */
 #define LOAD_SIGNED32 10 /* access kind, here only: a 32-bit load that sign-extends to 64 bits */
 static u8 *fused;
+static u8 *fma_sum; /* per IR value: a sum or difference that takes its product into a vfmadd */
 static u32 *cache_reg; /* per floating IR value: register holding it ... */
 static u32 *cache_blk; /* ... in this block */
 static u32 cur_blk;
@@ -830,6 +832,7 @@ static void sel_atomic(u32 v)
         emit(X_MOV, 1, d, RAX, NOREG);
 }
 
+int opt_x64_fma;
 int opt_math_errno = 1; /* sqrt of a negative number sets errno (as the C library's does): not done in line; -fno-math-errno */
 
 /* A call of one of the mathematical library's functions that one instruction does: in line. A function of that name
@@ -1064,6 +1067,9 @@ static MIns *emit_vex(u32 enc, int form, u32 d, u32 s0, u32 s1, u32 s2, int imm8
 
 /* the internal form of a test: reg = s0, rm = s1, nothing written but the flags */
 #define XF_TEST 8
+/* ... and of -ffp-contract's vfmadd: d = s0 * s1 + s2 by a 213 encoding; the product commutes, so the 231 form (d the
+   addend) or either factor in d's place saves the move */
+#define XF_FMA 9
 
 /* May the r/m operand of VEX instruction enc be memory? Not for the mask moves (the memory form is no instruction) nor
    for vmovhlps / vmovlhps (whose memory forms are other instructions). */
@@ -2056,9 +2062,25 @@ static void sel_ins(u32 v)
         }
         op = X_IMUL;
         goto binary;
-    case OP_FADD: op = X_FADD; goto binary;
-    case OP_FSUB: op = X_FSUB; goto binary;
-    case OP_FMUL: op = X_FMUL; goto binary;
+    case OP_FADD:
+    case OP_FSUB:
+        if (fused[i->a] == FUSE_FMA || fused[i->b] == FUSE_FMA) {
+            /* (-ffp-contract) a * b + c in one rounding: the 213 form, d = s1 * s0 + s2 with s0 first in d */
+            int left = fused[i->a] == FUSE_FMA, dbl = i->ty == IT_F64;
+            Ins *p = &f->ins[left ? i->a : i->b];
+            u32 c2 = left ? i->b : i->a;
+            /* a*b + c: vfmadd (a9); a*b - c: vfmsub (ab); c - a*b: vfnmadd (ad) */
+            u32 opc = i->op == OP_FADD ? 0xa9 : left ? 0xab : 0xad;
+            emit_vex(VE(opc, 2, 1, dbl), XF_FMA, d, reg_of(p->a), reg_of(p->b), reg_of(c2), -1);
+            return;
+        }
+        op = i->op == OP_FADD ? X_FADD : X_FSUB;
+        goto binary;
+    case OP_FMUL:
+        if (fused[v] == FUSE_FMA)
+            return; /* in its user's vfmadd */
+        op = X_FMUL;
+        goto binary;
     case OP_FDIV: op = X_FDIV; goto binary;
     binary: {
         u32 ra;
@@ -2884,6 +2906,29 @@ static void prepare(void)
         if (uses[v] && f->ins[v].blk && (op == OP_TRUNC || (op == OP_ZEXT32 && clean32(f->ins[f->ins[v].a].op))))
             fused[v] = FUSE_ALIAS;
     }
+    /* -ffp-contract with FMA: a product used only by a sum or difference is rounded with it, in one vfmadd */
+    free(fma_sum);
+    fma_sum = 0;
+    if (opt_fp_contract && opt_x64_fma) {
+        fma_sum = (u8 *)xmalloc(f->nins);
+        memset(fma_sum, 0, f->nins);
+    }
+    for (k = 0; opt_fp_contract && opt_x64_fma && k < nlayout; k++)
+        for (v = f->blk[layout[k]].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 side;
+            if ((i->op != OP_FADD && i->op != OP_FSUB) || (i->ty != IT_F32 && i->ty != IT_F64))
+                continue;
+            for (side = 0; side < 2; side++) {
+                u32 u = side ? i->b : i->a;
+                Ins *p = &f->ins[u];
+                if (p->op == OP_FMUL && p->ty == i->ty && uses[u] == 1 && !fused[u] && p->blk && i->a != i->b) {
+                    fused[u] = FUSE_FMA;
+                    fma_sum[v] = 1;
+                    break;
+                }
+            }
+        }
     /* cache_reg doubles as a count of each value's uses as a memory address */
     memset(cache_reg, 0, f->nins * sizeof(u32));
     for (k = 0; k < nlayout; k++)
@@ -3055,7 +3100,7 @@ static void prepare(void)
                 if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_AND || op == OP_OR || op == OP_XOR ||
                     (op >= OP_FADD && op <= OP_FDIV)) {
                     int commut = op != OP_SUB && op != OP_FSUB && op != OP_FDIV;
-                    if (full && !fused[u] && x->ty == i->ty && (x->b == v || commut) &&
+                    if (full && !fused[u] && !(fma_sum && fma_sum[u]) && x->ty == i->ty && (x->b == v || commut) &&
                         fused[x->a == v ? x->b : x->a] != FUSE_LOAD && /* one memory operand each */
                         !const_of(x->a == v ? x->b : x->a, &c))
                         ok = 1;
@@ -4215,6 +4260,35 @@ static void enc_vex(MIns *i)
         ra = xuse(i->s0, 0);
         rm = xuse(i->s1, 1);
         vex_rr(enc, ra, NOREG, rm);
+        break;
+    case XF_FMA:
+        dl = loc_of(i->d);
+        al = loc_of(i->s0);
+        bl = loc_of(i->s1);
+        cl = loc_of(i->s2);
+        if (!is_spill(dl) && dl == cl && dl != al && dl != bl) {
+            rv = xuse(i->s0, 1);
+            rm = xuse(i->s1, 2);
+            vex_rr(enc + 0x10, dl, rv, rm); /* 231: d = vvvv * rm + d */
+            dr = NOREG;
+            break;
+        }
+        if (!is_spill(dl) && (dl == al || dl == bl)) {
+            rv = xuse(dl == al ? i->s1 : i->s0, 1);
+            rm = xuse(i->s2, 2);
+            vex_rr(enc, dl, rv, rm); /* 213: d = vvvv * d + rm */
+            dr = NOREG;
+            break;
+        }
+        dr = is_spill(dl) || dl == cl ? FSCR0 : dl;
+        mov_locw(dr, al, vw_of(i->s0));
+        rv = xuse(i->s1, 1);
+        rm = xuse(i->s2, 2);
+        vex_rr(enc, dr, rv, rm);
+        if (dr == FSCR0 && !is_spill(dl)) {
+            vmov_rr(dl, dr, vw_of(i->d));
+            dr = NOREG;
+        }
         break;
     default:
         die("internal: x86-64 vector form %d", i->w);

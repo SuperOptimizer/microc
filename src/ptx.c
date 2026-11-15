@@ -34,7 +34,7 @@ static PSig *sigs;
 static u32 nsigs, capsigs;
 extern char opt_cuda_target[24];
 int opt_dev_fn;
-int opt_norange, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
+int opt_norange, opt_nohoist, opt_nofastcall, opt_nolocal, opt_nored, opt_nonc, opt_nolatch, opt_nounroll, opt_unrollpeel, opt_nosplit, opt_noauto, opt_nolicm, opt_autolog;
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6;
 u32 ptx_maxntid;
@@ -931,6 +931,40 @@ int ptx_pure_call(Func *f, u32 v)
     return 0;
 }
 
+/* -use_fast_math: single precision math calls as nvcc writes them: flushing denormals (.ftz), and fmaf(a, b, 0) a
+   product, fmaf(1, x, 0) x (no signed zeros). ufsm's fmaf(1.f, x, 0.f) (a product kept out of a later sum) came out
+   as an FFMA each: conv_bwd_w_f8_k<1,6,mx4,mx8,0> 1074 FFMA, nvcc none. MCC_NOFASTCALL: as without fast math. */
+static int fconst_is(u32 v, u32 bits)
+{
+    Ins *c = &PF->ins[RV(v)];
+    return c->op == OP_FCONST && c->ty == IT_F32 && (u32)c->a == bits;
+}
+
+static const char *fast_tmpl(u32 v, const char *name, const char *tmpl)
+{
+    Ins *i = &PF->ins[v];
+    if (opt_nofastcall)
+        return tmpl;
+    if (!strcmp(name, "sqrtf"))
+        return "sqrt.approx.ftz.f32 $d, $0;";
+    if (!strcmp(name, "fabsf"))
+        return "abs.ftz.f32 $d, $0;";
+    if (!strcmp(name, "fminf"))
+        return "min.ftz.f32 $d, $0, $1;";
+    if (!strcmp(name, "fmaxf"))
+        return "max.ftz.f32 $d, $0, $1;";
+    if (strcmp(name, "fmaf") || i->b != 3)
+        return tmpl;
+    if (fconst_is(PF->xargs[i->a + 2], 0) || fconst_is(PF->xargs[i->a + 2], 0x80000000u)) {
+        if (fconst_is(PF->xargs[i->a], 0x3f800000u))
+            return "mov.f32 $d, $1;";
+        if (fconst_is(PF->xargs[i->a + 1], 0x3f800000u))
+            return "mov.f32 $d, $0;";
+        return "mul.ftz.f32 $d, $0, $1;";
+    }
+    return "fma.rn.ftz.f32 $d, $0, $1, $2;";
+}
+
 /* Writes a template, with $d, $0.. or %0.. replaced by operands. */
 static void expand(const char *t, char mark, const char *dst, const char **ops, u32 nops)
 {
@@ -1330,8 +1364,7 @@ static void emit_call(u32 v)
                     return; /* arithmetic that nothing reads */
                 for (k = 0; k < i->b; k++)
                     args[k] = opnd(PF->xargs[i->a + k]);
-                expand(opt_fastmath && strcmp(name, "sqrtf") == 0 ? "sqrt.approx.ftz.f32 $d, $0;" : in->tmpl, '$',
-                       i->ty != IT_VOID ? reg(v) : "", args, i->b);
+                expand(opt_fastmath ? fast_tmpl(v, name, in->tmpl) : in->tmpl, '$', i->ty != IT_VOID ? reg(v) : "", args, i->b);
                 return;
             }
     }

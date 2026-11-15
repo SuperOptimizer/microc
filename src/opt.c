@@ -372,10 +372,57 @@ static int cond_base(u32 c, u32 *x)
     return sense;
 }
 
+/* Device code: the same pure value worked out in two blocks neither of which comes before the other (the arms of
+   per-channel conditions unrolled 48 times: conv_bwd_w_f8_k<1,6,...> loaded each GroupNorm parameter 96 times) is
+   worked out once, at the end of the nearest block that comes before both, if what it reads is known there and
+   that block is in no fewer loops than the two (a loop's head between them: the value stays where it is; moving
+   things out of loops costs registers, see licm). MCC_NOHOIST: off. */
+static u8 *hdr; /* device code: blocks a way back leads to */
+static u32 hoist_depth = 4; /* (dominator-tree steps up from either block: 4 against 2, 8, any on the 161 kernels: 8 and more spill, MCC_HOISTD=N) */
+
+static u32 hoist_to(u32 o, u32 a, u32 b)
+{
+    Ins *oi = &f->ins[o];
+    u32 l = a, x, n, k, *p;
+    if (oi->op == OP_ASMOUT || oi->op == OP_TLS || oi->op == OP_ISCONST || oi->op == OP_PHI || oi->op == OP_COPY ||
+        oi->op == OP_PARAM || oi->ty == IT_V128)
+        return 0;
+    if (rpo_num[a] == 0xffffffffU || rpo_num[b] == 0xffffffffU)
+        return 0;
+    while (!dominates(l, b))
+        l = idom[l];
+    for (x = a, k = 0; x != l; x = idom[x], k++)
+        if (hdr[x] || k >= hoist_depth)
+            return 0;
+    for (x = b, k = 0; x != l; x = idom[x], k++)
+        if (hdr[x] || k >= hoist_depth)
+            return 0;
+    IR_OPS(f, oi, p, n);
+    for (k = 0; k < n; k++) {
+        Ins *q = &f->ins[p[k]];
+        if (q->blk && !dominates(q->blk, l))
+            return 0;
+    }
+    return l;
+}
+
 static void gvn(void)
 {
     u32 k, v, nx, n, j, mask;
     compute_dom();
+    hdr = 0;
+    if (getenv("MCC_HOISTD"))
+        hoist_depth = (u32)atoi(getenv("MCC_HOISTD"));
+    if (opt_dev_fn && !opt_nohoist) {
+        hdr = (u8 *)xmalloc(f->nblk + 1);
+        memset(hdr, 0, f->nblk + 1);
+        for (k = 0; k < nrpo; k++) {
+            Block *bb = &f->blk[rpo[k]];
+            for (j = 0; j < bb->npreds; j++)
+                if (rpo_num[bb->preds[j]] != 0xffffffffU && dominates(rpo[k], bb->preds[j]))
+                    hdr[rpo[k]] = 1;
+        }
+    }
     nfacts = 0;
     nmem_phis = 0;
     if (out_cap < nrpo) {
@@ -576,9 +623,15 @@ static void gvn(void)
                 }
                 if (oi->op == i->op && oi->ty == i->ty && oi->a == i->a && oi->b == i->b &&
                     (i->op != OP_SELECT || oi->c == i->c) && oi->mem == i->mem) { /* (vectors: mem = lane kind) */
+                    u32 l;
                     if (oi->blk && dominates(oi->blk, b))
                         ir_replace(f, v, o);
-                    else
+                    else if (hdr && oi->blk && (l = hoist_to(o, oi->blk, b)) != 0) {
+                        ir_remove(f, o);
+                        ir_append(f, l, o);
+                        ir_replace(f, v, o);
+                        oi = &f->ins[o];
+                    } else
                         vn_tab[h] = v; /* the older one is out of scope here */
                     break;
                 }
@@ -618,6 +671,8 @@ static void gvn(void)
             }
         f->copies = 0;
     }
+    free(hdr);
+    hdr = 0;
 }
 
 /* ---- control-flow simplification ---- */

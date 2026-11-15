@@ -108,7 +108,7 @@ double log2(double); double exp2(double); double atan2(double, double); double f
 int abs(int); long labs(long); long long llabs(long long);
 }
 #define MCUDA_DEV(f) __device__ static __forceinline__ float __##f(float a) { return f(a); }
-MCUDA_DEV(expf) MCUDA_DEV(logf) MCUDA_DEV(sinf) MCUDA_DEV(cosf) MCUDA_DEV(tanf) MCUDA_DEV(log2f) MCUDA_DEV(exp2f) MCUDA_DEV(log10f)
+MCUDA_DEV(expf) MCUDA_DEV(logf) MCUDA_DEV(sinf) MCUDA_DEV(cosf) MCUDA_DEV(tanf) MCUDA_DEV(log2f) MCUDA_DEV(exp2f) MCUDA_DEV(log10f) MCUDA_DEV(exp10f)
 #undef MCUDA_DEV
 __device__ static __forceinline__ float __powf(float a, float b) { return powf(a, b); }
 

@@ -1139,14 +1139,25 @@ static const char *fast_tmpl(u32 v, const char *name, const char *tmpl)
     return "fma.rn.ftz.f32 $d, $0, $1, $2;";
 }
 
-/* -use_fast_math's exponentials and logarithms, as nvcc writes them (one MUFU op, an FMUL for the base): expf / __expf
-   ex2.approx(x log2 e), exp2f ex2.approx, logf / __logf lg2.approx(x) ln 2, log2f lg2.approx. Without this every call
-   went to the device library's accurate expf (41k calls in ufsm's PTX). MCC_NOFASTEXP: the library. */
+/* -use_fast_math's float math, as nvcc writes it (MUFU ops, an FMUL for a base): expf / exp2f / exp10f by ex2.approx,
+   logf / log2f / log10f by lg2.approx, sinf / cosf by sin / cos.approx, powf as __powf (ex2(y lg2 x)); the __ forms map
+   to these names (mcuda_device.h MCUDA_DEV). tanf and tanhf stay the library's, as with nvcc. Without this every call
+   went to the device library's accurate routine (41k expf calls in ufsm's PTX). MCC_NOFASTEXP: the library. */
 static const char *fast_libm(u32 v, const char *name)
 {
     Ins *i = &PF->ins[v];
-    if (opt_nofastexp || i->ty != IT_F32 || i->b != 1)
+    if (opt_nofastexp || i->ty != IT_F32 || i->b < 1 || i->b > 2)
         return 0;
+    if (i->b == 2) /* powf: __powf's ex2.approx(y lg2.approx(x)) */
+        return strcmp(name, "powf") ? 0 : "lg2.approx.ftz.f32 $d, $0; mul.ftz.f32 $d, $d, $1; ex2.approx.ftz.f32 $d, $d;";
+    if (!strcmp(name, "sinf"))
+        return "sin.approx.ftz.f32 $d, $0;";
+    if (!strcmp(name, "cosf"))
+        return "cos.approx.ftz.f32 $d, $0;";
+    if (!strcmp(name, "exp10f"))
+        return "mul.ftz.f32 $d, $0, 0f40549A78; ex2.approx.ftz.f32 $d, $d;";
+    if (!strcmp(name, "log10f"))
+        return "lg2.approx.ftz.f32 $d, $0; mul.ftz.f32 $d, $d, 0f3E9A209B;";
     if (!strcmp(name, "expf"))
         return "mul.ftz.f32 $d, $0, 0f3FB8AA3B; ex2.approx.ftz.f32 $d, $d;";
     if (!strcmp(name, "exp2f"))
@@ -1771,8 +1782,9 @@ static void emit_call(u32 v)
         if (opt_fastmath && fast_libm(v, name)) {
             if (!used[v])
                 return;
-            args[0] = opnd(PF->xargs[i->a]);
-            expand(fast_libm(v, name), '$', reg(v), args, 1);
+            for (k = 0; k < i->b; k++)
+                args[k] = opnd(PF->xargs[i->a + k]);
+            expand(fast_libm(v, name), '$', reg(v), args, i->b);
             return;
         }
     }

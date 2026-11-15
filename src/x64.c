@@ -3452,6 +3452,12 @@ static u32 nfixups, capfixups;
 static u32 spill_base, frame_size;
 static u64 saved_regs;
 static int has_frame;
+/* The frame addressed from rsp (no push rbp / mov rbp, rsp / leave): rbp is one more callee-saved register for the
+   allocator. rsp then stays where the prologue left it, frame_size below where rbp would have been, so every
+   [rbp + d] of the frame becomes [rsp + frame_size + d] and the layout is unchanged. Not with alloca / VLAs or
+   __builtin_frame_address (rsp moves, or rbp is asked for), nor around inline assembly. MCC_NOFPO: always rbp. */
+static int fpo;
+static int opt_nofpo = -1;
 /* -g: line table rows (offsets in the section, locations) and frame events of the function being encoded */
 static u32 *row_off, *row_loc, nrow, caprow;
 static DwCfi *cfi;
@@ -3471,6 +3477,7 @@ static void cfi_event(int op, u32 reg, u32 n)
     cfi[ncfi].op = (u8)op;
     cfi[ncfi].reg = (u8)reg;
     cfi[ncfi].n = (u8)n;
+    cfi[ncfi].v = n;
     ncfi++;
 }
 
@@ -3656,11 +3663,22 @@ static void ea_base(EA *ea, u32 base, i64 disp)
     ea->force32 = ea->fs = 0;
 }
 
+static void ea_frame(EA *ea, i64 disp)
+{
+    if (fpo)
+        ea_base(ea, RSP, disp + (i64)frame_size);
+    else
+        ea_base(ea, RBP, disp);
+}
+
 static u32 *spill_off; /* per spill slot: its distance below rbp */
+
+/* [rbp + disp] of the frame, or the same place from rsp */
+static void ea_frame(EA *ea, i64 disp);
 
 static void ea_spill(EA *ea, u32 loc)
 {
-    ea_base(ea, RBP, -(i64)spill_off[loc - SPILL0]);
+    ea_frame(ea, -(i64)spill_off[loc - SPILL0]);
 }
 
 /* the width of the vector in register r, 16 or 32 bytes; 0 for anything else */
@@ -3926,15 +3944,21 @@ static void prologue(void)
     EA ea;
     if (!has_frame)
         return;
-    b1(0x55);              /* push rbp */
-    cfi_event(CFI_PUSHFP, 0, 0);
-    op_rr(0x89, 1, RSP, RBP); /* mov rbp, rsp */
-    cfi_event(CFI_SETFP, 0, 0);
-    if (frame_size)
-        alu_ri(5, 1, RSP, frame_size);
+    if (fpo) {
+        /* the 8 bytes where rbp would have been pushed stay: the same layout and alignment */
+        alu_ri(5, 1, RSP, (i64)frame_size + 8);
+        cfi_event(CFI_SUBSP, 0, frame_size + 16);
+    } else {
+        b1(0x55);              /* push rbp */
+        cfi_event(CFI_PUSHFP, 0, 0);
+        op_rr(0x89, 1, RSP, RBP); /* mov rbp, rsp */
+        cfi_event(CFI_SETFP, 0, 0);
+        if (frame_size)
+            alu_ri(5, 1, RSP, frame_size);
+    }
     for (k = 0; k < 16; k++)
         if (saved_regs >> k & 1) {
-            ea_base(&ea, RBP, -(i64)(8 * ++n));
+            ea_frame(&ea, -(i64)(8 * ++n));
             store_reg(k, &ea);
             cfi_event(CFI_SAVE, k, 2 + n); /* rbp - 8n is the frame's address - 16 - 8n */
         }
@@ -3947,10 +3971,13 @@ static void epilogue(void)
     if (has_frame) {
         for (k = 0; k < 16; k++)
             if (saved_regs >> k & 1) {
-                ea_base(&ea, RBP, -(i64)(8 * ++n));
+                ea_frame(&ea, -(i64)(8 * ++n));
                 load_reg(k, &ea);
             }
-        b1(0xc9); /* leave */
+        if (fpo)
+            alu_ri(0, 1, RSP, (i64)frame_size + 8); /* add rsp */
+        else
+            b1(0xc9); /* leave */
         cfi_event(CFI_EPI, 0, 0);
     }
     b1(0xc3);
@@ -3966,7 +3993,9 @@ static void mem_ea(const MIns *i, u32 b, u32 x, i64 disp, EA *ea)
     ea->idx = x;
     ea->scale = XF_SCALE(i->flags);
     if (i->flags & XF_SLOT) {
-        ea->base = RBP;
+        ea->base = fpo ? RSP : RBP;
+        if (fpo)
+            ea->disp += frame_size;
         if (i->sym == ARGSLOT)
             ea->disp += 16;
         else
@@ -4669,7 +4698,7 @@ static void encode(MIns *i)
         return;
     case X_SLOTADDR:
         dr = dst(i->d, SCR0);
-        ea_base(&ea, RBP, i->sym == ARGSLOT ? 16 + i->imm : f->slots[i->sym].off + i->imm);
+        ea_frame(&ea, i->sym == ARGSLOT ? 16 + i->imm : f->slots[i->sym].off + i->imm);
         op_mem(0x8d, 1, dr, &ea, 0);
         fin(i->d, dr);
         return;
@@ -5301,13 +5330,13 @@ static void encode(MIns *i)
     case X_VASAVE: {
         i64 base = f->slots[i->sym].off;
         for (n = 0; n < 6; n++) {
-            ea_base(&ea, RBP, base + 8 * (i64)n);
+            ea_frame(&ea, base + 8 * (i64)n);
             store_reg(arg_gr[n], &ea);
         }
         op_rr(O_B8R | O_B8M | 0x84, 0, RAX, RAX); /* test al, al: were any xmm registers used? */
         jf(0x70 | CC_E);
         for (n = 0; n < 8; n++) {
-            ea_base(&ea, RBP, base + 48 + 16 * (i64)n);
+            ea_frame(&ea, base + 48 + 16 * (i64)n);
             op_mem(O_0F | 0x29, 0, XMM0 + n, &ea, 0); /* movaps */
         }
         jf_here();
@@ -5729,7 +5758,19 @@ void x64_gen(Func *fn, Obj *o)
     sel_loc = opt_debug ? dwarf_get_func_loc(f->sym) : 0;
     prepare();
     select_all();
-    ra_run(&mf, &target);
+    if (opt_nofpo < 0)
+        opt_nofpo = getenv("MCC_NOFPO") != 0;
+    fpo = !opt_nofpo && opt_level >= 1 && !uses_fp && !uses_alloca;
+    for (k = 0; k < mf.n && fpo; k++)
+        if (mf.ins[k].op == X_ASM || mf.ins[k].op == X_FRAMEADDR || mf.ins[k].op == X_ALLOCA)
+            fpo = 0;
+    if (fpo) {
+        MTarget t = target;
+        t.allocatable[0] |= BIT(RBP);
+        ra_run(&mf, &t);
+    } else {
+        ra_run(&mf, &target);
+    }
 
     /* The frame, from rbp downwards: saved registers, spills, slots; the
        outgoing arguments are at its bottom, where rsp points. */

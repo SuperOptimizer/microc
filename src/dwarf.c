@@ -1407,6 +1407,9 @@ static void eh_frame(void)
             case CFI_RESTORE:
                 buf_u8(b, 0x0b);                       /* DW_CFA_restore_state */
                 break;
+            case CFI_SUBSP:
+                buf_u8(b, 0x0e), buf_uleb(b, e->v);    /* DW_CFA_def_cfa_offset v */
+                break;
             }
         }
         pad_entry(b, len_at);

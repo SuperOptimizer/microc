@@ -315,12 +315,12 @@ static void materialise(u32 v, u32 d)
     }
 }
 
-/* A splat of a constant: made where it is used (a broadcast from read-only data), not kept in a register. */
+/* A splat of a constant: a broadcast from read-only data (sel_splat_const). */
 static int is_const_splat(u32 v)
 {
     Ins *i = &f->ins[v];
     int op;
-    if (i->op != OP_VSPLAT || !opt_avx)
+    if (i->op != OP_VSPLAT)
         return 0;
     op = f->ins[i->a].op;
     return op == OP_CONST || op == OP_FCONST;
@@ -329,7 +329,7 @@ static int is_const_splat(u32 v)
 static int is_floating(u32 v)
 {
     int op = f->ins[v].op;
-    return op == OP_CONST || op == OP_FCONST || op == OP_ADDR || op == OP_SLOT || is_const_splat(v);
+    return op == OP_CONST || op == OP_FCONST || op == OP_ADDR || op == OP_SLOT;
 }
 
 /* A read-only data symbol holding the n bytes at p (n = 1, 2, 4 or 8), shared by equal constants. */
@@ -1340,8 +1340,12 @@ static void sel_avx(u32 v)
         return;
     case OP_VSPLAT: {
         int lane = i->mem, sty = f->ins[i->a].ty;
-        if (is_const_splat(v))
-            return; /* made at each use */
+        if (is_const_splat(v)) {
+            /* a broadcast from read-only data, where the splat is (out of loops): kept in a register, or, if ra spills
+               it, one load per use */
+            sel_splat_const(v, d);
+            return;
+        }
         if (sty == IT_F32)
             lane = M_F32;
         else if (sty == IT_F64)
@@ -1588,6 +1592,11 @@ static void sel_avx_more(u32 v)
         return;
     case OP_SELECT: {
         u32 c = reg_of(i->a);
+        if (i->ty != IT_V512) {
+            /* the mask is whole lanes (a comparison's): vpblendvb, whatever their width */
+            emit_vex(VE(0x4c, 3, 1, 0) | L, XF_RVMR, d, reg_of(i->c), reg_of(i->b), c, -1);
+            return;
+        }
         t = vtmp_w(wide);
         emit_vex(VE(0xdb, 1, 1, 0) | L, XF_RVM, t, c, reg_of(i->b), NOREG, -1); /* vpand */
         u = vtmp_w(wide);

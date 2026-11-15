@@ -124,8 +124,8 @@ return (`if (!p) return 0;`), the frame is made after that test.
 ## Link-time optimisation
 
 With `-flto` the compiler stops after parsing: each function goes into the
-object as IR (section `__MCC,__ir`), and its symbol gets a one-instruction
-placeholder. Data is emitted as usual. When such objects reach the linker
+object as IR (section `__MCC,__ir`; `.mcc.ir` in ELF), and its symbol is
+defined at its record there (Mach-O: a one-instruction placeholder). Data is emitted as usual. When such objects reach the linker
 (`mcc`, `mcc ld`, straight from source or from `.o` and `.a` files, mixed
 freely with ordinary objects), they are merged into one object and compiled
 there:
@@ -138,8 +138,13 @@ there:
 - functions that nothing reaches from the entry point, from ordinary
   objects or from initialised data are left out.
 
-`-flto` objects can only be linked by mcc; another linker would link the
-placeholders. An archive member compiled with `-flto` is always loaded
+`-flto` objects can only be linked by mcc. Under `-mglibc` (x86-64 Linux,
+where the system's `cc` does the final link) mcc reads its objects back,
+compiles the IR ones as one and hands `ld` the result. Given them directly,
+`ld` stops at "defined in discarded section `.mcc.ir`" (the section is
+SHF_EXCLUDE); `ld -r` keeps the IR for a later mcc link. Functions with inline
+assembly and weak definitions are compiled at once, not kept as IR
+(tests/ltoglibc.sh, `make test-lto`). An archive member compiled with `-flto` is always loaded
 (its unused functions are still dropped). The C library can be built this
 way too (`mklibc.sh` with `-flto -c`); `make` does not do so by default.
 
@@ -169,6 +174,13 @@ parsing; `Block.freq` carries them through the passes and through `-flto`):
 
 On mcc compiling itself, trained on that same job: 3.3% fewer cycles, 5.9%
 with `-flto` as well (code grows 7% and 25%: the price of the hot inlining).
+
+On ufsm under `-mglibc` (2026-11-15: its 78 single-thread CPU test lines,
+cycles:u, best of two; trained on one pass of the same suite) neither pays:
+plain 1016.9 G cycles, `-flto` 1062.6 (+4.5%: test_zcache +22%,
+test_phase_interp +17%, one spatial-augment part -28%), `-fprofile-use`
+1014.3 (-0.25%, per test -6% .. +8%), both 1034.4 (+1.7%). The instrumented
+build ran ~32x slower. ufsm keeps both off under mcc.
 
 ## -O3
 

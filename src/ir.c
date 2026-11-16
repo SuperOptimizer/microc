@@ -40,6 +40,7 @@ void ir_func_reset(Func *f)
     memset(f->ctab, 0, f->ctab_size * sizeof(u32));
     f->ctab_used = 0;
     f->copies = 1;
+    f->ndv = 0;
     memset(&f->ins[0], 0, sizeof(Ins));
     memset(&f->blk[0], 0, sizeof(Block));
     arena_reset(&f->arena);
@@ -276,9 +277,41 @@ u32 ir_resolve(Func *f, u32 v)
     return v;
 }
 
+void ir_dbg_var(Func *f, u32 v, u32 var)
+{
+    u32 k;
+    if (!v || !var || f->ins[v].var == var)
+        return;
+    if (!f->ins[v].var) {
+        f->ins[v].var = var;
+        return;
+    }
+    for (k = f->ndv > 8 ? f->ndv - 8 : 0; k < f->ndv; k++) /* (the latest: a repeat is harmless, only a waste) */
+        if (f->dv[2 * k] == v && f->dv[2 * k + 1] == var)
+            return;
+    if (f->ndv == f->capdv) {
+        f->capdv = f->capdv ? f->capdv * 2 : 64;
+        f->dv = (u32 *)xrealloc(f->dv, 2 * f->capdv * sizeof(u32));
+    }
+    f->dv[2 * f->ndv] = v;
+    f->dv[2 * f->ndv + 1] = var;
+    f->ndv++;
+}
+
+/* (-g: the variables whose value v was have with's) */
 void ir_replace(Func *f, u32 v, u32 with)
 {
     Ins *i = &f->ins[v];
+    if (i->var || f->ndv) {
+        u32 k, w = ir_resolve(f, with);
+        if (w != v) {
+            for (k = 0; k < f->ndv; k++)
+                if (f->dv[2 * k] == v)
+                    f->dv[2 * k] = w;
+            ir_dbg_var(f, w, i->var);
+        }
+        i = &f->ins[v];
+    }
     ir_remove(f, v);
     i->op = OP_COPY;
     f->copies = 1;
@@ -1446,6 +1479,8 @@ void ir_dump(Func *f)
                 printf(k ? ", " : " ");
                 dump_val(f, f->xargs[i->a + k]);
             }
+            if (i->var)
+                printf("  ; var $%u", i->var - 1);
             printf("\n");
         }
         for (v = bb->first; v; v = f->ins[v].next) {
@@ -1521,6 +1556,8 @@ void ir_dump(Func *f)
                 }
                 break;
             }
+            if (i->var)
+                printf("  ; var $%u", i->var - 1);
             printf("\n");
         }
         switch (bb->term) {

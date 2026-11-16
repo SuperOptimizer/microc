@@ -425,12 +425,13 @@ void dwarf_func_loc(u32 sym, u32 loc, struct Type *ret); /* where the definition
 void dwarf_var(u32 fsym, u32 name, struct Type *ty, u32 slot, int param, int byref, u32 loc);
 void dwarf_scope_open(u32 fsym, u32 loc); /* a block of fsym's body begins at loc (its variables are in it) */
 void dwarf_scope_close(u32 loc);           /* ... and ends before loc */
+u32 dwarf_vars_peek(u32 fsym);         /* ... without starting afresh (the optimiser: which slots are variables) */
 u32 dwarf_vars(u32 fsym);              /* the back end: 1 + its first variable, or 0 */
 u32 dwarf_var_next(u32 k);
 u32 dwarf_var_slot(u32 k);
 int dwarf_var_byref(u32 k);
 void dwarf_var_frame(u32 k, i32 cfa_off); /* it stays in memory, at the frame's address + cfa_off */
-void dwarf_var_place(u32 k, u32 start, u32 end, const u8 *expr, u32 len); /* there from start to end (DWARF expression) */
+void dwarf_var_place(u32 k, u32 start, u32 end, const u8 *expr, u32 len, u32 rank); /* there from start to end (DWARF expression) */
 u32 dwarf_get_func_loc(u32 sym);
 u32 dwarf_file(const char *name);      /* its index in the unit's table of files */
 const char *dwarf_file_name(u32 k);

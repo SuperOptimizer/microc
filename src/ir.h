@@ -168,6 +168,8 @@ typedef struct Func {
     u32 *ctab; /* hash-consing table for floating values */
     u32 ctab_size, ctab_used;
     u32 copies; /* nonzero while OP_COPY instructions may still be referenced */
+    u32 *dv;    /* -g: (value, 1 + slot) pairs beyond Ins.var: a value that is the value of several variables */
+    u32 ndv, capdv;
     u32 cur;   /* block being filled; 0 = unreachable code is dropped */
     u32 sym;   /* object symbol */
     u8 *param_ty;
@@ -185,6 +187,7 @@ void ir_rehash(Func *f);
 int ir_is_bool(Func *f, u32 v, int depth); /* is v known to be 0 or 1? */
 int ir_nonneg(Func *f, u32 v);              /* is the I32 v known not to be negative? */
 void ir_func_reset(Func *f);
+void ir_dbg_var(Func *f, u32 v, u32 var); /* -g: value v is (also) variable var's (1 + its slot) */
 
 u32 ir_const(Func *f, int ty, u64 v);
 u32 ir_fconst(Func *f, int ty, double v);

@@ -59,6 +59,7 @@ static u32 *defs; /* [block * nvars + var]: value at the end of the block */
 static u32 *work; /* phis whose operands are still to be filled */
 static u32 nwork, capwork;
 static u32 *work_var;
+static u8 *dslot; /* -g: by slot, is it a variable's (dwarf_var) */
 static u32 *pend, npend, cappend; /* placeholders for values on entry to a block */
 
 static int mem_ty(int mem)
@@ -77,8 +78,8 @@ static int mem_ty(int mem)
 static u32 new_phi(u32 b, u32 var)
 {
     u32 v = ir_phi(pf, b, mem_ty(var_mem[var]));
-    if (opt_debug)
-        pf->ins[v].var = var_slot[var] + 1; /* the variable's value where paths join */
+    if (opt_debug && dslot[var_slot[var]])
+        ir_dbg_var(pf, v, var_slot[var] + 1); /* the variable's value where paths join */
     if (nwork == capwork) {
         capwork = capwork ? capwork * 2 : 256;
         work = (u32 *)xrealloc(work, capwork * sizeof(u32));
@@ -236,6 +237,12 @@ void opt_promote(Func *f)
     slot_var = (u32 *)xmalloc(f->nslots * sizeof(u32));
     var_slot = (u32 *)xmalloc(f->nslots * sizeof(u32));
     var_mem = (u8 *)xmalloc(f->nslots);
+    dslot = (u8 *)xmalloc(f->nslots);
+    memset(dslot, 0, f->nslots);
+    if (opt_debug)
+        for (k = dwarf_vars_peek(f->sym); k; k = dwarf_var_next(k))
+            if (dwarf_var_slot(k) < f->nslots)
+                dslot[dwarf_var_slot(k)] = 1;
     /* 0xfe: not yet seen; 0xff: not promotable */
     memset(var_mem, 0xfe, f->nslots);
 
@@ -311,8 +318,8 @@ void opt_promote(Func *f)
                 var = slot_var[o->a];
                 if (i->op == OP_STORE) {
                     cur[var] = narrow(v, ir_resolve(f, i->b), i->mem);
-                    if (opt_debug && f->ins[cur[var]].blk && !f->ins[cur[var]].var)
-                        f->ins[cur[var]].var = o->a + 1; /* -g: the value the variable now has */
+                    if (opt_debug && dslot[o->a])
+                        ir_dbg_var(f, cur[var], o->a + 1); /* -g: the value the variable now has */
                     ir_remove(f, v);
                     f->ins[v].op = OP_NOP;
                 } else {
@@ -403,6 +410,7 @@ void opt_promote(Func *f)
     free(slot_var);
     free(var_slot);
     free(var_mem);
+    free(dslot);
     /* copies left behind are resolved by value numbering, which reads
        every operand through them */
 }

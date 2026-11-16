@@ -81,6 +81,7 @@ typedef struct DwScope {
 
 typedef struct DwPlace {
     u32 start, end; /* offsets in the function */
+    u32 rank;       /* where they overlap, the place of the highest rank is the variable's (its newest value) */
     u32 next;
     u8 len;
     u8 expr[11];
@@ -231,6 +232,11 @@ void dwarf_var(u32 fsym, u32 name, Type *ty, u32 slot, int param, int byref, u32
     vtail[fsym] = ++nvars;
 }
 
+u32 dwarf_vars_peek(u32 fsym)
+{
+    return fsym < nfloc ? vhead[fsym] : 0;
+}
+
 u32 dwarf_vars(u32 fsym)
 {
     u32 k;
@@ -264,7 +270,7 @@ void dwarf_var_frame(u32 k, i32 cfa_off)
     vars[k - 1].fboff = cfa_off;
 }
 
-void dwarf_var_place(u32 k, u32 start, u32 end, const u8 *expr, u32 len)
+void dwarf_var_place(u32 k, u32 start, u32 end, const u8 *expr, u32 len, u32 rank)
 {
     DwPlace *p;
     if (start >= end || len > sizeof p->expr || vars[k - 1].kind == 1)
@@ -274,6 +280,7 @@ void dwarf_var_place(u32 k, u32 start, u32 end, const u8 *expr, u32 len)
     p->start = start;
     p->end = end;
     p->len = (u8)len;
+    p->rank = rank;
     memcpy(p->expr, expr, len);
     p->next = vars[k - 1].lr;
     vars[k - 1].lr = ++nplaces;
@@ -1288,35 +1295,54 @@ static void loclists(void)
         u32 fsym = fns[k].sym;
         for (v = fsym < nfloc ? vhead[fsym] : 0; v; v = vars[v - 1].next) {
             DwVar *x = &vars[v - 1];
-            u32 p, n = 0, i, j, *ord;
+            u32 p, n = 0, i, j, *ord, *pt, npt = 0, cur_p = ~0U, cur_s = 0;
             if (x->kind != 2)
                 continue;
             for (p = x->lr; p; p = places[p - 1].next)
                 n++;
             ord = (u32 *)xmalloc(n * sizeof(u32));
-            for (p = x->lr, i = 0; p; p = places[p - 1].next)
+            pt = (u32 *)xmalloc(2 * n * sizeof(u32));
+            for (p = x->lr, i = 0; p; p = places[p - 1].next) {
                 ord[i++] = p - 1;
-            for (i = 1; i < n; i++) /* by where they start (insertion sort: lists are short) */
-                for (j = i; j > 0 && places[ord[j - 1]].start > places[ord[j]].start; j--) {
-                    u32 t = ord[j];
-                    ord[j] = ord[j - 1];
-                    ord[j - 1] = t;
-                }
+                pt[npt++] = places[p - 1].start;
+                pt[npt++] = places[p - 1].end;
+            }
+            qsort(pt, npt, sizeof(u32), cmp_u32);
             b = sec(s_loc);
             loc_off[v - 1] = (u32)b->len + 1;
             buf_u8(b, 6); /* DW_LLE_base_address: the function */
             reloc_here(s_loc, R_ABS64, code_sym(fsym), 0, 8);
             b = sec(s_loc);
-            for (i = 0; i < n; i++) {
-                DwPlace *q = &places[ord[i]];
-                buf_u8(b, 4); /* DW_LLE_offset_pair */
-                buf_uleb(b, q->start);
-                buf_uleb(b, q->end);
-                buf_uleb(b, q->len);
-                buf_put(b, q->expr, q->len);
+            /* Places may overlap (two values of the variable live at once, the same value found twice): the code
+               between each two boundaries goes to the place of the highest rank there; runs of the same
+               expression are joined. */
+            for (j = 0; j + 1 <= npt; j++) {
+                u32 best = ~0U;
+                if (j + 1 < npt && pt[j] == pt[j + 1])
+                    continue;
+                if (j + 1 < npt)
+                    for (i = 0; i < n; i++) {
+                        DwPlace *q = &places[ord[i]];
+                        if (q->start <= pt[j] && pt[j + 1] <= q->end && (best == ~0U || q->rank > places[best].rank))
+                            best = ord[i];
+                    }
+                if (cur_p != ~0U && (best == ~0U || places[best].len != places[cur_p].len ||
+                                     memcmp(places[best].expr, places[cur_p].expr, places[cur_p].len))) {
+                    buf_u8(b, 4); /* DW_LLE_offset_pair */
+                    buf_uleb(b, cur_s);
+                    buf_uleb(b, pt[j]);
+                    buf_uleb(b, places[cur_p].len);
+                    buf_put(b, places[cur_p].expr, places[cur_p].len);
+                    cur_p = ~0U;
+                }
+                if (best != ~0U && cur_p == ~0U) {
+                    cur_p = best;
+                    cur_s = pt[j];
+                }
             }
             buf_u8(b, 0); /* DW_LLE_end_of_list */
             free(ord);
+            free(pt);
         }
     }
     put32(b, len_at, (u32)(b->len - len_at - 4));

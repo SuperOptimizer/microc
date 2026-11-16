@@ -5736,7 +5736,7 @@ static u32 place_expr(u8 *e, u32 l, int byref)
    live. Positions of the allocator are turned into code offsets through the instructions' offsets. */
 static void var_places(u32 start)
 {
-    u32 k, v, b, i, nslot = mf.n + mf.nblk + 1, *ss, *se, *byslot, cap = 64, *rs, *re;
+    u32 k, v, b, i, j, sl, nslot = mf.n + mf.nblk + 1, *ss, *se, *byslot, cap = 64, *rs, *re, *one;
     if (!dwarf_vars(f->sym))
         return;
     byslot = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32));
@@ -5763,11 +5763,27 @@ static void var_places(u32 start)
     }
     rs = (u32 *)xmalloc(cap * sizeof(u32));
     re = (u32 *)xmalloc(cap * sizeof(u32));
-    for (v = 1; v < f->nins; v++) {
-        Ins *in = &f->ins[v];
-        u32 d, l, n, len, sl;
+    one = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32)); /* by slot: its one value, 0 none, ~0 more */
+    memset(one, 0, (f->nslots + 1) * sizeof(u32));
+    for (j = 1; j < f->nins + f->ndv; j++) {
+        Ins *in;
+        u32 d, l, n, len, sl, rank;
         u8 e[12];
-        if (!in->var || !in->blk || (sl = in->var - 1) >= f->nslots || !byslot[sl])
+        if (j < f->nins) {
+            v = j;
+            sl = f->ins[v].var;
+        } else {
+            v = f->dv[2 * (j - f->nins)];
+            sl = f->dv[2 * (j - f->nins) + 1];
+        }
+        if (!sl || (sl -= 1) >= f->nslots || !byslot[sl])
+            continue;
+        v = ir_resolve(f, v);
+        in = &f->ins[v];
+        if (in->op == OP_NOP || (in->blk == 0 && in->op != OP_CONST && in->op != OP_FCONST))
+            continue;
+        one[sl] = !one[sl] || one[sl] == v ? v : ~0U;
+        if (!in->blk)
             continue;
         d = ra_dense(v);
         if (d == NOREG || (l = mf.loc[d]) == NOREG)
@@ -5782,14 +5798,54 @@ static void var_places(u32 start)
             re = (u32 *)xrealloc(re, cap * sizeof(u32));
             ra_ranges(d, rs, re, cap);
         }
-        for (i = 0; i < n; i++) {
-            /* a position: 2s + 2 reads in slot s, 2s + 3 writes there (so the value is there after it) */
-            u32 a = rs[i] & 1 ? (rs[i] - 1) / 2 : (rs[i] - 2) / 2, z = re[i] < 2 ? 0 : (re[i] - 2) / 2;
-            if (a >= nslot - 1 || z >= nslot - 1 || z < a)
-                continue;
-            dwarf_var_place(byslot[sl], ss[a], se[z], e, len);
-        }
+        for (k = 0, rank = ~0U; k < 2; k++) /* (its rank: where it is first, about where it was made) */
+            for (i = 0; i < n; i++) {
+                /* a position: 2s + 2 reads in slot s, 2s + 3 writes there (so the value is there after it) */
+                u32 a = rs[i] & 1 ? (rs[i] - 1) / 2 : (rs[i] - 2) / 2, z = re[i] < 2 ? 0 : (re[i] - 2) / 2;
+                if (a >= nslot - 1 || z >= nslot - 1 || z < a)
+                    continue;
+                if (!k)
+                    rank = ss[a] < rank ? ss[a] : rank;
+                else
+                    dwarf_var_place(byslot[sl], ss[a], se[z], e, len, rank + 1);
+            }
     }
+    /* a variable whose only value is a constant has it throughout (as gcc's DW_AT_const_value) */
+    for (sl = 0; sl < f->nslots; sl++) {
+        Ins *in;
+        u8 e[12];
+        u32 len = 0;
+        if (!byslot[sl] || !one[sl] || one[sl] == ~0U || dwarf_var_byref(byslot[sl]))
+            continue;
+        in = &f->ins[one[sl]];
+        if (in->op == OP_CONST) {
+            u64 c = 0;
+            i64 x;
+            ir_is_const(f, one[sl], &c);
+            x = in->ty == IT_I64 ? (i64)c : (i64)(i32)(u32)c;
+            e[len++] = 0x11; /* DW_OP_consts */
+            do {
+                u32 byte = (u32)(x & 0x7f);
+                x >>= 7;
+                if ((x == 0 && !(byte & 0x40)) || (x == -1 && (byte & 0x40))) {
+                    e[len++] = (u8)byte;
+                    break;
+                }
+                e[len++] = (u8)(byte | 0x80);
+            } while (1);
+            e[len++] = 0x9f; /* DW_OP_stack_value */
+        } else if (in->op == OP_FCONST && (in->ty == IT_F32 || in->ty == IT_F64)) {
+            u32 nb = in->ty == IT_F32 ? 4 : 8, q;
+            u64 bits = (u64)in->a | (nb == 8 ? (u64)in->b << 32 : 0);
+            e[len++] = 0x9e; /* DW_OP_implicit_value */
+            e[len++] = (u8)nb;
+            for (q = 0; q < nb; q++)
+                e[len++] = (u8)(bits >> 8 * q);
+        }
+        if (len)
+            dwarf_var_place(byslot[sl], 0, moff[mf.n] - start, e, len, 0);
+    }
+    free(one);
     free(rs);
     free(re);
     free(ss);

@@ -799,6 +799,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_inline_limit = atoi(a + 15);
         else if (strncmp(a, "-finline-hint=", 14) == 0)
             opt_inline_hint = atoi(a + 14);
+        else if (strncmp(a, "-finline-slotarg=", 17) == 0)
+            opt_inline_slotarg = atoi(a + 17);
         else if (strcmp(a, "-nostdlib") == 0)
             nostdlib = 1;
         else if (strcmp(a, "-nostdinc") == 0)

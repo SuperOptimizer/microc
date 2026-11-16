@@ -259,6 +259,7 @@ void inline_reset(void);
 extern int opt_inline_once;
 extern int opt_inline_limit;
 extern int opt_inline_hint; /* -finline-hint=: the limit for functions declared inline */
+extern int opt_inline_slotarg; /* -finline-slotarg=: the limit at host call sites passing the address of a local */
 extern int opt_level;
 extern int opt_fast_math;
 extern int opt_reciprocal_math; /* -freciprocal-math (in -ffast-math) */

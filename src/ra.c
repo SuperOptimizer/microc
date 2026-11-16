@@ -124,7 +124,7 @@ static u32 ranges_join(u32 a, u32 b)
 /* The union of two range lists that do not intersect, as a new list (both stay as they are). */
 static u32 ranges_union(u32 a, u32 b)
 {
-    u32 h = 0, *link = &h, r, x;
+    u32 h = 0, last = 0, r, x; /* (the tail by index: growing the pool moves rg_next) */
     while (a || b) {
         if (a && (!b || rg_start[a] < rg_start[b])) {
             x = a;
@@ -143,8 +143,11 @@ static u32 ranges_union(u32 a, u32 b)
         rg_start[r] = rg_start[x];
         rg_end[r] = rg_end[x];
         rg_next[r] = 0;
-        *link = r;
-        link = &rg_next[r];
+        if (last)
+            rg_next[last] = r;
+        else
+            h = r;
+        last = r;
     }
     return h;
 }

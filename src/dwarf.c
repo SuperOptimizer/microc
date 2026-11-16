@@ -1279,6 +1279,12 @@ static void info(const char *path)
 /* .debug_loclists: for each variable that lives in registers, its places, relative to its function's start */
 static u32 *loc_off; /* by variable: 1 + offset of its list */
 
+static int cmp_u32(const void *a, const void *b)
+{
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y;
+}
+
 static void loclists(void)
 {
     Buf *b = sec(s_loc);

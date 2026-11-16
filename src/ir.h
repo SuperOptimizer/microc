@@ -314,6 +314,7 @@ extern int opt_fastmath; /* CUDA device code, nvcc's -use_fast_math: single prec
                             and divides and takes square roots approximately, as the GPU's quick instructions do */
 extern const char *opt_ptx_out; /* also write the module's text to this file */
 extern int opt_ptx_raw;          /* --cuda-ptx-raw: the module's text plain in the object, not packed (mcuda_pack.h) */
+extern const char *opt_ptx_file; /* --cuda-ptx-file: the packed text in this file (OUT.ptxz), the object names it (MPF) */
 extern int opt_ptx_pack;         /* --cuda-ptx-pack=N: 0 plain, 1 MPZ, 2 MPY greedy (the default), 3 MPY optimal (mcuda_pack.h) */
 void ptx_reset(void);
 int ptx_active(void);

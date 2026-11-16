@@ -1356,8 +1356,15 @@ static void index_mod(int i)
         return;
     M->indexed = 1;
     if (M->packed) { /* (the bodies of a packed record, once: after the declarations that take() unpacked) */
-        if (mcuda_unpack_body(M->packed, (char *)M->m->ptx))
-            fprintf(stderr, "mcudahw: %s: damaged packed PTX: its functions are missing\n", M->m->name ? M->m->name : "module");
+        if (mcuda_unpack_body(M->packed, (char *)M->m->ptx)) {
+            const char *pf = mcuda_pack_file(M->packed);
+            if (pf)
+                fprintf(stderr, "mcudahw: %s: its PTX file %s (mcc --cuda-ptx-file) is missing, unreadable or not the one it was "
+                                "built with (MCUDA_PTXDIR: where it is now): its functions are missing\n",
+                        M->m->name ? M->m->name : "module", pf);
+            else
+                fprintf(stderr, "mcudahw: %s: damaged packed PTX: its functions are missing\n", M->m->name ? M->m->name : "module");
+        }
         M->packed = 0;
     }
     t = M->m->ptx ? M->m->ptx : "";

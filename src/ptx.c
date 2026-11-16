@@ -5053,7 +5053,28 @@ void ptx_finish(Obj *o)
             ptx_pack(&z, t.p, t.len, prologue);
         else
             ptx_pack_mpy(&z, t.p, t.len, prologue, opt_ptx_pack);
-        textsym = put_data(o, SEC_CONST, z.p, z.len, 1);
+        if (opt_ptx_file) { /* (MPF: the packed record in its own file, the object names it) */
+            Buf r = {0};
+            u64 h1 = (u64)0xcbf29ce4u << 32 | 0x84222325u, h2 = (u64)0x84222325u << 32 | 0xcbf29ce4u; /* MCUDA_PACK_FNV1 / 2 */
+            u64 pr = (u64)0x100u << 32 | 0x1b3u;                                                       /* the FNV prime */
+            size_t k;
+            for (k = 0; k < z.len; k++) {
+                h1 = (h1 ^ z.p[k]) * pr;
+                h2 = (h2 ^ z.p[k]) * pr;
+            }
+            os_write_file(opt_ptx_file, z.p, z.len, 0);
+            buf_put(&r, "\0MPF", 4);
+            buf_u64(&r, (u64)t.len);
+            buf_u64(&r, (u64)z.len);
+            buf_u64(&r, (u64)prologue);
+            buf_put(&r, t.p, prologue);
+            buf_u64(&r, h1);
+            buf_u64(&r, h2);
+            buf_put(&r, opt_ptx_file, strlen(opt_ptx_file) + 1);
+            textsym = put_data(o, SEC_CONST, r.p, r.len, 1);
+            buf_free(&r);
+        } else
+            textsym = put_data(o, SEC_CONST, z.p, z.len, 1);
         buf_free(&z);
     }
 

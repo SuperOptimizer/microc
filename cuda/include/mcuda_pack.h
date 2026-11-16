@@ -22,11 +22,18 @@
      front, OF 3 + c is a new offset (bucket code c) pushed in front; the repeats start as 1, 2, 3. After the last
      sequence, LIT up to n. Counts, lengths and offsets are bucket codes: v < 16 is the code itself; else, with
      b = floor(log2 v), the code is 16 + 2 (b - 4) + the bit below the top one, followed by the low b - 1 bits of v
-     plain. Codes are at most MCUDA_MPY_MAXL bits. */
+     plain. Codes are at most MCUDA_MPY_MAXL bits.
+   - "\0MPF" (mcc --cuda-ptx-file, with -c -o X.o): the packed record (MPZ or MPY) is in the file X.o.ptxz, not in
+     the object; here m is that file's size, and the prologue is followed by two 64-bit FNV-1a hashes of the file
+     (seeds MCUDA_PACK_FNV1, MCUDA_PACK_FNV2) and its absolute path, NUL-terminated. A build that links one unit into
+     many programs (a test suite) then holds its PTX once. The file is read when the bodies are first wanted; it
+     must have the hashes, the same n and P and the same prologue. MCUDA_PTXDIR=DIR: DIR/(the file's name) first
+     (a build directory that moved). */
 #ifndef MCUDA_PACK_H
 #define MCUDA_PACK_H
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #define MCUDA_PACK_MINM 6
@@ -221,7 +228,16 @@ out:
 
 static inline int mcuda_packed(const char *p)
 {
-    return p && p[0] == 0 && p[1] == 'M' && p[2] == 'P' && (p[3] == 'Z' || p[3] == 'Y');
+    return p && p[0] == 0 && p[1] == 'M' && p[2] == 'P' && (p[3] == 'Z' || p[3] == 'Y' || p[3] == 'F');
+}
+
+#define MCUDA_PACK_FNV1 0xcbf29ce484222325ull
+#define MCUDA_PACK_FNV2 0x84222325cbf29ce4ull
+static inline unsigned long long mcuda_pack_fnv(unsigned long long h, const unsigned char *p, unsigned long long n)
+{
+    while (n--)
+        h = (h ^ *p++) * 1099511628211ull;
+    return h;
 }
 
 static inline unsigned long long mcuda_pack_rd8(const unsigned char *p)
@@ -268,9 +284,55 @@ static inline int mcuda_unpack_prologue(const char *p, char *out)
    that out holds the whole text. -1 on a damaged record (sizes or a copy out of range, a text that does not end
    in its NUL): out then holds the prologue alone. */
 static inline int mcuda_unpack_mpz(const char *p, char *out);
+static inline int mcuda_unpack_body(const char *p, char *out);
+
+/* an MPF record's file name (0 for the other forms) */
+static inline const char *mcuda_pack_file(const char *p)
+{
+    return p[3] == 'F' ? p + MCUDA_PACK_HDR + mcuda_pack_p(p) + 16 : 0;
+}
+
+/* the bodies of an MPF record from its file */
+static inline int mcuda_unpack_file(const char *p, char *out)
+{
+    unsigned long long n = mcuda_pack_n(p), m = mcuda_pack_m(p), pl = mcuda_pack_p(p);
+    const char *path = mcuda_pack_file(p), *dir = getenv("MCUDA_PTXDIR"), *base = strrchr(path, '/');
+    const unsigned char *hs = (const unsigned char *)p + MCUDA_PACK_HDR + pl;
+    char *buf = 0;
+    FILE *f = 0;
+    int r = -1;
+    if (m < MCUDA_PACK_HDR + pl || m > (1ull << 40))
+        goto out;
+    if (dir && dir[0] && strlen(dir) < 4000 && strlen(base ? base : path) < 4000) {
+        char alt[8200];
+        sprintf(alt, "%s/%s", dir, base ? base + 1 : path);
+        f = fopen(alt, "rb");
+    }
+    if (!f && !(f = fopen(path, "rb")))
+        goto out;
+    if (!(buf = (char *)malloc((size_t)m)) || fread(buf, 1, (size_t)m, f) != (size_t)m || fgetc(f) != EOF)
+        goto out;
+    if (mcuda_pack_fnv(MCUDA_PACK_FNV1, (const unsigned char *)buf, m) != mcuda_pack_rd8(hs) ||
+        mcuda_pack_fnv(MCUDA_PACK_FNV2, (const unsigned char *)buf, m) != mcuda_pack_rd8(hs + 8))
+        goto out;
+    if (!mcuda_packed(buf) || buf[3] == 'F' || mcuda_pack_n(buf) != n || mcuda_pack_p(buf) != pl ||
+        MCUDA_PACK_HDR + pl + mcuda_pack_m(buf) != m || memcmp(buf + MCUDA_PACK_HDR, p + MCUDA_PACK_HDR, (size_t)pl))
+        goto out;
+    r = mcuda_unpack_body(buf, out);
+out:
+    if (f)
+        fclose(f);
+    free(buf);
+    if (r)
+        out[pl] = 0;
+    return r;
+}
+
 static inline int mcuda_unpack_body(const char *p, char *out)
 {
     unsigned long long n = mcuda_pack_n(p), m = mcuda_pack_m(p), pl = mcuda_pack_p(p);
+    if (p[3] == 'F')
+        return mcuda_unpack_file(p, out);
     if (p[3] != 'Y')
         return mcuda_unpack_mpz(p, out);
     if (n < 1 || n > (1ull << 40) || pl >= n || m > (1ull << 40) ||

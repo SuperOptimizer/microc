@@ -224,6 +224,7 @@ static int force_cuda; /* -x cuda */
 const char *opt_ptx_out;
 int opt_ptx_raw;
 int opt_ptx_pack = 2;
+const char *opt_ptx_file;
 char opt_cuda_target[24] = "sm_86"; /* CUDA: the .target of the PTX: the GPU of --cuda-arch */
 static int cuda_arch = 860; /* CUDA: the value of __CUDA_ARCH__; --cuda-arch=N or nvcc's -arch=sm_NN */
 int opt_fmad = 1;
@@ -563,7 +564,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
     Obj **objs = 0;
     size_t nobjs = 0;
     int ninputs = 0, ndefines = 0, i, k, nsources = 0;
-    int preprocess_only = 0, dump_ir = 0, compile_only = 0;
+    int preprocess_only = 0, dump_ir = 0, compile_only = 0, want_ptx_file = 0;
     int jobs = 0, running = 0, next = 0, failed = 0;
     int *job_id, *job_fd, out_fd = -1;
 
@@ -768,6 +769,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_ptx_out = a + 10;
         else if (strcmp(a, "--cuda-ptx-raw") == 0)
             opt_ptx_raw = 1;
+        else if (strcmp(a, "--cuda-ptx-file") == 0)
+            want_ptx_file = 1;
         else if (strncmp(a, "--cuda-ptx-pack=", 16) == 0 && a[16] >= '0' && a[16] <= '3' && !a[17])
             opt_ptx_pack = a[16] - '0';
         else if (strncmp(a, "--cuda-arch=", 12) == 0) {
@@ -886,6 +889,16 @@ static int cc_main(const char *argv0, int argc, char **argv)
     if ((preprocess_only || dump_ir || (compile_only && out_path)) && (nsources != 1 || ninputs != 1) &&
         !(ninputs == 1 && kind_of(inputs[0]) != 'o'))
         die("exactly one source file is required with these options");
+    if (want_ptx_file) { /* the object's PTX goes to OUT.ptxz (mcuda_pack.h, MPF), named by its absolute path */
+        char *cwd = out_path && out_path[0] != '/' ? os_getcwd() : 0;
+        char *f;
+        if (!compile_only || !out_path)
+            die("--cuda-ptx-file needs -c and -o");
+        f = (char *)xmalloc((cwd ? strlen(cwd) + 1 : 0) + strlen(out_path) + 8);
+        sprintf(f, "%s%s%s.ptxz", cwd ? cwd : "", cwd ? "/" : "", out_path);
+        opt_ptx_file = f;
+        free(cwd);
+    }
 
     /* Several source files are compiled by one child process each, at most
        "jobs" at a time. A child sends its object back through a pipe (or

@@ -35,6 +35,8 @@ int main(int argc, char **argv)
     if (!mcuda_packed(ptx))
         return printf("check: the record is not packed\n"), 1;
     un = mcuda_pack_n(ptx), pm = mcuda_pack_m(ptx), pl = mcuda_pack_p(ptx), tot = MCUDA_PACK_HDR + pl + pm;
+    if (mcuda_pack_file(ptx)) /* MPF: the record holds the prologue, two hashes and the file's name */
+        tot = MCUDA_PACK_HDR + pl + 16 + strlen(mcuda_pack_file(ptx)) + 1;
     if (un != (unsigned long long)n + 1)
         return printf("check: unpacked size %llu, the text has %ld + 1\n", un, n), 1;
     got = mcuda_unpack(ptx);
@@ -52,6 +54,21 @@ int main(int argc, char **argv)
     free(pro);
     /* damaged copies: each must be refused or give some NUL-terminated text of the stated size */
     copy = malloc((size_t)tot);
+    if (mcuda_pack_file(ptx)) { /* MPF: a wrong hash, a wrong prologue byte, a file that is not there */
+        int w;
+        for (w = 0; w < 3; w++) {
+            memcpy(copy, ptx, (size_t)tot);
+            if (w == 0)
+                copy[MCUDA_PACK_HDR + pl + 3] ^= 1;
+            else if (w == 1)
+                copy[MCUDA_PACK_HDR + pl / 2] ^= 1;
+            else
+                copy[tot - 2] ^= 1;
+            if ((got = mcuda_unpack((const char *)copy)) != 0)
+                bad++, free(got);
+        }
+        pm = 0;
+    }
     for (k = 0; k < 64 && k < pm; k++) {
         unsigned long long at = MCUDA_PACK_HDR + pl + (k * 7919) % pm;
         memcpy(copy, ptx, (size_t)tot);

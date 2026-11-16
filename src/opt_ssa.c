@@ -1,6 +1,7 @@
 /* CFG cleanup, promotion of stack slots to SSA values, dead code removal. */
 #include "ir.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Drops unreachable blocks and the edges coming out of them. */
@@ -897,6 +898,157 @@ static int select_loads(Func *f)
     return changed;
 }
 
+/* ---- x86-64: arrays carved out of records and frames ----
+   An element of an array at a variable index (the frontend leaves the array's bytes in Ins.c of the sum, see
+   parse.c) keeps the whole slot in memory, scalars and all: a decoder's state { bit reader; u32 x[2]; u32 k; }
+   read as x[k] was loaded and stored field by field through its whole token loop. A slot whose address goes
+   only into loads and stores at constant places and into such sums gets one new slot per array, the sums and
+   the loads and stores inside an array moved there; the rest of it can then be split as usual. */
+#define CARVE_MAX 8
+static int carve_why;
+static int carve_one(Func *f, u32 s)
+{
+    u32 b, v, k, n, *ops, nreg = 0, ro[CARVE_MAX], re[CARVE_MAX], to[CARVE_MAX], outside = 0;
+    int pass;
+    /* pass 0 finds the arrays, pass 1 checks every access at a constant place against all of them (one met before
+       an array was seen, a copy or clearing of the whole record, may cross it), pass 2 moves them; nothing changes
+       before pass 2, so any refusal leaves the function as it was */
+    for (pass = 0; pass < 3; pass++) {
+        if (pass == 2) {
+            if (!nreg || !outside)
+                { carve_why = __LINE__; return 0; }
+            for (k = 0; k < nreg; k++)
+                to[k] = ir_new_slot(f, re[k], f->slots[s].align ? f->slots[s].align : 1);
+        }
+        for (b = 1; b < f->nblk; b++) {
+            Block *bb = &f->blk[b];
+            if (bb->term == TERM_NONE)
+                continue;
+            if (bb->arg && f->ins[bb->arg].op == OP_SLOT && f->ins[bb->arg].a == s)
+                { carve_why = __LINE__; return 0; }
+            for (v = bb->phis; v; v = f->ins[v].next)
+                for (k = 0; k < f->ins[v].b; k++) {
+                    u32 x = ir_resolve(f, f->xargs[f->ins[v].a + k]);
+                    if (f->ins[x].op == OP_SLOT && f->ins[x].a == s)
+                        { carve_why = __LINE__; return 0; }
+                }
+            for (v = bb->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                IR_OPS(f, i, ops, n);
+                if (i->op == OP_CALL && f->ins[ir_resolve(f, i->c)].op == OP_SLOT && f->ins[ir_resolve(f, i->c)].a == s)
+                    { carve_why = __LINE__; return 0; }
+                for (k = 0; k < n; k++) {
+                    u32 x = ir_resolve(f, ops[k]), r, sz;
+                    i32 off;
+                    if (f->ins[x].op != OP_SLOT || f->ins[x].a != s)
+                        continue;
+                    off = (i32)f->ins[x].b;
+                    if (k == 0 && i->op == OP_ADD && i->c && i->ty == IT_I64) {
+                        /* an element at a variable index: every use of the sum a load or a store of it */
+                        u32 w, c2, n2, *o2;
+                        if (off < 0 || (u64)(u32)off + i->c > f->slots[s].size)
+                            { carve_why = __LINE__; return 0; }
+                        if (pass == 1)
+                            continue;
+                        if (pass == 0) {
+                            for (c2 = 1; c2 < f->nblk; c2++) {
+                                Block *cb = &f->blk[c2];
+                                if (cb->term == TERM_NONE)
+                                    continue;
+                                if (cb->arg && ir_resolve(f, cb->arg) == v)
+                                    { carve_why = __LINE__; return 0; }
+                                for (w = cb->phis; w; w = f->ins[w].next)
+                                    for (r = 0; r < f->ins[w].b; r++)
+                                        if (ir_resolve(f, f->xargs[f->ins[w].a + r]) == v)
+                                            { carve_why = __LINE__; return 0; }
+                                for (w = cb->first; w; w = f->ins[w].next) {
+                                    IR_OPS(f, &f->ins[w], o2, n2);
+                                    for (r = 0; r < n2; r++)
+                                        if (ir_resolve(f, o2[r]) == v &&
+                                            !(r == 0 && (f->ins[w].op == OP_LOAD || f->ins[w].op == OP_STORE)))
+                                            { carve_why = __LINE__; return 0; }
+                                    if (f->ins[w].op == OP_CALL && ir_resolve(f, f->ins[w].c) == v)
+                                        { carve_why = __LINE__; return 0; }
+                                }
+                            }
+                            for (r = 0; r < nreg; r++)
+                                if (ro[r] == (u32)off && re[r] == i->c)
+                                    break;
+                            if (r == nreg) {
+                                for (r = 0; r < nreg; r++)
+                                    if ((u32)off < ro[r] + re[r] && ro[r] < (u32)off + i->c)
+                                        { carve_why = __LINE__; return 0; } /* overlapping arrays of different extents */
+                                if (nreg == CARVE_MAX)
+                                    { carve_why = __LINE__; return 0; }
+                                ro[nreg] = (u32)off;
+                                re[nreg++] = i->c;
+                            }
+                        } else {
+                            for (r = 0; r < nreg && !(ro[r] == (u32)off && re[r] == i->c); r++)
+                                ;
+                            ops[k] = ir_slot_addr(f, to[r], 0);
+                            i = &f->ins[v];
+                            IR_OPS(f, i, ops, n);
+                        }
+                        continue;
+                    }
+                    /* a load / store / clearing / copy at a constant place: inside one array or outside all */
+                    if (!((k == 0 && (i->op == OP_LOAD || i->op == OP_STORE || i->op == OP_MEMZERO)) || (k < 2 && i->op == OP_MEMCPY)))
+                        { carve_why = 100000 + i->op * 100 + k * 10 + (i->c != 0); return 0; }
+                    sz = i->op == OP_MEMZERO || i->op == OP_MEMCPY ? i->c : M_SIZE(i->mem);
+                    if (off < 0 || !sz)
+                        { carve_why = __LINE__; return 0; }
+                    if (pass == 0)
+                        continue;
+                    if (pass == 1) {
+                        int in = 0;
+                        for (r = 0; r < nreg; r++)
+                            if ((u32)off < ro[r] + re[r] && ro[r] < (u32)off + sz) {
+                                if ((u32)off < ro[r] || (u32)off + sz > ro[r] + re[r])
+                                    { carve_why = __LINE__; return 0; }
+                                in = 1;
+                            }
+                        if (!in)
+                            outside = 1;
+                    } else {
+                        for (r = 0; r < nreg; r++)
+                            if ((u32)off >= ro[r] && (u32)off + sz <= ro[r] + re[r])
+                                break;
+                        if (r < nreg) {
+                            ops[k] = ir_slot_addr(f, to[r], (i64)off - ro[r]);
+                            i = &f->ins[v];
+                            IR_OPS(f, i, ops, n);
+                        } else {
+                            u32 q;
+                            for (q = 0; q < nreg; q++)
+                                if ((u32)off < ro[q] + re[q] && ro[q] < (u32)off + sz)
+                                    return -1; /* (cannot be: pass 1 checked every access) */
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static void slot_carve(Func *f)
+{
+    u32 s, n = f->nslots;
+    int any = 0;
+    for (s = 0; s < n; s++) {
+        int r;
+        r = carve_one(f, s);
+        if (getenv("MCC_CARVELOG") && f->slots[s].size >= 16)
+            fprintf(stderr, "carve %s slot %lu size %lu: %d\n", f->name ? f->name : "?", (unsigned long)s, (unsigned long)f->slots[s].size, r * 10000 + (r ? 0 : carve_why));
+        if (r < 0)
+            die("slot_carve: an access across an array of slot %lu", (unsigned long)s);
+        any |= r;
+    }
+    if (any)
+        ir_resolve_all(f);
+}
+
 int opt_split(Func *f)
 {
     u32 b, v, k, n, nu = 0, capu = 0, nslots = f->nslots, j, p, done = 0;
@@ -912,6 +1064,10 @@ int opt_split(Func *f)
         f->copies = 1;
         ir_resolve_all(f);
         opt_dce(f);
+    }
+    if (!opt_dev_fn && opt_arch == ARCH_X64 && opt_level >= 2 && !getenv("MCC_NOCARVE")) {
+        slot_carve(f);
+        nslots = f->nslots;
     }
     pf = f;
     slot_bad = (u8 *)xmalloc(nslots);

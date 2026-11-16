@@ -6224,6 +6224,7 @@ static void postfix_ops(Expr *e)
         case T_LBRACK: {
             Expr idx;
             int saved_stop = launch_stop;
+            Type *aty = e->ty; /* (an array: its extent goes on the address, see below) */
             next();
             rvalue(e);
             launch_stop = 0;
@@ -6238,6 +6239,12 @@ static void postfix_ops(Expr *e)
             binop(T_PLUS, e, &idx, loc);
             if (e->ty->kind != TY_PTR)
                 error_at(loc, "subscripted value is not an array or pointer");
+            /* host: an element of an array (of known size) at a variable index stays inside the array: the sum
+               remembers the array's bytes (Ins.c of OP_ADD, otherwise unused), so that opt_split can take the
+               array apart from the scalars of the record or frame it is in (a decoder's state with x[k]) */
+            if (!opt_cuda && aty && aty->kind == TY_ARRAY && type_size(aty) && type_size(aty) < 0x10000000 && e->v &&
+                F->ins[e->v].op == OP_ADD && F->ins[e->v].ty == IT_I64 && !F->ins[e->v].c)
+                F->ins[e->v].c = (u32)type_size(aty);
             e->ty = e->ty->base;
             e->lval = 1;
             break;

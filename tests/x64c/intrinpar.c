@@ -47,7 +47,9 @@ static void fill(V *v, int k, int kind)
         case 2: v->fl[j] = special[r % (sizeof special / sizeof special[0])]; break;
         case 3: v->u[j] = (r & 1 ? 0x7fc00000u : 0xff800000u) | (unsigned)(r >> 8 & 1 ? 0x7f800000u : 0) | (unsigned)(r >> 12 & 0x3ff); break;
         case 4: v->u[j] = (unsigned)(r % 7) * 0x01010101u * (unsigned)(r >> 20 & 0xff); break;
-        default: v->fl[j] = (float)(r % 100000) / 7.0f - 5000.0f; break;
+        /* random mantissa, exponent 2^-4 .. 2^13, either sign: built from bits, so the inputs are the same under
+           -ffast-math (a / 7.0f - 5000 became x * (1/7) fused into an FMA there, and every hash moved) */
+        default: v->u[j] = (unsigned)(r >> 40 & 1) << 31 | (unsigned)(123 + r % 18) << 23 | (unsigned)(r >> 8 & 0x7fffff); break;
         }
     }
     (void)k;

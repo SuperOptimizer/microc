@@ -422,7 +422,8 @@ static int grabbing;
    vectoriser takes, and the counter is a constant in each copy */
 #define UNROLL_HOST_N 16      /* (a loop over the 8 corners of a cell, 13 neighbours) */
 #define UNROLL_HOST_INS 1200  /* (8 corners x a short row loop: ufsm write_spatial_tm 1.11x, phase_blend_row 1.5x) */
-#define UNROLL_HOST_SIZE 2400 /* tokens */
+#define UNROLL_HOST_LINE 1800 /* a body of straight-line code run at least 4 times: ufsm fit_vox2's 8 corners (8 x 212) */
+#define UNROLL_HOST_SIZE 4800 /* tokens (a cheap first test: UNROLL_HOST_INS decides) */
 static u32 au_n;
 static u32 auto_n; /* loops unrolled unasked so far (debugging: MCC_AUTOMAX, MCC_AUTOLOG) */
 static Sym *unroll_probe; /* C: the counter read as its constant while an unasked unroll reads the condition (C++ reads every
@@ -10041,6 +10042,21 @@ static int unroll_plain(const Token *t, u32 n)
     return 1;
 }
 
+/* No branch of its own in the body (if, continue, break, return; a ?: is a select): its copies, the counter a constant in
+   each, are one straight run of code. A branchy one (ufsm's chamfer reference: 13 neighbours each tested for the box) became
+   13 sets of tests computed up front, spilled (+26 % instructions); a straight one gives its small arrays to registers. */
+static int unroll_straight(const Token *t, u32 n)
+{
+    u32 k;
+    for (k = 0; k < n; k++) {
+        int kd = t[k].kind;
+        if (kd == KW(KW_IF) || kd == KW(KW_CONTINUE) || kd == KW(KW_BREAK) || kd == KW(KW_RETURN) || kd == KW(KW_SWITCH) ||
+            kd == KW(KW_WHILE) || kd == KW(KW_DO))
+            return 0;
+    }
+    return 1;
+}
+
 static int unroll_quiet; /* a step that is not a constant is no error: the loop was not asked to be unrolled */
 
 static int unroll_step(Sym *s, const Token *t, u32 n, i64 *val)
@@ -10430,7 +10446,8 @@ static void statement(void)
                             break_level = s_bl;
                             cont_level = s_cl;
                             grown = F->nins - n0;
-                            if ((u64)grown * k <= (cur_fn_dev ? UNROLL_AUTO_INS : UNROLL_HOST_INS)) {
+                            if ((u64)grown * k <= (cur_fn_dev ? UNROLL_AUTO_INS : UNROLL_HOST_INS) ||
+                                (!cur_fn_dev && k >= 4 && (u64)grown * k <= UNROLL_HOST_LINE && unroll_straight(btk, bn))) {
                                 auto_n++;
                                 ur = k + 1;
                                 if (opt_autolog)

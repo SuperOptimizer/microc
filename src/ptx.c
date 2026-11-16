@@ -4392,6 +4392,559 @@ static void ptx_pack(Buf *out, const u8 *in, size_t n, size_t pro)
     free(k.chain);
 }
 
+/* ---- the MPY form (cuda/include/mcuda_pack.h has the layout and the decoder) ----
+   LZ77 with three repeat offsets, then canonical prefix codes for literals, literal counts, copy lengths and
+   offsets. PTX instantiations of one template differ in a few constants and register numbers, so a copy breaks
+   off and resumes at the same distance: a repeat offset costs ~1-3 bits where a new one costs ~25. Prices (1/16
+   bit) come from a greedy parse of the first MPY_SAMPLE bytes, then the whole text is parsed once with them:
+   --cuda-ptx-pack=2 greedily (one step of lazy matching; a repeat of MPY_REPTAKE bytes is taken at once, chains
+   of depth 1), --cuda-ptx-pack=3 optimally (forward dynamic programming over windows of MPY_OPTW positions; a copy
+   of MPY_NICE bytes ends a window; chains of depth 4). Measured on ufsm's 124 release units (337.6 MB of PTX):
+   MPZ 87.9 MB, pack 2 43.5 MB, pack 3 34.2 MB (zstd -9 --long 37.3, -19 28.9); lp_f4fwd_i0p (18.6 MB) pack 2
+   ~1.9 G cycles (MPZ ~1.8 G), pack 3 ~10 G. The decoder reads ~1 GB/s. */
+#define MPY_MINM 3 /* MCUDA_MPY_MINM */
+#define MPY_MAXL 11
+#define MPY_NLIT 256
+#define MPY_NLEN 88
+#define MPY_NOF 91
+#define MPY_SAMPLE (2u << 20)
+#define MPY_REPTAKE 16
+#define MPY_OPTW 1024
+#define MPY_NICE 128
+#define MPY_INF 0x7fffffffffffffffL
+
+typedef struct {
+    u32 ll, ml;
+    int oc; /* 0..2 a repeat offset, 3 a new one */
+    u64 off;
+} MpySeq;
+typedef struct {
+    int lit[MPY_NLIT], ll[MPY_NLEN], ml[MPY_NLEN], of[MPY_NOF];
+} MpyPrice;
+typedef struct {
+    const u8 *in;
+    size_t n;
+    int hb, depth;
+    u32 *h, *h32, *chain;
+    MpySeq *s;
+    size_t ns, cap;
+} Mpy;
+
+/* the bucket code of v, its count of plain bits nb and their value ex */
+static int mpy_bk(u64 v, int *nb, u64 *ex)
+{
+    int b = 4;
+    if (v < 16) {
+        *nb = 0, *ex = 0;
+        return (int)v;
+    }
+    while (b < 63 && (v >> (b + 1)) != 0)
+        b++;
+    *nb = b - 1;
+    *ex = v & (((u64)1 << (b - 1)) - 1);
+    return 16 + 2 * (b - 4) + (int)((v >> (b - 1)) & 1);
+}
+static int mpy_pv(const int *t, u64 v)
+{
+    int nb;
+    u64 ex;
+    int c = mpy_bk(v, &nb, &ex);
+    return t[c] + nb * 16;
+}
+
+/* lengths of a prefix code of at most MPY_MAXL bits for freq[0..n) (n <= 256): Huffman's, with the counts halved
+   until it fits */
+static void mpy_lens(const u64 *freq, int n, u8 *len)
+{
+    u64 f[MPY_NLIT], w[2 * MPY_NLIT];
+    int par[2 * MPY_NLIT], alive[2 * MPY_NLIT], sym[MPY_NLIT], used = 0, i;
+    for (i = 0; i < n; i++) {
+        f[i] = freq[i];
+        len[i] = 0;
+        if (f[i])
+            sym[used++] = i;
+    }
+    if (used == 0)
+        return;
+    if (used == 1) {
+        len[sym[0]] = 1;
+        return;
+    }
+    for (;;) {
+        int nn = used, k, ok = 1;
+        for (i = 0; i < used; i++)
+            w[i] = f[sym[i]], alive[i] = 1, par[i] = -1;
+        for (k = 0; k < used - 1; k++) {
+            int a = -1, b = -1, j;
+            for (j = 0; j < nn; j++)
+                if (alive[j]) {
+                    if (a < 0 || w[j] < w[a])
+                        b = a, a = j;
+                    else if (b < 0 || w[j] < w[b])
+                        b = j;
+                }
+            w[nn] = w[a] + w[b], alive[nn] = 1, par[nn] = -1;
+            alive[a] = alive[b] = 0, par[a] = par[b] = nn;
+            nn++;
+        }
+        for (i = 0; i < used; i++) {
+            int d = 0, j = i;
+            while (par[j] >= 0)
+                j = par[j], d++;
+            len[sym[i]] = (u8)d;
+            if (d > MPY_MAXL)
+                ok = 0;
+        }
+        if (ok)
+            return;
+        for (i = 0; i < used; i++)
+            f[sym[i]] = (f[sym[i]] + 1) / 2;
+    }
+}
+/* the codes of lengths len[], bit-reversed (the stream is least significant bit first) */
+static void mpy_codes(const u8 *len, int nsym, u32 *code)
+{
+    int cnt[MPY_MAXL + 1], next[MPY_MAXL + 1], s, l, c = 0;
+    memset(cnt, 0, sizeof cnt);
+    for (s = 0; s < nsym; s++)
+        cnt[len[s]]++;
+    cnt[0] = 0;
+    for (l = 1; l <= MPY_MAXL; l++) {
+        c = (c + cnt[l - 1]) << 1;
+        next[l] = c;
+    }
+    for (s = 0; s < nsym; s++)
+        if (len[s]) {
+            int v = next[len[s]]++, r = 0, k;
+            for (k = 0; k < len[s]; k++)
+                r |= ((v >> k) & 1) << (len[s] - 1 - k);
+            code[s] = (u32)r;
+        }
+}
+static void mpy_price(MpyPrice *P, const u8 *l0, const u8 *l1, const u8 *l2, const u8 *l3)
+{
+    int i;
+    for (i = 0; i < MPY_NLIT; i++)
+        P->lit[i] = (l0[i] ? l0[i] : 14) * 16;
+    for (i = 0; i < MPY_NLEN; i++)
+        P->ll[i] = (l1[i] ? l1[i] : 14) * 16, P->ml[i] = (l2[i] ? l2[i] : 14) * 16;
+    for (i = 0; i < MPY_NOF; i++)
+        P->of[i] = (l3[i] ? l3[i] : 14) * 16;
+}
+
+static size_t mpy_len(const u8 *a, const u8 *b, const u8 *e)
+{
+    const u8 *s = b;
+    while (b + 8 <= e && pk_ld8(a) == pk_ld8(b))
+        a += 8, b += 8;
+    while (b < e && *a == *b)
+        a++, b++;
+    return (size_t)(b - s);
+}
+static void mpy_ins(Mpy *m, size_t i)
+{
+    u32 h;
+    if (i + 8 > m->n)
+        return;
+    h = pk_h8(m->in + i, m->hb);
+    m->chain[i] = m->h[h];
+    m->h[h] = (u32)i;
+    if (i + 32 <= m->n && (i & 7) == 0)
+        m->h32[pk_h32(m->in + i, m->hb)] = (u32)i;
+}
+static void mpy_seq(Mpy *m, size_t ll, size_t ml, int oc, u64 off)
+{
+    if (m->ns == m->cap) {
+        m->cap = m->cap ? 2 * m->cap : 1024;
+        m->s = (MpySeq *)xrealloc(m->s, m->cap * sizeof *m->s);
+    }
+    m->s[m->ns].ll = (u32)ll, m->s[m->ns].ml = (u32)ml, m->s[m->ns].oc = oc, m->s[m->ns].off = off;
+    m->ns++;
+}
+static void mpy_rep(u64 *r, int oc, u64 off)
+{
+    u64 o = oc < 3 ? r[oc] : off;
+    if (oc == 0)
+        return;
+    if (oc != 1) /* (a repeat 1 swaps with repeat 0; repeat 2 and a new offset push the others back) */
+        r[2] = r[1];
+    r[1] = r[0];
+    r[0] = o;
+}
+static void mpy_start(Mpy *m, const u8 *in, size_t n, int depth)
+{
+    int hb = 10;
+    while (hb < 24 && ((size_t)1 << hb) < n)
+        hb++;
+    m->in = in, m->n = n, m->hb = hb, m->depth = depth;
+    m->h = (u32 *)xmalloc(sizeof(u32) << hb);
+    m->h32 = (u32 *)xmalloc(sizeof(u32) << hb);
+    m->chain = (u32 *)xmalloc(sizeof(u32) * (n + 1));
+    memset(m->h, 0xff, sizeof(u32) << hb);
+    memset(m->h32, 0xff, sizeof(u32) << hb);
+    m->s = 0, m->ns = m->cap = 0;
+}
+static void mpy_stop(Mpy *m)
+{
+    free(m->h);
+    free(m->h32);
+    free(m->chain);
+}
+
+/* ---- the greedy parse ---- */
+typedef struct {
+    size_t l;
+    int oc;
+    u64 off;
+    long g; /* what it saves over literals, 1/16 bit */
+} MpyCand;
+static void mpy_best(Mpy *m, const MpyPrice *P, const u32 *cum, size_t i, const u64 *rep, MpyCand *c)
+{
+    const u8 *in = m->in, *e = in + m->n;
+    int r, d;
+    u32 x;
+    c->l = 0, c->g = 0, c->oc = 0, c->off = 0;
+    for (r = 0; r < 3; r++)
+        if (rep[r] <= i) {
+            size_t l = mpy_len(in + i - rep[r], in + i, e);
+            long g;
+            if (l < MPY_MINM)
+                continue;
+            g = (long)(u32)(cum[i + l] - cum[i]) - mpy_pv(P->ml, l - MPY_MINM) - P->of[r];
+            if (g > c->g)
+                c->g = g, c->l = l, c->oc = r, c->off = rep[r];
+        }
+    if (i + 8 > m->n || c->l >= MPY_REPTAKE)
+        return;
+    if (i + 32 <= m->n && (x = m->h32[pk_h32(in + i, m->hb)]) != 0xffffffffu && x < i) {
+        size_t l = mpy_len(in + x, in + i, e);
+        long g = l < MPY_MINM ? 0 : (long)(u32)(cum[i + l] - cum[i]) - mpy_pv(P->ml, l - MPY_MINM) - mpy_pv(P->of + 3, i - x);
+        if (g > c->g)
+            c->g = g, c->l = l, c->oc = 3, c->off = i - x;
+    }
+    for (x = m->h[pk_h8(in + i, m->hb)], d = 0; d < m->depth && x != 0xffffffffu; d++, x = m->chain[x]) {
+        size_t l = mpy_len(in + x, in + i, e);
+        long g = l < MPY_MINM ? 0 : (long)(u32)(cum[i + l] - cum[i]) - mpy_pv(P->ml, l - MPY_MINM) - mpy_pv(P->of + 3, i - x);
+        if (g > c->g)
+            c->g = g, c->l = l, c->oc = 3, c->off = i - x;
+    }
+    if (c->oc == 3)
+        for (r = 0; r < 3; r++)
+            if (c->off == rep[r])
+                c->oc = r;
+}
+/* the sequences of in[pro..n) into m->s */
+static void mpy_greedy(Mpy *m, size_t pro, const MpyPrice *P)
+{
+    const u8 *in = m->in;
+    size_t n = m->n, i, lit = pro;
+    u64 rep[3];
+    u32 *cum = (u32 *)xmalloc(sizeof(u32) * (n + 1)); /* (literal prices summed, mod 2^32: differences are exact) */
+    rep[0] = 1, rep[1] = 2, rep[2] = 3;
+    cum[0] = 0;
+    for (i = 0; i < n; i++)
+        cum[i + 1] = cum[i] + (u32)P->lit[in[i]];
+    for (i = 0; i < pro; i++) /* (the bodies may copy from the declarations) */
+        mpy_ins(m, i);
+    i = pro;
+    while (i < n) {
+        MpyCand c, c1;
+        size_t j;
+        mpy_best(m, P, cum, i, rep, &c);
+        mpy_ins(m, i);
+        if (c.l == 0) {
+            i++;
+            continue;
+        }
+        if (i + 1 < n && !(c.oc < 3 && c.l >= MPY_REPTAKE)) {
+            mpy_best(m, P, cum, i + 1, rep, &c1); /* (lazy: a better copy one byte on) */
+            if (c1.l && c1.g - P->lit[in[i]] > c.g) {
+                i++;
+                continue;
+            }
+        }
+        mpy_seq(m, i - lit, c.l, c.oc, c.off);
+        mpy_rep(rep, c.oc, c.off);
+        for (j = i + 1; j < i + c.l; j++)
+            mpy_ins(m, j);
+        i += c.l;
+        lit = i;
+    }
+    free(cum);
+}
+
+/* ---- the optimal parse ----
+   Node j of a window is position i0 + j: its price, and the step that reached it (a literal, len 0, or a copy of
+   len from node from); its literal run and repeat offsets are filled in from that step when the node is reached in
+   order. A copy candidate relaxes only the lengths the cheaper candidates before it did not reach (repeat 0, 1, 2,
+   then chain matches nearest first). */
+typedef struct {
+    u32 len, litrun;
+    int oc, from;
+    u64 off, rep[3];
+} MpyNode;
+static void mpy_opt(Mpy *m, size_t pro, const MpyPrice *P)
+{
+    const u8 *in = m->in;
+    size_t n = m->n, i0, lit = pro;
+    int W = MPY_OPTW + MPY_NICE + 8, j;
+    MpyNode *nd = (MpyNode *)xmalloc(sizeof(MpyNode) * (size_t)W);
+    long *pr = (long *)xmalloc(sizeof(long) * (size_t)W);
+    int *mlp = (int *)xmalloc(sizeof(int) * (size_t)W), *path = (int *)xmalloc(sizeof(int) * (size_t)W);
+    u64 rep[3];
+    rep[0] = 1, rep[1] = 2, rep[2] = 3;
+    for (j = 0; j < W; j++)
+        mlp[j] = j >= MPY_MINM ? mpy_pv(P->ml, (u64)(j - MPY_MINM)) : 0;
+    for (i0 = 0; i0 < pro; i0++)
+        mpy_ins(m, i0);
+    i0 = pro;
+    while (i0 < n) {
+        int e = -1, lj = -1, reach = 0, np, q;
+        size_t lL = 0;
+        int lOC = 0;
+        u64 lOFF = 0;
+        pr[0] = 0;
+        nd[0].litrun = (u32)(i0 - lit), nd[0].from = -1, nd[0].len = 0;
+        nd[0].rep[0] = rep[0], nd[0].rep[1] = rep[1], nd[0].rep[2] = rep[2];
+        for (j = 0;; j++) {
+            size_t p = i0 + (size_t)j, best = MPY_MINM - 1, cl[40], done = MPY_MINM - 1;
+            const u8 *ce = in + (p + MPY_NICE < n ? p + MPY_NICE : n);
+            int co[40], nc = 0, r, d, k;
+            u64 cf[40];
+            u32 x;
+            long base;
+            MpyNode *N = &nd[j];
+            if (j > 0) {
+                MpyNode *F = &nd[N->from];
+                N->rep[0] = F->rep[0], N->rep[1] = F->rep[1], N->rep[2] = F->rep[2];
+                if (N->len == 0)
+                    N->litrun = F->litrun + 1;
+                else
+                    N->litrun = 0, mpy_rep(N->rep, N->oc, N->off);
+            }
+            if (p >= n || j >= MPY_OPTW) {
+                e = j;
+                break;
+            }
+            while (reach < j + 1)
+                pr[++reach] = MPY_INF;
+            if (pr[j] + P->lit[in[p]] < pr[j + 1]) {
+                pr[j + 1] = pr[j] + P->lit[in[p]];
+                nd[j + 1].len = 0, nd[j + 1].from = j;
+            }
+            for (r = 0; r < 3; r++)
+                if (N->rep[r] <= p) {
+                    size_t l = mpy_len(in + p - N->rep[r], in + p, ce);
+                    if (l >= MPY_MINM)
+                        cl[nc] = l, co[nc] = r, cf[nc] = N->rep[r], nc++;
+                }
+            if (p + 8 <= n) {
+                size_t rb = 0;
+                for (k = 0; k < nc; k++)
+                    if (cl[k] > rb)
+                        rb = cl[k];
+                for (x = m->h[pk_h8(in + p, m->hb)], d = 0; d < m->depth && x != 0xffffffffu; d++, x = m->chain[x]) {
+                    size_t l = mpy_len(in + x, in + p, ce);
+                    if (l > best)
+                        best = l, cl[nc] = l, co[nc] = 3, cf[nc] = p - x, nc++;
+                }
+                if (best > rb)
+                    rb = best;
+                if (rb < 32 && p + 32 <= n && (x = m->h32[pk_h32(in + p, m->hb)]) != 0xffffffffu && x < p) {
+                    size_t l = mpy_len(in + x, in + p, ce);
+                    if (l > rb)
+                        cl[nc] = l, co[nc] = 3, cf[nc] = p - x, nc++;
+                }
+            }
+            mpy_ins(m, p);
+            for (k = 0; k < nc; k++)
+                if (co[k] == 3)
+                    for (r = 0; r < 3; r++)
+                        if (cf[k] == N->rep[r])
+                            co[k] = r;
+            for (k = 0; k < nc; k++)
+                if (cl[k] >= MPY_NICE && cl[k] > lL)
+                    lL = cl[k], lOC = co[k], lOFF = cf[k], lj = j;
+            if (lj >= 0) { /* a long copy here: the window ends, the copy is taken after it */
+                e = j;
+                break;
+            }
+            base = pr[j] + mpy_pv(P->ll, N->litrun);
+            for (k = 0; k < nc; k++) {
+                size_t l, L = cl[k];
+                long ofp = co[k] < 3 ? P->of[co[k]] : mpy_pv(P->of + 3, cf[k]);
+                if ((size_t)j + L > (size_t)(MPY_OPTW + MPY_NICE))
+                    L = (size_t)(MPY_OPTW + MPY_NICE - j);
+                while ((size_t)reach < (size_t)j + L)
+                    pr[++reach] = MPY_INF;
+                for (l = done + 1; l <= L; l++) {
+                    long c = base + mlp[l] + ofp;
+                    if (c < pr[(size_t)j + l]) {
+                        MpyNode *T = &nd[(size_t)j + l];
+                        pr[(size_t)j + l] = c;
+                        T->len = (u32)l, T->oc = co[k], T->off = cf[k], T->from = j;
+                    }
+                }
+                if (L > done)
+                    done = L;
+            }
+        }
+        for (np = 0, q = e; q > 0; q = nd[q].from)
+            path[np++] = q;
+        for (q = np - 1; q >= 0; q--) {
+            MpyNode *T = &nd[path[q]];
+            if (T->len) {
+                size_t at = i0 + (size_t)T->from;
+                mpy_seq(m, at - lit, T->len, T->oc, T->off);
+                lit = at + T->len;
+            }
+        }
+        rep[0] = nd[e].rep[0], rep[1] = nd[e].rep[1], rep[2] = nd[e].rep[2];
+        i0 += (size_t)e;
+        if (lj >= 0) {
+            size_t k2;
+            int oc = lOC, r;
+            lL = mpy_len(in + i0 - lOFF, in + i0, in + n); /* (seen capped at MPY_NICE) */
+            if (oc == 3)
+                for (r = 0; r < 3; r++)
+                    if (lOFF == rep[r])
+                        oc = r;
+            mpy_seq(m, i0 - lit, lL, oc, lOFF);
+            mpy_rep(rep, oc, lOFF);
+            for (k2 = i0 + 1; k2 < i0 + lL; k2++)
+                mpy_ins(m, k2);
+            i0 += lL;
+            lit = i0;
+        }
+    }
+    free(nd);
+    free(pr);
+    free(mlp);
+    free(path);
+}
+
+static void mpy_stats(const u8 *in, size_t n, size_t pro, const MpySeq *s, size_t ns, u64 *f0, u64 *f1, u64 *f2, u64 *f3)
+{
+    size_t k, i = pro, j;
+    int nb;
+    u64 ex;
+    memset(f0, 0, MPY_NLIT * sizeof *f0);
+    memset(f1, 0, MPY_NLEN * sizeof *f1);
+    memset(f2, 0, MPY_NLEN * sizeof *f2);
+    memset(f3, 0, MPY_NOF * sizeof *f3);
+    for (k = 0; k < ns; k++) {
+        for (j = 0; j < s[k].ll; j++)
+            f0[in[i + j]]++;
+        i += s[k].ll + s[k].ml;
+        f1[mpy_bk(s[k].ll, &nb, &ex)]++;
+        f2[mpy_bk(s[k].ml - MPY_MINM, &nb, &ex)]++;
+        f3[s[k].oc < 3 ? s[k].oc : 3 + mpy_bk(s[k].off, &nb, &ex)]++;
+    }
+    for (; i < n; i++)
+        f0[in[i]]++;
+}
+
+typedef struct {
+    Buf *o;
+    u64 b;
+    int n;
+} MpyBits;
+static void mpy_put(MpyBits *w, u64 v, int k)
+{
+    if (k > 32) {
+        mpy_put(w, v & 0xffffffffu, 32);
+        mpy_put(w, v >> 32, k - 32);
+        return;
+    }
+    w->b |= (v & (((u64)1 << k) - 1)) << w->n;
+    w->n += k;
+    while (w->n >= 8) {
+        buf_u8(w->o, (u32)(w->b & 255));
+        w->b >>= 8;
+        w->n -= 8;
+    }
+}
+
+/* out = "\0MPY", n, m, P, in[0..P) plain, the coded body (m bytes); level 2 greedy, 3 optimal */
+static void ptx_pack_mpy(Buf *out, const u8 *in, size_t n, size_t pro, int level)
+{
+    Mpy m;
+    MpyPrice P;
+    u64 f0[MPY_NLIT], f1[MPY_NLEN], f2[MPY_NLEN], f3[MPY_NOF];
+    u8 l0[MPY_NLIT], l1[MPY_NLEN], l2[MPY_NLEN], l3[MPY_NOF];
+    u32 c0[MPY_NLIT], c1[MPY_NLEN], c2[MPY_NLEN], c3[MPY_NOF];
+    size_t k, i, at, sn = n;
+    const u8 *L[4];
+    int N[4], t;
+    MpyBits w;
+
+    /* prices: a greedy parse of a sample, from defaults */
+    memset(l0, 6, sizeof l0), memset(l1, 4, sizeof l1), memset(l2, 4, sizeof l2), memset(l3, 6, sizeof l3);
+    l3[0] = 1, l3[1] = 3, l3[2] = 4;
+    mpy_price(&P, l0, l1, l2, l3);
+    if (sn > pro + MPY_SAMPLE)
+        sn = pro + MPY_SAMPLE;
+    mpy_start(&m, in, sn, 1);
+    mpy_greedy(&m, pro, &P);
+    mpy_stats(in, sn, pro, m.s, m.ns, f0, f1, f2, f3);
+    mpy_lens(f0, MPY_NLIT, l0), mpy_lens(f1, MPY_NLEN, l1), mpy_lens(f2, MPY_NLEN, l2), mpy_lens(f3, MPY_NOF, l3);
+    mpy_stop(&m);
+    free(m.s);
+    /* the whole text with those prices */
+    mpy_price(&P, l0, l1, l2, l3);
+    mpy_start(&m, in, n, level >= 3 ? 4 : 1);
+    if (level >= 3)
+        mpy_opt(&m, pro, &P);
+    else
+        mpy_greedy(&m, pro, &P);
+    mpy_stop(&m);
+    mpy_stats(in, n, pro, m.s, m.ns, f0, f1, f2, f3);
+    mpy_lens(f0, MPY_NLIT, l0), mpy_lens(f1, MPY_NLEN, l1), mpy_lens(f2, MPY_NLEN, l2), mpy_lens(f3, MPY_NOF, l3);
+    mpy_codes(l0, MPY_NLIT, c0), mpy_codes(l1, MPY_NLEN, c1), mpy_codes(l2, MPY_NLEN, c2), mpy_codes(l3, MPY_NOF, c3);
+
+    buf_put(out, "\0MPY", 4);
+    buf_u64(out, (u64)n);
+    at = out->len;
+    buf_u64(out, 0);
+    buf_u64(out, (u64)pro);
+    buf_put(out, in, pro);
+    buf_uleb(out, (u64)m.ns);
+    L[0] = l0, L[1] = l1, L[2] = l2, L[3] = l3;
+    N[0] = MPY_NLIT, N[1] = MPY_NLEN, N[2] = MPY_NLEN, N[3] = MPY_NOF;
+    for (t = 0; t < 4; t++)
+        for (k = 0; k < (size_t)N[t]; k += 2)
+            buf_u8(out, (u32)(L[t][k] | (k + 1 < (size_t)N[t] ? L[t][k + 1] << 4 : 0)));
+    w.o = out, w.b = 0, w.n = 0;
+    for (i = pro, k = 0; k < m.ns; k++) {
+        const MpySeq *s = &m.s[k];
+        size_t j;
+        int nb, c;
+        u64 ex;
+        c = mpy_bk(s->ll, &nb, &ex);
+        mpy_put(&w, c1[c], l1[c]);
+        mpy_put(&w, ex, nb);
+        for (j = 0; j < s->ll; j++)
+            mpy_put(&w, c0[in[i + j]], l0[in[i + j]]);
+        i += s->ll + s->ml;
+        c = mpy_bk(s->ml - MPY_MINM, &nb, &ex);
+        mpy_put(&w, c2[c], l2[c]);
+        mpy_put(&w, ex, nb);
+        if (s->oc < 3)
+            mpy_put(&w, c3[s->oc], l3[s->oc]);
+        else {
+            c = mpy_bk(s->off, &nb, &ex);
+            mpy_put(&w, c3[3 + c], l3[3 + c]);
+            mpy_put(&w, ex, nb);
+        }
+    }
+    for (; i < n; i++)
+        mpy_put(&w, c0[in[i]], l0[in[i]]);
+    if (w.n)
+        buf_u8(out, (u32)(w.b & 255));
+    put_u64le(out->p + at, (u64)(out->len - at - 16 - pro));
+    free(m.s);
+}
+
 static u32 put_data(Obj *o, int sec, const void *p, size_t n, u32 align)
 {
     u64 off = obj_reserve(o, sec, n, align);
@@ -4492,11 +5045,14 @@ void ptx_finish(Obj *o)
         }
     }
     buf_u8(&t, 0);
-    if (opt_ptx_raw) {
+    if (opt_ptx_raw || opt_ptx_pack == 0) {
         textsym = put_data(o, SEC_CONST, t.p, t.len, 1);
     } else { /* (packed: mcuda_pack.h; the run time unpacks it before it reads it) */
         Buf z = {0};
-        ptx_pack(&z, t.p, t.len, prologue);
+        if (opt_ptx_pack == 1)
+            ptx_pack(&z, t.p, t.len, prologue);
+        else
+            ptx_pack_mpy(&z, t.p, t.len, prologue, opt_ptx_pack);
         textsym = put_data(o, SEC_CONST, z.p, z.len, 1);
         buf_free(&z);
     }

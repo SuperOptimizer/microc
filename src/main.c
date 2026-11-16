@@ -223,6 +223,7 @@ static int std_c99; /* -std names C99 or later: restrict is a keyword */
 static int force_cuda; /* -x cuda */
 const char *opt_ptx_out;
 int opt_ptx_raw;
+int opt_ptx_pack = 2;
 char opt_cuda_target[24] = "sm_86"; /* CUDA: the .target of the PTX: the GPU of --cuda-arch */
 static int cuda_arch = 860; /* CUDA: the value of __CUDA_ARCH__; --cuda-arch=N or nvcc's -arch=sm_NN */
 int opt_fmad = 1;
@@ -767,6 +768,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_ptx_out = a + 10;
         else if (strcmp(a, "--cuda-ptx-raw") == 0)
             opt_ptx_raw = 1;
+        else if (strncmp(a, "--cuda-ptx-pack=", 16) == 0 && a[16] >= '0' && a[16] <= '3' && !a[17])
+            opt_ptx_pack = a[16] - '0';
         else if (strncmp(a, "--cuda-arch=", 12) == 0) {
             /* N, ten times the GPU's number as __CUDA_ARCH__ has it; a letter after it is the GPU's own (1200a) */
             const char *q = a + 12;

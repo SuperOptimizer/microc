@@ -6,11 +6,23 @@
    (mcuda_ptx_plain below); the result is the exact text, so the JIT cache key (the text) is unchanged.
    The declarations ahead of the first function body (the prologue: all that mcudahw's scan of every unit reads at
    the first launch) stay plain, so a process unpacks the bodies of only the units whose kernels it runs.
-   Layout: "\0MPZ" (a PTX text never starts with a NUL), the unpacked size n (8 bytes, little endian, the
-   terminating NUL included), the packed size m (8 bytes), the prologue size P (8 bytes), the P bytes of the
-   prologue, then m bytes of tokens that make the remaining n - P bytes (a copy may reach back into the prologue):
-     varint L, L literal bytes, [varint M - MCUDA_PACK_MINM, varint D: copy M bytes from D bytes back]
-   repeated; the last token has its literals only. varint: 7 bits a byte, low first, high bit = more. */
+   Layout: "\0MP" and a letter for the form (a PTX text never starts with a NUL), the unpacked size n (8 bytes,
+   little endian, the terminating NUL included), the packed size m (8 bytes), the prologue size P (8 bytes), the P
+   bytes of the prologue, then m bytes that make the remaining n - P bytes (a copy may reach back into the prologue).
+   Two forms of those m bytes:
+   - "\0MPZ" (mcc --cuda-ptx-pack=1; ~5x on ufsm): tokens
+       varint L, L literal bytes, [varint M - MCUDA_PACK_MINM, varint D: copy M bytes from D bytes back]
+     repeated; the last token has its literals only. varint: 7 bits a byte, low first, high bit = more.
+   - "\0MPY" (mcc's default, --cuda-ptx-pack=2 / 3; ~10x / ~13x on ufsm): sequences of literals and copies with
+     three repeat offsets, entropy-coded. varint S (the number of sequences); the code lengths of four canonical
+     prefix codes as nibbles, low nibble first, each table a whole number of bytes: LIT (256 symbols: the literal
+     bytes), LL (88: literal counts), ML (88: copy lengths - MCUDA_MPY_MINM), OF (91: offsets); then one bit stream,
+     least significant bit first, codes stored bit-reversed (the first bit of a code is the stream's next bit).
+     Each sequence: LL, that many LIT, ML, OF; OF 0..2 takes repeat offset 0..2 (newest first) and moves it to the
+     front, OF 3 + c is a new offset (bucket code c) pushed in front; the repeats start as 1, 2, 3. After the last
+     sequence, LIT up to n. Counts, lengths and offsets are bucket codes: v < 16 is the code itself; else, with
+     b = floor(log2 v), the code is 16 + 2 (b - 4) + the bit below the top one, followed by the low b - 1 bits of v
+     plain. Codes are at most MCUDA_MPY_MAXL bits. */
 #ifndef MCUDA_PACK_H
 #define MCUDA_PACK_H
 #include <stddef.h>
@@ -20,9 +32,196 @@
 #define MCUDA_PACK_MINM 6
 #define MCUDA_PACK_HDR 28
 
+/* ---- the MPY form's decoder ---- */
+#define MCUDA_MPY_MINM 3
+#define MCUDA_MPY_MAXL 11
+#define MCUDA_MPY_NLIT 256
+#define MCUDA_MPY_NLEN 88
+#define MCUDA_MPY_NOF 91
+
+typedef struct {
+    const unsigned char *p, *e; /* the next byte to load, the end */
+    unsigned long long b;       /* bits, the next one lowest */
+    int n;                      /* how many b holds */
+    int bad;                    /* no code here */
+    int pad;                    /* zero bits put in past the end (a stream that reads them is damaged) */
+} mcuda_bits;
+
+static inline void mcuda_bits_fill(mcuda_bits *s)
+{
+    if (s->p + 8 <= s->e) {
+        unsigned long long v;
+        int k = (63 - s->n) >> 3;
+        memcpy(&v, s->p, 8);
+        s->b |= v << s->n;
+        s->p += k;
+        s->n += k * 8;
+        s->b &= s->n >= 64 ? ~0ull : (1ull << s->n) - 1;
+    } else
+        while (s->n <= 56) {
+            if (s->p < s->e)
+                s->b |= (unsigned long long)*s->p++ << s->n;
+            else
+                s->pad += 8;
+            s->n += 8;
+        }
+}
+
+static inline unsigned long long mcuda_bits_get(mcuda_bits *s, int k)
+{
+    unsigned long long v;
+    if (k == 0)
+        return 0;
+    if (s->n < k)
+        mcuda_bits_fill(s);
+    v = s->b & ((1ull << k) - 1);
+    s->b >>= k;
+    s->n -= k;
+    return v;
+}
+
+/* a decoding table: (symbol << 4 | length) by the next MAXL bits; 0 where no code is */
+typedef unsigned short mcuda_htab[1 << MCUDA_MPY_MAXL];
+
+/* the table of nsym code lengths len[]: -1 when they are not a prefix code */
+static inline int mcuda_htab_make(mcuda_htab t, const unsigned char *len, int nsym)
+{
+    int cnt[MCUDA_MPY_MAXL + 1], next[MCUDA_MPY_MAXL + 1], s, l, code = 0, used = 0;
+    memset(t, 0, sizeof(mcuda_htab));
+    memset(cnt, 0, sizeof cnt);
+    for (s = 0; s < nsym; s++)
+        cnt[len[s]]++;
+    cnt[0] = 0;
+    for (l = 1; l <= MCUDA_MPY_MAXL; l++) {
+        code = (code + cnt[l - 1]) << 1;
+        next[l] = code;
+        used += cnt[l] << (MCUDA_MPY_MAXL - l);
+    }
+    if (used > (1 << MCUDA_MPY_MAXL))
+        return -1;
+    for (s = 0; s < nsym; s++) {
+        int c, r = 0, k, step;
+        l = len[s];
+        if (!l)
+            continue;
+        c = next[l]++;
+        for (k = 0; k < l; k++) /* (the stream is LSB first: the code reversed) */
+            r |= ((c >> k) & 1) << (l - 1 - k);
+        for (step = 1 << l, k = r; k < (1 << MCUDA_MPY_MAXL); k += step)
+            t[k] = (unsigned short)(s << 4 | l);
+    }
+    return 0;
+}
+
+static inline int mcuda_hget(mcuda_bits *s, const mcuda_htab t)
+{
+    unsigned e;
+    if (s->n < MCUDA_MPY_MAXL)
+        mcuda_bits_fill(s);
+    e = t[s->b & ((1u << MCUDA_MPY_MAXL) - 1)];
+    if (!e) {
+        s->bad = 1;
+        return 0;
+    }
+    s->b >>= e & 15;
+    s->n -= (int)(e & 15);
+    return (int)(e >> 4);
+}
+
+static inline unsigned long long mcuda_bucket_get(mcuda_bits *s, int code)
+{
+    int b, half;
+    if (code < 16)
+        return (unsigned long long)code;
+    b = 4 + (code - 16) / 2;
+    half = (code - 16) & 1;
+    return 1ull << b | (unsigned long long)half << (b - 1) | mcuda_bits_get(s, b - 1);
+}
+
+/* the nibbles of nsym code lengths at *pp (< e), into len[]; -1 if short */
+static inline int mcuda_mpy_lens(const unsigned char **pp, const unsigned char *e, unsigned char *len, int nsym)
+{
+    int k;
+    const unsigned char *p = *pp;
+    if ((size_t)(e - p) < (size_t)(nsym + 1) / 2)
+        return -1;
+    for (k = 0; k < nsym; k++)
+        len[k] = (unsigned char)((p[k >> 1] >> ((k & 1) * 4)) & 15);
+    *pp = p + (nsym + 1) / 2;
+    for (k = 0; k < nsym; k++)
+        if (len[k] > MCUDA_MPY_MAXL)
+            return -1;
+    return 0;
+}
+
+/* Decodes an MPY body (m bytes) into out[pl .. n) after the prologue out[0 .. pl) (already there). -1 on a damaged body. */
+static inline int mcuda_mpy_body(const unsigned char *body, unsigned long long m, char *outc, unsigned long long pl,
+                                   unsigned long long n)
+{
+    static const int nsym[4] = {MCUDA_MPY_NLIT, MCUDA_MPY_NLEN, MCUDA_MPY_NLEN, MCUDA_MPY_NOF};
+    const unsigned char *p = body, *e = body + m;
+    unsigned char *o = (unsigned char *)outc + pl, *oe = (unsigned char *)outc + n, *st = (unsigned char *)outc;
+    unsigned char len[256];
+    unsigned long long nseq = 0, rep[3] = {1, 2, 3};
+    int s = 0, k;
+    mcuda_bits B;
+    mcuda_htab *T;
+    int r = -1;
+
+    while (p < e && (*p & 128) && s < 63)
+        nseq |= (unsigned long long)(*p++ & 127) << s, s += 7;
+    if (p >= e || s >= 63)
+        return -1;
+    nseq |= (unsigned long long)*p++ << s;
+    if (!(T = (mcuda_htab *)malloc(4 * sizeof(mcuda_htab)))) /* (16 KB: not for a thread's stack) */
+        return -1;
+    for (k = 0; k < 4; k++)
+        if (mcuda_mpy_lens(&p, e, len, nsym[k]) || mcuda_htab_make(T[k], len, nsym[k]))
+            goto out;
+    B.p = p, B.e = e, B.b = 0, B.n = 0, B.bad = 0, B.pad = 0;
+    while (nseq--) {
+        unsigned long long ll = mcuda_bucket_get(&B, mcuda_hget(&B, T[1])), ml, off;
+        int oc;
+        if (B.bad || ll > (unsigned long long)(oe - o))
+            goto out;
+        while (ll--)
+            *o++ = (unsigned char)mcuda_hget(&B, T[0]);
+        ml = mcuda_bucket_get(&B, mcuda_hget(&B, T[2])) + MCUDA_MPY_MINM;
+        oc = mcuda_hget(&B, T[3]);
+        if (oc < 3) {
+            off = rep[oc];
+            for (; oc > 0; oc--)
+                rep[oc] = rep[oc - 1];
+            rep[0] = off;
+        } else {
+            off = mcuda_bucket_get(&B, oc - 3);
+            rep[2] = rep[1], rep[1] = rep[0], rep[0] = off;
+        }
+        if (B.bad || ml > (unsigned long long)(oe - o) || off == 0 || off > (unsigned long long)(o - st))
+            goto out;
+        {
+            const unsigned char *f = o - off;
+            if (off >= 8)
+                while (ml >= 8) {
+                    memcpy(o, f, 8);
+                    o += 8, f += 8, ml -= 8;
+                }
+            while (ml--)
+                *o++ = *f++;
+        }
+    }
+    while (o < oe && !B.bad)
+        *o++ = (unsigned char)mcuda_hget(&B, T[0]);
+    if (!B.bad && B.n >= B.pad && o == oe && oe[-1] == 0)
+        r = 0;
+out:
+    free(T);
+    return r;
+}
+
 static inline int mcuda_packed(const char *p)
 {
-    return p && p[0] == 0 && p[1] == 'M' && p[2] == 'P' && p[3] == 'Z';
+    return p && p[0] == 0 && p[1] == 'M' && p[2] == 'P' && (p[3] == 'Z' || p[3] == 'Y');
 }
 
 static inline unsigned long long mcuda_pack_rd8(const unsigned char *p)
@@ -68,7 +267,20 @@ static inline int mcuda_unpack_prologue(const char *p, char *out)
 /* Unpacks the bodies of packed record p into out, after the prologue (out as mcuda_unpack_prologue left it), so
    that out holds the whole text. -1 on a damaged record (sizes or a copy out of range, a text that does not end
    in its NUL): out then holds the prologue alone. */
+static inline int mcuda_unpack_mpz(const char *p, char *out);
 static inline int mcuda_unpack_body(const char *p, char *out)
+{
+    unsigned long long n = mcuda_pack_n(p), m = mcuda_pack_m(p), pl = mcuda_pack_p(p);
+    if (p[3] != 'Y')
+        return mcuda_unpack_mpz(p, out);
+    if (n < 1 || n > (1ull << 40) || pl >= n || m > (1ull << 40) ||
+        mcuda_mpy_body((const unsigned char *)p + MCUDA_PACK_HDR + pl, m, out, pl, n)) {
+        out[pl] = 0;
+        return -1;
+    }
+    return 0;
+}
+static inline int mcuda_unpack_mpz(const char *p, char *out)
 {
     unsigned long long n = mcuda_pack_n(p), m = mcuda_pack_m(p), pl = mcuda_pack_p(p), l, ml, d;
     const unsigned char *i = (const unsigned char *)p + MCUDA_PACK_HDR + pl, *e = i + m;

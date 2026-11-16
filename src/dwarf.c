@@ -1285,6 +1285,48 @@ static int cmp_u32(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
+/* loclists' sweep: indices into lp_ord (the variable's places in list order) */
+static const u32 *lp_ord;
+static int cmp_lp_start(const void *a, const void *b)
+{
+    u32 x = places[lp_ord[*(const u32 *)a]].start, y = places[lp_ord[*(const u32 *)b]].start;
+    if (x != y)
+        return x < y ? -1 : 1;
+    return *(const u32 *)a < *(const u32 *)b ? -1 : *(const u32 *)a > *(const u32 *)b;
+}
+/* heap order: higher rank first, then the earlier in the list (the old scan's choice) */
+static int lp_before(u32 a, u32 b)
+{
+    u32 ra = places[lp_ord[a]].rank, rb = places[lp_ord[b]].rank;
+    return ra != rb ? ra > rb : a < b;
+}
+static void lp_push(u32 *h, u32 *nh, u32 x)
+{
+    u32 i = (*nh)++;
+    while (i && lp_before(x, h[(i - 1) / 2])) {
+        h[i] = h[(i - 1) / 2];
+        i = (i - 1) / 2;
+    }
+    h[i] = x;
+}
+static void lp_pop(u32 *h, u32 *nh)
+{
+    u32 x = h[--*nh], i = 0, c;
+    if (!*nh)
+        return;
+    for (;;) {
+        c = 2 * i + 1;
+        if (c >= *nh)
+            break;
+        if (c + 1 < *nh && lp_before(h[c + 1], h[c]))
+            c++;
+        if (!lp_before(h[c], x))
+            break;
+        h[i] = h[c];
+        i = c;
+    }
+    h[i] = x;
+}
 static void loclists(void)
 {
     Buf *b = sec(s_loc);
@@ -1301,7 +1343,7 @@ static void loclists(void)
         u32 fsym = fns[k].sym;
         for (v = fsym < nfloc ? vhead[fsym] : 0; v; v = vars[v - 1].next) {
             DwVar *x = &vars[v - 1];
-            u32 p, n = 0, i, j, *ord, *pt, npt = 0, cur_p = ~0U, cur_s = 0;
+            u32 p, n = 0, i, j, *ord, *pt, *bys, *hp, nh = 0, nx = 0, npt = 0, cur_p = ~0U, cur_s = 0;
             if (x->kind != 2)
                 continue;
             for (p = x->lr; p; p = places[p - 1].next)
@@ -1314,6 +1356,13 @@ static void loclists(void)
                 pt[npt++] = places[p - 1].end;
             }
             qsort(pt, npt, sizeof(u32), cmp_u32);
+            /* the sweep: places in order of start (bys), the active ones in a heap (hp) by rank, ties to the earlier in the list */
+            bys = (u32 *)xmalloc((n ? n : 1) * sizeof(u32));
+            hp = (u32 *)xmalloc((n ? n : 1) * sizeof(u32));
+            for (i = 0; i < n; i++)
+                bys[i] = i;
+            lp_ord = ord;
+            qsort(bys, n, sizeof(u32), cmp_lp_start);
             b = sec(s_loc);
             loc_off[v - 1] = (u32)b->len + 1;
             buf_u8(b, 6); /* DW_LLE_base_address: the function */
@@ -1326,12 +1375,14 @@ static void loclists(void)
                 u32 best = ~0U;
                 if (j + 1 < npt && pt[j] == pt[j + 1])
                     continue;
-                if (j + 1 < npt)
-                    for (i = 0; i < n; i++) {
-                        DwPlace *q = &places[ord[i]];
-                        if (q->start <= pt[j] && pt[j + 1] <= q->end && (best == ~0U || q->rank > places[best].rank))
-                            best = ord[i];
-                    }
+                if (j + 1 < npt) {
+                    while (nx < n && places[ord[bys[nx]]].start <= pt[j])
+                        lp_push(hp, &nh, bys[nx++]);
+                    while (nh && places[ord[hp[0]]].end < pt[j + 1])
+                        lp_pop(hp, &nh);
+                    if (nh)
+                        best = ord[hp[0]];
+                }
                 if (cur_p != ~0U && (best == ~0U || places[best].len != places[cur_p].len ||
                                      memcmp(places[best].expr, places[cur_p].expr, places[cur_p].len))) {
                     buf_u8(b, 4); /* DW_LLE_offset_pair */
@@ -1349,6 +1400,8 @@ static void loclists(void)
             buf_u8(b, 0); /* DW_LLE_end_of_list */
             free(ord);
             free(pt);
+            free(bys);
+            free(hp);
         }
     }
     put32(b, len_at, (u32)(b->len - len_at - 4));

@@ -5736,7 +5736,7 @@ static u32 place_expr(u8 *e, u32 l, int byref)
    live. Positions of the allocator are turned into code offsets through the instructions' offsets. */
 static void var_places(u32 start)
 {
-    u32 k, v, b, i, j, sl, nslot = mf.n + mf.nblk + 1, *ss, *se, *byslot, cap = 64, *rs, *re, *one;
+    u32 k, v, b, i, j, sl, nslot = mf.n + mf.nblk + 1, *ss, *se, *byslot, cap = 64, *rs, *re, *one, *seen, nseen;
     if (!dwarf_vars(f->sym))
         return;
     byslot = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32));
@@ -5765,6 +5765,12 @@ static void var_places(u32 start)
     re = (u32 *)xmalloc(cap * sizeof(u32));
     one = (u32 *)xmalloc((f->nslots + 1) * sizeof(u32)); /* by slot: its one value, 0 none, ~0 more */
     memset(one, 0, (f->nslots + 1) * sizeof(u32));
+    /* (value, slot) pairs already placed: many instructions resolve to one value (ir_resolve), and each would add the value's
+       whole set of ranges again (predict.c under -g: 123 M places for 1598 variables, 25 s of sorting) */
+    for (nseen = 64; nseen < 2 * (f->nins + f->ndv); nseen *= 2)
+        ;
+    seen = (u32 *)xmalloc(2 * nseen * sizeof(u32));
+    memset(seen, 0, 2 * nseen * sizeof(u32));
     for (j = 1; j < f->nins + f->ndv; j++) {
         Ins *in;
         u32 d, l, n, len, sl, rank;
@@ -5785,6 +5791,15 @@ static void var_places(u32 start)
         one[sl] = !one[sl] || one[sl] == v ? v : ~0U;
         if (!in->blk)
             continue;
+        {
+            u32 hh = ((v * 2654435761U) ^ (sl * 40503U)) & (nseen - 1);
+            while (seen[2 * hh] && (seen[2 * hh] != v || seen[2 * hh + 1] != sl))
+                hh = (hh + 1) & (nseen - 1);
+            if (seen[2 * hh])
+                continue;
+            seen[2 * hh] = v;
+            seen[2 * hh + 1] = sl;
+        }
         d = ra_dense(v);
         if (d == NOREG || (l = mf.loc[d]) == NOREG)
             continue;
@@ -5846,6 +5861,7 @@ static void var_places(u32 start)
             dwarf_var_place(byslot[sl], 0, moff[mf.n] - start, e, len, 0);
     }
     free(one);
+    free(seen);
     free(rs);
     free(re);
     free(ss);

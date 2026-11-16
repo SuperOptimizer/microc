@@ -2632,6 +2632,7 @@ void opt_run(Func *fn)
 }
 
 static void finish_passes(Func *fn);
+static int fuse_sincos(void);
 
 void opt_finish(Func *fn)
 {
@@ -2721,6 +2722,9 @@ static void run_passes(Func *fn)
             if (licm())
                 ir_resolve_all(f);
     }
+    if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2 && !opt_size && opt_glibc && opt_obj && !getenv("MCC_NOSINCOS") &&
+        fuse_sincos())
+        ir_resolve_all(f);
     if (opt_level >= 3 && !opt_size && !opt_novec && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
         opt_dce(f);
         return; /* vector code stays out of the inliner: the scalar passes do not know it */
@@ -2729,6 +2733,97 @@ static void run_passes(Func *fn)
     if (opt_slotcheck)
         slot_check(fn, "end");
     inline_save(f);
+}
+
+/* x86-64 host, the GNU C library: sin (x) and cos (x) of one x are one call of sincos (x, &s, &c), which computes the
+   two from one reduction of x (clang does the same). The pair: pure calls (IF_PURE) of the same width on the same value, the
+   first dominating the second; the call goes where the first was, the two results through a stack slot (glibc 2.27 or
+   newer: the call is by the sincosf64 / sincosf32 alias). ufsm's
+   surflabels / patchid / score_par called both side by side (cos 10.9 + sin 7.1 G cycles where clang's sincos took 12.5).
+   MCC_NOSINCOS: off. */
+int opt_glibc;
+#define SINCOS_MAX 64
+static int fuse_sincos(void)
+{
+    u32 b, v, k, j, nc = 0, cv[SINCOS_MAX], ca[SINCOS_MAX], cpos[SINCOS_MAX], pos = 0;
+    u8 ck[SINCOS_MAX]; /* bit 0: cos, bit 1: float */
+    int any = 0;
+    static u32 nm[4];
+    static const char *const names[4] = {"sin", "cos", "sinf", "cosf"};
+    if (!nm[0])
+        for (k = 0; k < 4; k++)
+            nm[k] = intern_cstr(names[k]);
+    compute_dom();
+    for (k = 0; k < nrpo && nc < SINCOS_MAX; k++) {
+        b = rpo[k];
+        for (v = f->blk[b].first; v && nc < SINCOS_MAX; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            Ins *ce;
+            u32 q, name;
+            pos++;
+            if (i->op != OP_CALL || !(i->flags & IF_PURE) || i->b != 1)
+                continue;
+            ce = &f->ins[ir_resolve(f, i->c)];
+            if (ce->op != OP_ADDR || ce->b || !opt_obj->syms[ce->a].name)
+                continue;
+            name = opt_obj->syms[ce->a].name;
+            for (q = 0; q < 4 && nm[q] != name; q++)
+                ;
+            if (q == 4 || i->ty != (q >= 2 ? IT_F32 : IT_F64))
+                continue;
+            cv[nc] = v;
+            ca[nc] = ir_resolve(f, f->xargs[i->a]);
+            ck[nc] = (u8)q;
+            cpos[nc++] = pos; /* (in reverse postorder, so within a block the earlier first) */
+        }
+    }
+    for (k = 0; k < nc; k++) {
+        u32 a = cv[k], fb;
+        if (!a)
+            continue;
+        for (j = k + 1; j < nc; j++) {
+            u32 bv = cv[j], first, sv, cvv, slot, sz, call, ls, lc, args[3], sym, callee;
+            const char *fname;
+            int fl = ck[k] >> 1;
+            if (!bv || ca[j] != ca[k] || ck[j] != (ck[k] ^ 1))
+                continue;
+            fb = f->ins[a].blk;
+            if (fb == f->ins[bv].blk ? cpos[k] > cpos[j] : !dominates(fb, f->ins[bv].blk))
+                continue;
+            first = a;
+            sv = ck[k] & 1 ? bv : a;
+            cvv = ck[k] & 1 ? a : bv;
+            sz = fl ? 4 : 8;
+            fname = fl ? "sincosf32" : "sincosf64"; /* (glibc 2.27's aliases of sincosf / sincos: a name of the C library's own
+                                                     that no program defines, where a static sincos of the unit would be called) */
+            sym = obj_named_sym(opt_obj, intern_cstr(fname));
+            opt_obj->syms[sym].global = 1;
+            callee = ir_addr(f, sym, 0);
+            slot = ir_new_slot(f, 2 * sz, sz);
+            args[0] = ca[k];
+            args[1] = ir_slot_addr(f, slot, 0);
+            args[2] = ir_slot_addr(f, slot, sz);
+            {
+                u32 saved = f->cur;
+                f->cur = 0;
+                call = ir_call(f, IT_VOID, callee, args, 3, 0xffffffffU, 0);
+                f->cur = saved;
+            }
+            ir_insert_before(f, first, call);
+            ls = ir_raw(f, OP_LOAD, fl ? IT_F32 : IT_F64, args[1], 0);
+            f->ins[ls].mem = fl ? M_F32 : M_F64;
+            ir_insert_before(f, first, ls);
+            lc = ir_raw(f, OP_LOAD, fl ? IT_F32 : IT_F64, args[2], 0);
+            f->ins[lc].mem = fl ? M_F32 : M_F64;
+            ir_insert_before(f, first, lc);
+            ir_replace(f, sv, ls);
+            ir_replace(f, cvv, lc);
+            cv[k] = cv[j] = 0;
+            any = 1;
+            break;
+        }
+    }
+    return any;
 }
 
 static void finish_passes(Func *fn)

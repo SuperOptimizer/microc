@@ -529,6 +529,7 @@ static void target_macros(void)
             "__builtin_signbitl(x)=__signbit(x)", 0};
         pp_undef("__STDC_NO_THREADS__");
         pp_define("__mcc_glibc__");
+        opt_glibc = 1; /* (its sincos: opt.c fuse_sincos) */
         for (k = 0; g[k]; k++)
             pp_define(g[k]);
     }

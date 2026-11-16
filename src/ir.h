@@ -267,6 +267,7 @@ extern int opt_no_signed_zeros; /* -fno-signed-zeros (in -ffast-math) */
 extern int opt_finite_math; /* -ffinite-math-only (in -ffast-math): no NaN or infinity reaches a comparison, so a < b ? a : b may be a min */
 extern int opt_vec_report;
 extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
+extern int opt_glibc;      /* opt.c: x86-64 programs for the GNU C library (-mglibc / --sysroot): its functions beyond C's may be called */
 extern int opt_x64_fma;   /* x64.c: FMA3 may be used (-mfma, -march=native / x86-64-v3) */
 extern int opt_x64_bmi2;  /* x64.c: shlx / shrx / sarx for shifts by a register (BMI2; MCC_NOSHLX: off) */
 extern int opt_x64_avx2;  /* opt_vec.c: 32-byte vectors in AVX functions */

@@ -1309,6 +1309,8 @@ static int avx_takes(u32 v)
     case OP_VMATH:
     case OP_SITOF:
     case OP_FTOSI:
+    case OP_FEXT:
+    case OP_FTRUNC:
     case OP_FEQ: case OP_FNE: case OP_FLT: case OP_FLE: case OP_FGT: case OP_FGE:
         return 1;
     case OP_SHL:
@@ -1442,6 +1444,8 @@ static void sel_avx(u32 v)
     case OP_VMATH:
     case OP_SITOF:
     case OP_FTOSI:
+    case OP_FEXT:
+    case OP_FTRUNC:
     case OP_SELECT:
         sel_avx_more(v);
         return;
@@ -1643,7 +1647,18 @@ static void sel_avx_more(u32 v)
     }
     case OP_SITOF:
     case OP_FTOSI:
+        if (op == OP_SITOF && i->mem == M_F64) {
+            /* (opt_vec.c's doubles in four-byte lanes: the ints of an xmm to the doubles of a ymm) */
+            emit_vex(VE(0xe6, 1, 2, 0) | L, XF_RM, d, reg_of(i->a), NOREG, NOREG, -1); /* vcvtdq2pd */
+            return;
+        }
         emit_vex(VE(0x5b, 1, op == OP_SITOF ? 0 : 2, 0) | L, XF_RM, d, reg_of(i->a), NOREG, NOREG, -1); /* vcvtdq2ps, vcvttps2dq */
+        return;
+    case OP_FEXT: /* the floats of an xmm to the doubles of a ymm (opt_vec.c's dbl) */
+        emit_vex(VE(0x5a, 1, 0, 0) | L, XF_RM, d, reg_of(i->a), NOREG, NOREG, -1); /* vcvtps2pd */
+        return;
+    case OP_FTRUNC: /* the doubles of a ymm to the floats of an xmm: the length is the source's (EVEX: W1) */
+        emit_vex(VE(0x5a, 1, 1, 1) | (f->ins[i->a].ty == IT_V256 ? VE_L : 0), XF_RM, d, reg_of(i->a), NOREG, NOREG, -1); /* vcvtpd2ps */
         return;
     case OP_SELECT: {
         u32 c = reg_of(i->a);

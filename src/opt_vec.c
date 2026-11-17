@@ -65,6 +65,11 @@ static u32 iv;  /* the induction variable that indexes arrays, if any */
 static int ext; /* how the body widens it when it is 32 bits wide */
 static u32 lanesz; /* bytes per element; 0 = not known yet */
 static u32 vw = 16; /* bytes per vector */
+/* x86-64 AVX: double values computed in a loop of four-byte lanes (emb_at's v[k] += (float) (w * s[k]): int8 -> double, a product,
+   -> float) are vectors twice as wide, ymm beside the xmm of the rest (vw 16; a loop that needs it at vw 32 asks for a second try
+   at 16: dbl_retry). They come from and go to the four-byte lanes by vcvtdq2pd / vcvtps2pd / vcvtpd2ps; no double is read, written,
+   compared or summed (those loops have lanes of eight bytes) */
+static int dbl, dbl_ok, dbl_retry;
 static int vty = IT_V128; /* the type of vector values */
 
 /* induction variables: phi, phi + step each time round */
@@ -235,7 +240,13 @@ static int set_lane(int mem)
 /* can a value of this type be one lane? (i32 values may be narrower in memory) */
 static int fits(int ty)
 {
-    return ty == IT_I32 ? lanesz <= 4 : ty == IT_F32 ? lanesz == 4 : (ty == IT_I64 || ty == IT_F64) && lanesz == 8;
+    return ty == IT_I32 ? lanesz <= 4 : ty == IT_F32 ? lanesz == 4 : ((ty == IT_I64 || ty == IT_F64) && lanesz == 8) || (ty == IT_F64 && lanesz == 4 && dbl);
+}
+
+/* the vector type of a value of type ty: doubles in four-byte lanes (dbl) take twice the width */
+static int vt_of(int ty)
+{
+    return dbl && ty == IT_F64 && lanesz == 4 ? IT_V256 : vty;
 }
 
 static int lane_kind(int ty)
@@ -289,7 +300,7 @@ static u32 vec_operand(u32 x, u32 P)
         ;
     if (j == nsplat) {
         splat_of[j] = x;
-        splat[j] = mk(P, OP_VSPLAT, vty, outside(x), 0);
+        splat[j] = mk(P, OP_VSPLAT, vt_of(f->ins[x].ty), outside(x), 0);
         f->ins[splat[j]].mem = (u8)lane_kind(f->ins[x].ty);
         nsplat++;
     }
@@ -1140,6 +1151,8 @@ static int try_loop(u32 l, u32 n0)
 
     lanesz = 0;
     mixed = 0;
+    dbl = 0;
+    dbl_ok = opt_arch == ARCH_X64 && f->avx;
     nar = 0;
     ngth = 0;
     nsplat = 0;
@@ -1366,9 +1379,14 @@ static int try_loop(u32 l, u32 n0)
             nvec++;
             break;
         case OP_SITOF: case OP_UITOF: case OP_FTOSI: case OP_FTOUI:
-            /* between integers and floating point of the same width */
+            /* between integers and floating point of the same width (an int to a double: dbl) */
             if (!is_vec(i->a))
                 MISS("a value that is neither per-element nor constant in the loop");
+            if (i->ty == IT_F64 || f->ins[i->a].ty == IT_F64) {
+                if (i->op != OP_SITOF || f->ins[i->a].ty != IT_I32 || !dbl_ok)
+                    MISS("a conversion between doubles and integers other than an int to a double (x86-64 AVX)");
+                dbl = 1;
+            }
             full_only = 1;
             kind[v] = K_VEC;
             nvec++;
@@ -1411,6 +1429,15 @@ static int try_loop(u32 l, u32 n0)
         case OP_NEG: case OP_FNEG:
             if (!is_vec(i->a))
                 MISS("a value that is neither per-element nor constant in the loop");
+            kind[v] = K_VEC;
+            nvec++;
+            break;
+        case OP_FEXT: case OP_FTRUNC:
+            /* float <-> double: the doubles in vectors twice as wide (dbl) */
+            if (!dbl_ok || !is_vec(i->a))
+                MISS("a float / double conversion (x86-64 AVX only, of a per-element value)");
+            dbl = 1;
+            full_only = 1;
             kind[v] = K_VEC;
             nvec++;
             break;
@@ -1481,6 +1508,26 @@ static int try_loop(u32 l, u32 n0)
     /* (x86-64: vec_pressure below counts what is alive at once; AVX functions' vectors can also be spilled) */
     if (opt_arch != ARCH_X64 && nvec + nred * 5 > MAX_VECS)
         MISS("too much going on for the vector registers");
+    if (dbl && lanesz != 4)
+        dbl = 0; /* (lanes of eight bytes hold the doubles themselves) */
+    if (dbl) {
+        for (v = f->blk[l].first; v; v = f->ins[v].next) {
+            Ins *x = &f->ins[v];
+            missv = v;
+            if (kind[v] == K_MASK && f->ins[x->a].ty == IT_F64)
+                MISS("a comparison of doubles in four-byte lanes");
+            if (kind[v] == K_VEC && x->ty == IT_F64 && x->op != OP_FADD && x->op != OP_FSUB && x->op != OP_FMUL && x->op != OP_FDIV &&
+                x->op != OP_FNEG && x->op != OP_SITOF && x->op != OP_FEXT)
+                MISS("an operation on doubles in four-byte lanes that is not arithmetic or a conversion");
+        }
+        for (k = 0; k < nred; k++)
+            if (f->ins[red_phi[k]].ty == IT_F64)
+                MISS("a sum of doubles in four-byte lanes");
+        if (vw != 16) {
+            dbl_retry = 1; /* (opt_vectorise tries the loop again with vectors of 16 bytes: the doubles' then 32) */
+            MISS("doubles in four-byte lanes need vectors of 16 bytes (tried again)");
+        }
+    }
     for (v = f->blk[l].first; v; v = f->ins[v].next)
         if ((kind[v] == K_VEC && !fits(f->ins[v].ty)) || (kind[v] == K_MASK && !fits(f->ins[f->ins[v].a].ty)))
             MISS("elements of different widths");
@@ -1909,7 +1956,7 @@ static int try_loop(u32 l, u32 n0)
                 nv = mk(V, in.op, vty, vec_operand(in.a, VP), in.b); /* the count stays a constant */
             } else if (ir_opcount_tab[in.op] == 1) {
                 /* x86-64 takes only unsigned values below 2^31 (x64_has): the signed conversion */
-                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : opt_arch == ARCH_X64 && in.op == OP_FTOUI ? OP_FTOSI : in.op, vty, vec_operand(in.a, VP), 0);
+                nv = mk(V, opt_arch == ARCH_X64 && in.op == OP_UITOF ? OP_SITOF : opt_arch == ARCH_X64 && in.op == OP_FTOUI ? OP_FTOSI : in.op, vt_of(in.ty), vec_operand(in.a, VP), 0);
             } else if (in.op == OP_FDIV && INV(in.b) && (opt_reciprocal_math || exact_recip(in.b)) && nsplat < MAX_SPLATS) {
                 /* x / c as x * (1 / c), 1 / c worked out once in the preheader: exact when 1 / c is (c a power of
                    two), else -freciprocal-math (in -ffast-math). A vector division takes ten times a multiplication. */
@@ -1920,13 +1967,13 @@ static int try_loop(u32 l, u32 n0)
                     rcp[k] = mk(VP, OP_FDIV, in.ty, ir_fconst(f, in.ty, 1.0), outside(in.b));
                     nrcp++;
                 }
-                nv = mk(V, OP_FMUL, vty, vec_operand(in.a, VP), vec_operand(rcp[k], VP));
+                nv = mk(V, OP_FMUL, vt_of(in.ty), vec_operand(in.a, VP), vec_operand(rcp[k], VP));
             } else {
                 if (kind[v] == K_MASK)
                     lk = lane_kind(f->ins[in.a].ty);
                 x = vec_operand(in.a, VP);
                 y = vec_operand(in.b, VP);
-                nv = mk(V, kind[v] == K_MASK && shift[v] ? shift[v] : in.op, vty, x, y);
+                nv = mk(V, kind[v] == K_MASK && shift[v] ? shift[v] : in.op, kind[v] == K_MASK ? vty : vt_of(in.ty), x, y);
             }
             f->ins[nv].mem = (u8)lk;
             map[v] = nv;
@@ -2524,8 +2571,19 @@ int opt_vectorise(Func *fn)
     lpos = map + n0;
     ioff = lpos + n0;
     for (b = 1; b < nblk; b++)
-        if (f->blk[b].term == TERM_BR)
-            done += try_loop(b, n0) || try_search(b, n0);
+        if (f->blk[b].term == TERM_BR) {
+            int r;
+            dbl_retry = 0;
+            r = try_loop(b, n0);
+            if (!r && dbl_retry && vw == 32) {
+                vw = 16;
+                vty = IT_V128;
+                r = try_loop(b, n0);
+                vw = 32;
+                vty = IT_V256;
+            }
+            done += r || try_search(b, n0);
+        }
     free(kind);
     free(base);
     return done;

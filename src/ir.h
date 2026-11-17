@@ -80,6 +80,8 @@ enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
 #define XI_EFFECT 1 /* OP_XI's flags: it has an effect besides its value (a fence, a prefetch): it stays where it is */
 #define PARAM_GLOBAL 1 /* OP_PARAM's mem: a kernel's pointer, the address of global memory */
 #define PARAM_GLOBAL_NC 2 /* ... a "const T *__restrict__" one: memory the kernel only reads (ld.global.nc) */
+#define PARAM_PTR 1      /* OP_PARAM's flags, x86-64 host: the parameter is a pointer (opt.c: the root of the addresses made from it) */
+#define PARAM_RESTRICT 2 /* ... declared restrict: what is written through it is reached only through it */
 #define IF_SRET 1 /* OP_CALL: first argument is the struct return pointer */
 #define IF_ALLOCA 4 /* OP_CALL: the one argument is a byte count, the result that much new stack */
 #define IF_ATOMIC 8 /* OP_CALL: an atomic operation done in line. The callee is a constant: ATOM_* kind,
@@ -92,6 +94,8 @@ enum { ATOM_LOAD, ATOM_STORE, ATOM_XCHG, ATOM_ADD, ATOM_SUB, ATOM_AND, ATOM_OR, 
 #define IF_NC 0x40 /* OP_LOAD, device code: of global memory the kernel only reads (__ldg: ld.global.nc) */
 #define IF_SSE0 0x10 /* OP_CALL with IF_SRET and mem, x86-64: the first eight bytes come back in an xmm register, */
 #define IF_SSE1 0x20 /* the second eight; Func.has_sret says the same with 0x40 and 0x80 */
+#define IF_FRESH 0x40 /* OP_CALL, x86-64 host: malloc, calloc, realloc, aligned_alloc: the result is the address of memory nothing
+                         else points to */
 #define IF_PURE 0x80 /* OP_CALL, x86-64 host: a C library math function of its arguments alone (no memory read or written, no
                         errno under -fno-math-errno): gvn shares two alike */
 #define IF_ASM 2  /* OP_CALL: inline assembly. The callee is the constant index of an AsmStmt; the
@@ -300,6 +304,7 @@ void opt_run(Func *f); /* the whole pipeline, from freshly parsed IR */
 int ptx_pure_call(Func *f, u32 v); /* ptx.c: a call that is an instruction of arithmetic in device code */
 extern Obj *ptx_obj;
 extern int opt_strict_aliasing;
+int opt_alias_roots(void); /* opt.c: addresses are told apart by the object they are in (x86-64 host; MCC_NOALIASROOT: off) */
 
 /* backend */
 void arm64_gen(Func *f, Obj *o);

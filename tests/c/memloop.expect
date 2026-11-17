@@ -1,0 +1,10 @@
+kept 23
+written 2.53125
+written_through 14 27
+with_call 10.5
+with_call 28.5 12
+nested 54 41
+middle 12.5 28.5
+cleared 18 11
+allocs 127
+exit 0

@@ -2681,6 +2681,11 @@ static void x64_param(Sym *p, Type *pt)
     /* on the stack: the parameter is the block itself */
     v = ir_add_param(F, IT_I64);
     F->param_ty[F->nparams - 1] |= 0x80 | (type_align(pt) > 8 ? 0x20 : 0);
+    /* (opt.c, roots_apart: the block is this function's own copy, which no other pointer reaches: the same as a
+       restrict pointer to it. ufsm warp_w4_ref: the fields of its "sym sy" are read once, not again after each store
+       of a byte) */
+    if (!cur_fn_dev && opt_alias_roots() && F->ins[v].op == OP_PARAM)
+        F->ins[v].flags = PARAM_PTR | PARAM_RESTRICT;
     for (off = 8; off < size; off += 8) {
         ir_add_param(F, IT_I64);
         F->param_ty[F->nparams - 1] = 0x40;
@@ -3330,6 +3335,14 @@ static void call(Expr *e)
     if (!flags && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && type_is_float(ret) && F->ins[callee].op == OP_ADDR &&
         !F->ins[callee].b && O->syms[F->ins[callee].a].name && pure_math(intern_str(O->syms[F->ins[callee].a].name)))
         F->ins[v].flags |= IF_PURE;
+    /* the C library's allocators: the result is the address of new memory (opt.c, roots_apart). Not one this file
+       defines itself (so far): an allocator of its own may hand out a global array that is also used by name */
+    if (!flags && F->cur && !cur_fn_dev && opt_alias_roots() && ret->kind == TY_PTR && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && O->syms[F->ins[callee].a].sec == SEC_UNDEF && F->ins[v].op == OP_CALL) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        if (strcmp(cn, "malloc") == 0 || strcmp(cn, "calloc") == 0 || strcmp(cn, "realloc") == 0 || strcmp(cn, "aligned_alloc") == 0)
+            F->ins[v].flags |= IF_FRESH;
+    }
     if (!flags && vec_mem(ret)) {
         u32 tmp = new_temp(ret);
         ir_store(F, vec_mem(ret), tmp, v);
@@ -7780,7 +7793,7 @@ static Type *declarator(Type *base, u32 *name)
             base = type_ptr(base);
             if (op->quals)
                 base = type_qual(base, op->quals);
-            if (op->restr && opt_cuda)
+            if (op->restr && (opt_cuda || opt_alias_roots())) /* (x86-64 host: PARAM_RESTRICT) */
                 base = type_restrict(base);
             break;
         case D_REF:
@@ -11181,6 +11194,8 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         } else if (type_is_record(pt)) {
             cur_named_gr++;
             v = ir_add_param(F, IT_I64);
+            if (!cur_fn_dev && opt_alias_roots() && F->ins[v].op == OP_PARAM)
+                F->ins[v].flags = PARAM_PTR | PARAM_RESTRICT; /* (the caller's copy, made for this call: see x64_param) */
             p->slot = ir_new_slot(F, 8, 8);
             p->byref = 1;
             ir_store(F, M_64, ir_slot_addr(F, p->slot, 0), v);
@@ -11190,6 +11205,9 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             ir_store(F, M_F32, ir_slot_addr(F, p->slot, 0), ir_ins(F, OP_FTRUNC, IT_F32, v, 0));
         } else {
             v = abi_extend(pt, ir_add_param(F, type_ir(pt)));
+            /* x86-64 host: a pointer parameter is the root of the addresses made from it (opt.c, roots_apart) */
+            if (!cur_fn_dev && !cur_fn_kernel && opt_alias_roots() && pt->kind == TY_PTR && F->ins[v].op == OP_PARAM)
+                F->ins[v].flags = (u8)(PARAM_PTR | (pt->restr ? PARAM_RESTRICT : 0));
             if (cur_fn_kernel && pt->kind == TY_PTR && F->ins[v].op == OP_PARAM)
                 F->ins[v].mem = pt->restr && (pt->base->quals & Q_CONST) ? PARAM_GLOBAL_NC : PARAM_GLOBAL;
             p->slot = ir_new_slot(F, type_size(pt), type_align(pt));

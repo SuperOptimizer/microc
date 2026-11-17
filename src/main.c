@@ -1025,6 +1025,12 @@ static int cc_main(const char *argv0, int argc, char **argv)
         opt_nounroll = getenv("MCC_NOUNROLL") != 0;
         if (getenv("MCC_INLINELIMIT")) /* (-finline-limit=N from the environment, for measuring) */
             opt_inline_limit = opt_inline_host = atoi(getenv("MCC_INLINELIMIT"));
+        if (getenv("MCC_INLINEHINT"))
+            opt_inline_hint = atoi(getenv("MCC_INLINEHINT"));
+        if (getenv("MCC_INLINEONCE"))
+            opt_inline_oncelim = atoi(getenv("MCC_INLINEONCE"));
+        if (getenv("MCC_INLINESLOT"))
+            opt_inline_slotarg = atoi(getenv("MCC_INLINESLOT"));
         opt_nolocal = getenv("MCC_NOLOCAL") != 0; /* PTX: the frame through generic [%SP] */
         opt_noldcomb = getenv("MCC_NOLDCOMB") != 0; /* PTX: loads of neighbouring bytes stay apart */
         opt_nostrip = getenv("MCC_NOSTRIP") != 0; /* device code: a loop that runs at most once keeps its way back */

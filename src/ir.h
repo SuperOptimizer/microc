@@ -264,6 +264,7 @@ int opt_vectorise(Func *f); /* opt_vec.c; returns the number of loops rewritten 
 /* opt_inline.c */
 void inline_reset(void);
 extern int opt_inline_once;
+extern int opt_inline_oncelim;
 extern int opt_inline_limit, opt_inline_host;
 extern int opt_inline_hint; /* -finline-hint=: the limit for functions declared inline */
 extern int opt_inline_slotarg; /* -finline-slotarg=: the limit at host call sites passing the address of a local */

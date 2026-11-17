@@ -12,7 +12,8 @@ int opt_inline_host = 20;  /* the same for host code: a helper of two library ca
                               callers, where what it computes is often already there (ufsm's CPU tests: -1.3 % instructions,
                               no larger; 32 and 48 are no better). -finline-limit=N sets both. */
 #define MAX_INLINE_BLOCKS 48
-#define ONCE_INLINE_INS 200 /* a function called from one place only */
+int opt_inline_oncelim = 500; /* a function called from one place only */
+#define ONCE_INLINE_INS ((u32)opt_inline_oncelim)
 #define MAX_CALLER_INS 60000
 
 typedef struct Body {
@@ -80,7 +81,7 @@ int opt_inline_hot = 40; /* limit at call sites a profile shows to be hot */
 /* limit at host call sites that pass the address of one of the caller's locals (a decoder's state, a bit reader): inlined,
    the record no longer escapes and can live in registers (opt_split / slot_carve); one such call left (an init outside the
    loop) keeps every field in memory for the whole function. -finline-slotarg=N; 0: off */
-int opt_inline_slotarg = 160;
+int opt_inline_slotarg = 280;
 int opt_hot_shift = 10;  /* hot: runs at least 1/2^n as often as the busiest block of the program */
 #define LIMIT (opt_size ? 3 : opt_dev_fn || opt_cuda ? opt_inline_limit : opt_inline_host)
 

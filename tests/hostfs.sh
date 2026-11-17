@@ -5,7 +5,9 @@
 #     relocatable object of ours - nothing with an interpreter or a dynamic section;
 #   - tests/hostfs/smoke.sh runs inside it as root of a user namespace, through bubblewrap (`bwrap --bind
 #     rootfs / --unshare-all`: no network, nothing of the machine visible but /proc and a /dev of its own),
-#     started by the image's own init as the Dockerfile's ENTRYPOINT would.
+#     started by the image's own init as the Dockerfile's ENTRYPOINT would;
+#   - when the image has ssh, tests/hostfs/ssh.sh runs in a second such container: server and client over the
+#     loopback of its empty network, as a user that is not root (see below).
 #   X64_SSH="ssh user@host"   how to reach the machine (it must have bwrap; no root needed)
 #   X64_DIR=dir               a directory there that this may use (default /root/x64); it works in DIR/hostfs
 #   UFSM=dir                  a clone of ufsm: its tests that need no GPU are built and run in the image too
@@ -23,7 +25,7 @@ if [ -z "$X64_SSH" ] || [ "$X64_SSH" = local ]; then
 fi
 rm -rf $W; mkdir -p $W/in/work
 cp $O/hostfs.tar $W/in/
-cp tests/hostfs/smoke.sh $W/in/work/
+cp tests/hostfs/smoke.sh tests/hostfs/ssh.sh $W/in/work/
 if [ -n "$GPU" ]; then cp tests/hostfs/gpu.sh tests/hostfs/ltcmp.cu $W/in/work/; fi
 if [ -n "$UFSM" ]; then
     cp tests/hostfs/ufsm.sh $W/in/work/
@@ -72,6 +74,17 @@ bwrap --bind rootfs / --proc /proc --dev /dev --tmpfs /tmp --bind work /work $gp
     --setenv UFSM_GPU_TESTS "$UFSM_GPU_TESTS" --chdir /work \
     /usr/bin/init /bin/sh -c 'sh /work/smoke.sh; if [ -f /work/ufsm.sh ]; then sh /work/ufsm.sh; fi; if [ -f /work/gpu.sh ]; then sh /work/gpu.sh; fi' 2>&1
 echo "exit $?"
+# ssh, when the image has it: server and client over the loopback of a network that is the container's alone.
+# As a user that is not root: in a user namespace made without privilege nobody may set groups, which the
+# server does for root before it starts root's shell (under Docker it can).
+if [ -e rootfs/usr/dropbearmulti ]; then
+    echo "== ssh =="
+    printf 'tester:x:1000:1000::/work/home:/bin/sh\n' >> rootfs/etc/passwd
+    mkdir -p work/home && chmod 700 work/home
+    bwrap --bind rootfs / --proc /proc --dev /dev --tmpfs /tmp --bind work /work --unshare-all --as-pid-1 --uid 1000 --gid 1000 \
+        --clearenv --setenv PATH /usr/bin --setenv HOME /work/home --chdir /work /usr/bin/init /bin/sh /work/ssh.sh 2>&1
+    echo "ssh exit $?"
+fi
 REOF
 (cd $W/in && tar cf - .) | $X64_SSH "rm -rf $R && mkdir -p $R && cd $R && tar xf - 2>/dev/null && UFSM_TESTS='$UFSM_TESTS' UFSM_GPU_TESTS='$UFSM_GPU_TESTS' sh run.sh 2>&1; cd .. && rm -rf $R" > $W/log
 grep -v '^ok ' $W/log

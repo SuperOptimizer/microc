@@ -682,8 +682,8 @@ times slower than gcc -O2's.
 containers in which every program is built by mcc from this tree against our own C library, statically:
 `OUTDIR/rootfs`, the same as `OUTDIR/hostfs.tar` (the archive is written by mbox's `tar`, with owner root and
 one fixed time, so the same tree gives the same bytes), and a `Dockerfile` (`FROM scratch`, `ADD hostfs.tar /`).
-About 10 MB. Nothing in it comes from a distribution; one file is not mcc's work, the list of certificate
-authorities (below).
+About 12 MB. Nothing in it comes from a distribution. Two things in it are not this tree's: the list of
+certificate authorities, which is data, and ssh, which is Dropbear built here by mcc from its source (both below).
 
 | path | what |
 | --- | --- |
@@ -692,6 +692,7 @@ authorities (below).
 | `/usr/bin` | every tool by name (links to the two programs); `gcc`, `ld`, `ar`, `nm`, `nvcc`, ... and `pkg-config` are two-line scripts; `/bin` and `/sbin` are links to it |
 | `/usr/linux-x64` | the C library (`include`, `lib/crt1.o`, `lib/libc.a`) and the third-party libraries (`ext`) |
 | `/usr/cuda` | `include`: what a `.cu` file includes; `lib64/libcudart.a`: the CUDA run time, which runs kernels on the GPU when NVIDIA's driver is there and on the CPU otherwise (with a `libcublasLt.a` and a `libstdc++.a` that hold nothing) |
+| `/usr/dropbearmulti` | ssh: Dropbear's server, client, `dropbearkey` and `scp` (not ours, built here from source: below), and `/usr/bin/start-ssh` |
 | `/etc/passwd`, `group`, `hosts` | root alone; `/tmp`, `/root`, `/proc`, `/sys`, `/dev` are empty |
 | `/etc/ssl/certs/ca-certificates.crt` | the certificate authorities HTTPS trusts (libcurl's default file; `/etc/ssl/cert.pem` is a link to it). **The one file that is data from outside this tree**: a copy of `CACERTS=file` (PEM), by default the build machine's own `/etc/ssl/certs/ca-certificates.crt` (Linux) or `/etc/ssl/cert.pem` (macOS: 128 certificates, readable by anyone; the keychain's list, `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > roots.pem`, also needs no rights and can be given as `CACERTS=roots.pem`). `CACERTS=none` leaves it out. Nothing is downloaded; `mkhostfs.sh` prints the file's SHA-256, and the same file gives the same archive |
 
@@ -754,14 +755,49 @@ brings the driver's libraries and device nodes, as it does for any image.
 `GPU=1` makes `tests/hostfs.sh` bind the machine's two driver libraries (read-only) and `/dev/nvidia*` into the
 image the way NVIDIA's container run time does and run `tests/hostfs/gpu.sh` there: `cuInit` and the devices'
 names through `dlopen`, a kernel on the GPU and the same program on the CPU, the cublasLt comparison, and
-with `UFSM_GPU_TESTS` tests of ufsm. On two RTX 3090 (driver 615.71, under bubblewrap): 52 checks pass;
+with `UFSM_GPU_TESTS` tests of ufsm. On two RTX 3090 (driver 615.71, under bubblewrap) all 63 checks pass
+(with ufsm's and ssh's);
 ufsm's `test_nn` takes 5 s on the GPU (498 s on the CPU's run time). `GPU=1 make test-x64-cuda` runs the
 programs of `tests/cuda` on the GPU: 41 pass; `mx` (for sm_120a) and `ldg` (it reads a `uint2` at an address
 that is a multiple of 4 but not of 8, which `ld.global.nc.v2.u32` does not take on a real device) are left out.
 
+### ssh
+
+The image's ssh is **Dropbear, which is not ours** (Matt Johnston's, MIT licence): the second thing in the
+image, after the certificate authorities, that this tree did not write. It is built from its source by mcc
+against our C library, statically, like everything else (`mkssh.sh MCC DIR`; `make hostfs` runs it when
+`build/ext/dropbear-2026.90` is there): `/usr/dropbearmulti`, one program that is `dropbear` (the server),
+`dbclient` / `ssh` (the client), `dropbearkey` and `scp`. Its `configure` and makefiles are not run:
+`libc/ext/dropbear/config.h` is what configure would find, written by hand, and `localoptions.h` what the
+image wants. For it the C library got the users and groups of `/etc/passwd` and `/etc/group` (`getpwnam`,
+`getgrnam`, `initgroups`, ...: `libc/linux/src/pwgrp.c`), which the headers declared and nothing defined.
+
+The release is fetched once, by hand, and checked before it is unpacked:
+
+    curl -O https://matt.ucc.asn.au/dropbear/releases/dropbear-2026.90.tar.bz2      # into an empty directory
+    curl -O https://matt.ucc.asn.au/dropbear/releases/SHA256SUM.asc
+    sha256sum dropbear-2026.90.tar.bz2   # 16be820347723271b0fea6049ffeed6d6680d7429c65406d8af37776393a0250, as SHA256SUM.asc lists it
+    gpg --verify SHA256SUM.asc           # good signature of F734 7EF2 EE2E 07A2 6762 8CA9 4493 1494 F29C 6773
+                                         # ("Dropbear SSH Release Signing"; the key is releases/dropbear-key-2015.asc)
+    tar -xjf dropbear-2026.90.tar.bz2 -C build/ext
+
+Keys only: the server takes no passwords and the client offers none (both are compiled out). No key is in
+the image. `start-ssh [PORT]` starts the server for root: it adds the public keys in `$PUBLIC_KEY`,
+`$SSH_PUBLIC_KEY` or `$AUTHORIZED_KEYS` to `/root/.ssh/authorized_keys` (which may also be mounted), refuses
+to start without one, takes the host's keys from `/etc/dropbear` if any are mounted there and otherwise makes
+an ed25519 one at this first start, and returns; so a container that should be reachable runs
+`start-ssh && exec its-command`. (`PUBLIC_KEY` is the name RunPod's own images read, from memory: not checked.)
+
+`tests/hostfs/ssh.sh` runs in a second bubblewrap container whose network is its own and empty, so the server
+listens on a loopback nobody else can reach: a key pair is made, the server started by `start-ssh`, and the
+client logs in by `dbclient` and by `ssh`, runs a command, gets its status, copies a file with `scp`; another
+key is refused and no password is asked for. It runs as a user that is not root, because in a user namespace
+made without privilege nobody may set groups, which the server does for root before starting root's shell:
+root's login is for Docker to show. A session with a terminal was tried by hand (`dbclient -t`: `/dev/pts/0`).
+
 Not in it: time zones (the library knows UTC), bash and python (ufsm's suite runner and some of its tests),
-an ssh client or server. Not tried: Docker itself and NVIDIA's container run time (the checks above are under
-bubblewrap, with the libraries and devices bound by hand), RunPod.
+sftp. Not tried: Docker itself and NVIDIA's container run time (the checks above are under bubblewrap, with
+the libraries and devices bound by hand), RunPod.
 
 ## Known gaps
 

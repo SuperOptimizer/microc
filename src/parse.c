@@ -209,12 +209,13 @@ static int cur_fn_dev;  /* CUDA: the function being read is device code */
    known. */
 #define NNSW 16
 static u32 nsw_vals[NNSW], nsw_blks[NNSW], nsw_at;
+static Func *nsw_fns[NNSW]; /* and the functions: a value's number means nothing in another */
 
 static int is_nsw(u32 v)
 {
     int k;
     for (k = 0; k < NNSW; k++)
-        if (nsw_vals[k] == v && nsw_blks[k] == F->cur)
+        if (nsw_vals[k] == v && nsw_blks[k] == F->cur && nsw_fns[k] == F)
             return v != 0;
     return 0;
 }
@@ -238,6 +239,27 @@ static u32 add_index(u32 p, u32 v, int minus, u64 size, int depth)
     x = ir_ins(F, OP_SEXT32, IT_I64, v, 0);
     x = ir_ins(F, OP_MUL, IT_I64, x, ir_const(F, IT_I64, size));
     return ir_ins(F, minus ? OP_SUB : OP_ADD, IT_I64, p, x);
+}
+/* x86-64 host: (long)(a + k), where a + k was an int's sum just now (one that does not wrap): (long)a + k, so the
+   constant goes into an address and (long)a is shared by the sums that differ in k alone (the eight corners of a
+   cell: (size_t)(base + 1) * n), and so of any sum or difference, both parts made wider. MCC_CONVWIDEN=0: off;
+   =1: only sums with a constant. */
+static u32 widen_sum(u32 v, int depth)
+{
+    static int mode = -1;
+    Ins *i = &F->ins[v];
+    u64 k;
+    if (mode < 0)
+        mode = getenv("MCC_CONVWIDEN") ? atoi(getenv("MCC_CONVWIDEN")) : 2;
+    if (mode && depth && i->ty == IT_I32 && (i->op == OP_ADD || i->op == OP_SUB) && is_nsw(v) &&
+        (mode == 2 || ir_is_const(F, i->b, &k) || ir_is_const(F, i->a, &k))) {
+        u32 a = i->a, b = i->b, wa, wb;
+        int sub = i->op == OP_SUB;
+        wa = widen_sum(a, depth - 1);
+        wb = widen_sum(b, depth - 1);
+        return ir_ins(F, sub ? OP_SUB : OP_ADD, IT_I64, wa, wb);
+    }
+    return ir_ins(F, OP_SEXT32, IT_I64, v, 0);
 }
 static int cur_fn_kernel; /* CUDA: and a kernel, whose code is only ever PTX */
 static int launch_stop; /* CUDA: reading the <<<...>>> of a kernel launch, where >> ends an expression */
@@ -1590,7 +1612,11 @@ static void convert(Expr *e, Type *to)
     if (type_is_float(from)) {
         e->v = ir_ins(F, type_is_unsigned(to) ? OP_FTOUI : OP_FTOSI, ti, e->v, 0);
     } else if (fi == IT_I32 && ti == IT_I64) {
-        e->v = ir_ins(F, type_is_unsigned(from) ? OP_ZEXT32 : OP_SEXT32, IT_I64, e->v, 0);
+        if (from->kind == TY_INT && !type_is_unsigned(from) && opt_arch == ARCH_X64 && !cur_fn_dev && !opt_dev_parse && !opt_cuda &&
+            !opt_wrapv)
+            e->v = widen_sum(e->v, 3);
+        else
+            e->v = ir_ins(F, type_is_unsigned(from) ? OP_ZEXT32 : OP_SEXT32, IT_I64, e->v, 0);
     } else if (fi == IT_I64 && ti == IT_I32) {
         e->v = ir_ins(F, OP_TRUNC, IT_I32, e->v, 0);
     }
@@ -1903,7 +1929,7 @@ static void binop(int op, Expr *l, Expr *r, u32 loc)
                    gain being fewer than the indices that cost an addition more.) */
             {
                 u64 nk = 0;
-                if (opt_nowiden != 1 && !vsize && r->ty->kind == TY_INT && is_nsw(r->v) &&
+                if (opt_nowiden != 1 && !opt_wrapv && !vsize && r->ty->kind == TY_INT && is_nsw(r->v) &&
                     (F->ins[r->v].op == OP_ADD || F->ins[r->v].op == OP_SUB) && F->ins[r->v].ty == IT_I32 &&
                     (opt_dev_parse ? ir_is_const(F, F->ins[r->v].b, &nk) : opt_nowiden == 2)) {
                     l->v = add_index(l->v, r->v, op != T_PLUS, size, opt_dev_parse ? 1 : 4);
@@ -1993,6 +2019,7 @@ static void binop(int op, Expr *l, Expr *r, u32 loc)
                  (irop == OP_SUB && ni->op == OP_ADD && ni->a == la && ir_is_const(F, rb, &c1) && ir_is_const(F, ni->b, &c2) &&
                   (u32)c2 == (u32)(0 - c1) && (u32)c1 != 0x80000000UL))) {
                 nsw_vals[nsw_at % NNSW] = l->v;
+                nsw_fns[nsw_at % NNSW] = F;
                 nsw_blks[nsw_at++ % NNSW] = F->cur;
             }
         }
@@ -11112,6 +11139,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     F->cur = ir_new_block(F);
     F->name = intern_str(s->name);
     cur_fn_name = F->name;
+    memset(nsw_vals, 0, sizeof nsw_vals); /* nothing is known of the sums of the function before */
     F->sym = sym_obj(s);
     if (opt_debug)
         dwarf_func_loc(F->sym, loc, ty->base);

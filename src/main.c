@@ -844,6 +844,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_debug = 1; /* -g, -g3, -ggdb, -gdwarf-5, -gline-tables-only ...: all the same here */
         else if (strcmp(a, "-g0") == 0)
             opt_debug = 0;
+        else if (strcmp(a, "-fwrapv") == 0 || strcmp(a, "-fno-strict-overflow") == 0)
+            opt_wrapv = 1; /* signed sums wrap: nothing is concluded from an int's sum not wrapping */
         else if (strncmp(a, "-W", 2) == 0 || strncmp(a, "-f", 2) == 0 || strncmp(a, "-m", 2) == 0 ||
                  strncmp(a, "-g", 2) == 0 || strncmp(a, "-O", 2) == 0 || strncmp(a, "-Q", 2) == 0 ||
                  strcmp(a, "-pipe") == 0 || strcmp(a, "-w") == 0)

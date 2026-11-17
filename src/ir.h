@@ -263,6 +263,7 @@ int opt_vectorise(Func *f); /* opt_vec.c; returns the number of loops rewritten 
 
 /* opt_inline.c */
 void inline_reset(void);
+extern int opt_wrapv; /* -fwrapv, -fno-strict-overflow */
 extern int opt_inline_once;
 extern int opt_inline_oncelim;
 extern int opt_inline_limit, opt_inline_host;

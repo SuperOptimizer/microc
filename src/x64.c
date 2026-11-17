@@ -4440,6 +4440,11 @@ static void mem_ea(const MIns *i, u32 b, u32 x, i64 disp, EA *ea)
 }
 
 /* d = a op b for a two-address instruction "op r, r/m"; sub: it is a subtraction, else the operands commute */
+/* The register an and / or / xor just wrote, its width, and where that instruction ends: a test of that register
+   against itself right there finds the flags already as it would leave them (MCC_NOZFREUSE: tested anyway). */
+static u32 zf_reg, zf_end = 0xffffffffU;
+static int zf_w, zf_off = -1;
+
 static void bin_int(MIns *i, u32 opc, int sub)
 {
     u32 dl = loc_of(i->d), al = loc_of(i->s0), bl = loc_of(i->s1), dr = dst(i->d, SCR0);
@@ -4456,8 +4461,12 @@ static void bin_int(MIns *i, u32 opc, int sub)
     if (al != dr)
         mov_loc(dr, al);
     op_loc(opc, i->w, dr, bl);
-    (void)dl;
     fin(i->d, dr);
+    if ((opc == 0x23 || opc == 0x0b || opc == 0x33) && !is_spill(dl)) {
+        zf_reg = dr;
+        zf_w = i->w;
+        zf_end = (u32)text->len;
+    }
 }
 
 static void bin_fp(MIns *i, u32 opc, int commut)
@@ -5152,6 +5161,17 @@ static void encode(MIns *i)
     }
     case X_MOVI:
         dr = dst(i->d, SCR0);
+        if (zf_off < 0)
+            zf_off = getenv("MCC_NOZFREUSE") != 0;
+        if (i->imm == 0 && zf_end == (u32)text->len && dr != zf_reg && !zf_off && !is_spill(loc_of(i->d)) &&
+            i[1].op == X_TEST && i[1].s0 == i[1].s1) {
+            /* a zero between an or and the test of its result: made without touching the flags, so that the
+               test can go */
+            op_prefix(0xb8 | (dr & 7), 0, NOREG, NOREG, dr);
+            b4(0);
+            zf_end = (u32)text->len;
+            return;
+        }
         mov_ri(dr, (u64)i->imm, w);
         fin(i->d, dr);
         return;
@@ -5363,6 +5383,10 @@ static void encode(MIns *i)
     case X_TEST:
         a = use(i->s0, SCR0);
         b = i->s1 == i->s0 ? a : use(i->s1, SCR1);
+        if (zf_off < 0)
+            zf_off = getenv("MCC_NOZFREUSE") != 0;
+        if (i->s1 == i->s0 && zf_end == (u32)text->len && zf_reg == a && zf_w == w && !zf_off)
+            return;
         op_rr(0x85, w, b, a);
         return;
     case X_FCMP:
@@ -7306,6 +7330,7 @@ void x64_gen(Func *fn, Obj *o)
         MBlock *mb = &mf.blk[k];
         blk_off[k] = (u32)text->len;
         sp_loc = NOREG; /* a branch may come here */
+        zf_end = 0xffffffffU;
         for (n = mb->first; n < mb->first + mb->n; n++) {
             if (mf.ins[n].op == X_ASM)
                 has_asm = 1;

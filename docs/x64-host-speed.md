@@ -170,6 +170,7 @@ test_zcache (+-2 G).
 | + inlining: 280 where a local's address is passed, 500 for a function called once | 1975 | 1.28 |
 | + vectors chosen by ?: as values, unasked unrolling up to 3000 instructions | 1958 | 1.27 |
 | + 32-bit loop counters widened (iv_widen) | 1941 | 1.25 |
+| + int sums widened at conversion, test after and/or/xor dropped | 1932 | 1.25 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -204,6 +205,12 @@ What went in (each with its switch):
   chosen by its address, so both arms were stored and the result loaded through a pointer (write_spatial_tm's gathers).
 - Unasked unrolling up to 3000 instructions (was 1200; `MCC_UNROLLINS=N`): -16 G, 4 % more code. (With the inlining
   above the earlier loss on test_zcache turned into a gain of 10 G.)
+- Conversion widening (parse.c `widen_sum`, `MCC_CONVWIDEN=0` off, `=1` only sums with a constant): `(long)(a + b)`
+  where `a + b` was an int's sum in the same block becomes `(long)a + (long)b`, so constants go into addresses and
+  `(long)a` is shared (the eight corners of a cell). Nothing is concluded under `-fwrapv` / `-fno-strict-overflow`,
+  and the table of such sums is per function.
+- Flag reuse (x64.c, `MCC_NOZFREUSE`): a `test r, r` right after the `and` / `or` / `xor` that wrote `r` is not
+  emitted; a zero made between the two is `mov $0` instead of `xor`.
 - `iv_widen` (opt.c, last before selection, `MCC_NOIVWIDEN`, `MCC_IVWLOG`): a 32-bit counter read widened becomes a
   64-bit counter where i + step cannot wrap (the way back is taken only while next < n and the first value is a
   constant, known small or was compared before the loop; or the header leaves unless i < n); `(long)(i - k)` of a

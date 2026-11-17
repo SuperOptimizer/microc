@@ -47,6 +47,7 @@ typedef struct Sym {
     u32 aflags;   /* AT_* from attributes */
     u32 maxntid;  /* CUDA: from launch_bounds, 0 if none */
     u32 cluster;  /* CUDA: __cluster_dims__ x | y << 8 | z << 16, 0 if none */
+    u32 maxnreg;  /* CUDA: __maxnreg__, 0 if none */
     u32 section, alias, asmname; /* interned strings from attributes, 0 if none */
     Type *ty;
     u32 slot;
@@ -763,6 +764,7 @@ typedef struct Attr {
     u32 vecsize; /* bytes asked for by vector_size(), 0 if none */
     u32 maxntid; /* CUDA, launch_bounds(): the most threads a block of the kernel is launched with */
     u32 cluster; /* CUDA, cluster_dims(): the kernel's thread-block cluster, x | y << 8 | z << 16 */
+    u32 maxnreg; /* CUDA, maxnreg(): the registers a thread of the kernel gets at most */
 } Attr;
 
 static Attr ds_attr;  /* attributes among the last declaration specifiers */
@@ -893,6 +895,19 @@ static void attributes(Attr *a)
                     if (!d[0] || !d[1] || !d[2] || (u64)d[0] * d[1] * d[2] > 255)
                         error_at(tok.loc, "cluster_dims: each extent at least 1, at most 255 blocks in a cluster");
                     a->cluster = d[0] | d[1] << 8 | d[2] << 16;
+                }
+                continue;
+            } else if (strcmp(name, "maxnreg") == 0) {
+                /* (n): at most n registers a thread (PTX .maxnreg): a fixed budget, e.g. for a warp-specialised kernel
+                   whose warps then move registers between them with setmaxnreg.inc / .dec */
+                u32 n;
+                expect(T_LPAREN);
+                n = (u32)const_int_expr();
+                expect(T_RPAREN);
+                if (n < 0x40000000UL) {   /* (TP_SENT: a template's value parameter, read again by the instance) */
+                    if (n < 1 || n > 255)
+                        error_at(tok.loc, "maxnreg: 1 to 255 registers a thread");
+                    a->maxnreg = n;
                 }
                 continue;
             } else if (strcmp(name, "launch_bounds") == 0) {
@@ -9309,6 +9324,8 @@ static void sym_attrs(Sym *s, const Attr *a, int is_inline, int storage)
         s->maxntid = a->maxntid;
     if (a->cluster)
         s->cluster = a->cluster;
+    if (a->maxnreg)
+        s->maxnreg = a->maxnreg;
     if (a->section)
         s->section = a->section;
     if (a->alias && !s->alias) {
@@ -10944,6 +10961,7 @@ typedef struct LazyFn {
     u8 ptx;    /* its PTX has been written */
     u32 maxntid; /* a kernel's launch_bounds */
     u32 cluster; /* and its cluster_dims */
+    u32 maxnreg; /* and its maxnreg */
 } LazyFn;
 
 static LazyFn *lazy;
@@ -11029,6 +11047,7 @@ static void ptx_one(u32 sym, int entry)
     opt_finish(fn_func);
     ptx_maxntid = entry ? lazy[sym].maxntid : 0;
     ptx_cluster = entry ? lazy[sym].cluster : 0;
+    ptx_maxnreg = entry ? lazy[sym].maxnreg : 0;
     ptx_gen(fn_func, O, entry);
 }
 
@@ -11296,6 +11315,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         lf->kernel = (u8)((s->aflags & AT_GLOBAL) != 0);
         lf->maxntid = s->maxntid;
         lf->cluster = s->cluster;
+        lf->maxnreg = s->maxnreg;
         lf->sec = s->section ? (u32)obj_section(O, s->section, SF_ALLOC | SF_EXEC) : SEC_TEXT;
         lf->noemit = (u8)def_extern_inline;
         /* (+4: device code, which has no vector operations) */

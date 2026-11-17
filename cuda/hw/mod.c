@@ -1877,6 +1877,22 @@ static int job_compile(Job *J, CUhandle *link, void **cubin, size_t *size)
     return r;
 }
 
+/* Whether the kernel is loaded as a whole program (cuModuleLoadDataEx on its PTX) instead of linked: a kernel that moves registers
+   between its warps with setmaxnreg. The driver's linker compiles every text relocatable, and ptxas then drops each setmaxnreg
+   (C7504 "ignored to maintain compatibility across compilation units"; the kernel keeps the registers it needs at its smallest, 8
+   for a test kernel of .maxnreg 96 instead of 96); compiled whole, they stay. Only a kernel of one text can be (2294 of the 2570
+   kernels of ufsm, every conv_bwd_w_f4ws_k among them); one that also needs the device library or globals is linked, and said so.
+   Such a module is not in mcuda's cache (the driver gives no machine code back), the driver's own compute cache keeps it. */
+static int job_whole(const Job *J)
+{
+    int i, any = 0;
+    for (i = 0; i < J->ntext; i++)
+        any |= J->texts[i].p && strstr(J->texts[i].p, "setmaxnreg") != 0;
+    if (any && J->ntext > 1)
+        fprintf(stderr, "mcuda: %s: its setmaxnreg are dropped (it is linked from %d texts: device library or globals)\n", J->kname, J->ntext);
+    return any && J->ntext == 1;
+}
+
 /* MCUDA_DUMP=DIR: the texts of every kernel that is loaded (with MCUDA_PRECOMPILE: of every kernel, and nothing is
    compiled), DIR/KERNEL.N.ptx. Returns whether it is set. */
 static int job_dump(Job *J)
@@ -1908,6 +1924,7 @@ static void kload(Kern *K, int mod, int item)
     size_t size = 0;
     CUhandle link = 0;
     double t0;
+    int whole;
 
     K->tried = 1;
     job_prep(&J, mod, item);
@@ -1939,7 +1956,21 @@ static void kload(Kern *K, int mod, int item)
             fprintf(stderr, "mcuda: %s: text %d from %s\n", J.kname, j, fn);
         }
     }
-    if (!r && J.have_path)
+    whole = !r && job_whole(&J);
+    if (whole) {
+        char log[8192];
+        int opt[2] = {5 /* CU_JIT_ERROR_LOG_BUFFER */, 6 /* CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES */};
+        void *val[2];
+        val[0] = log;
+        val[1] = (void *)(size_t)sizeof log;
+        log[0] = 0;
+        t0 = now();
+        r = hw.ModuleLoadDataEx(&K->module, J.texts[0].p, 2, opt, val);
+        if (r)
+            fprintf(stderr, "mcuda: %s: the driver does not compile its PTX as a whole program (error %d)\n%s\n", J.kname, r, log);
+        else if (verbose())
+            fprintf(stderr, "mcuda: %s: compiled as a whole program (setmaxnreg) in %.2f s\n", J.kname, now() - t0);
+    } else if (!r && J.have_path)
         image = cache_read(J.path, &size);
     if (image) {
         r = hw.ModuleLoadData(&K->module, image);
@@ -1951,7 +1982,7 @@ static void kload(Kern *K, int mod, int item)
         } else if (verbose())
             fprintf(stderr, "mcuda: %s: from %s\n", J.kname, J.path);
     }
-    if (!r && !image) {
+    if (!r && !image && !whole) {
         t0 = now();
         r = job_compile(&J, &link, &cubin, &size);
         if (!r) {
@@ -2070,6 +2101,8 @@ static void *pre_worker(void *arg)
             pre_bad++;
         else if (job_dump(&J))
             ;
+        else if (job_whole(&J))
+            ; /* (compiled when loaded: the driver caches it) */
         else if (J.have_path && access(J.path, R_OK) != 0) {
             CUhandle link = 0;
             void *cubin = 0;

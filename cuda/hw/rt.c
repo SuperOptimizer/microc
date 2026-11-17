@@ -297,6 +297,33 @@ cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute a, int
     return ret(hw.FuncSetAttribute(f, (int)a, value));
 }
 
+cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func)
+{
+    CUhandle f;
+    int v[9], i, r = 0;
+    ENTER();
+    if (!attr)
+        return ret(cudaErrorInvalidValue);
+    memset(attr, 0, sizeof *attr);
+    f = hw_kernel_of(func);
+    if (!f)
+        return cudaSuccess;
+    for (i = 0; i < 9 && !r; i++) /* CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK 0 ... MAX_DYNAMIC_SHARED_SIZE_BYTES 8 */
+        r = hw.FuncGetAttribute(&v[i], i, f);
+    if (r)
+        return ret(r);
+    attr->maxThreadsPerBlock = v[0];
+    attr->sharedSizeBytes = (size_t)v[1];
+    attr->constSizeBytes = (size_t)v[2];
+    attr->localSizeBytes = (size_t)v[3];
+    attr->numRegs = v[4];
+    attr->ptxVersion = v[5];
+    attr->binaryVersion = v[6];
+    attr->cacheModeCA = v[7];
+    attr->maxDynamicSharedSizeBytes = v[8];
+    return cudaSuccess;
+}
+
 cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache c)
 {
     (void)func;

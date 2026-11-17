@@ -654,6 +654,15 @@ cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute a, int
     return cudaSuccess;
 }
 
+cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func)
+{
+    (void)func;
+    if (!attr)
+        return ret(cudaErrorInvalidValue);
+    memset(attr, 0, sizeof *attr);
+    return cudaSuccess;
+}
+
 cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache c)
 {
     (void)func;

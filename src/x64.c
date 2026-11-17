@@ -6327,7 +6327,11 @@ typedef struct SplitCp {
     u32 kind; /* SC_TAIL: at the end of block at; SC_HEAD: at its head; SC_EDGE: in the new block at; | SC_SAME */
     u32 at, d, s;
 } SplitCp;
-enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100 };
+enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100, SC_DEF = 0x200 };
+
+/* With xmm16-xmm31 to hand (set per function by x64_gen): the splitting below also looks at spilled vectors, and
+   at spilled xmm registers from where they are written (MCC_NOVSPLIT, MCC_NODSPLIT: not) */
+static int split_vec, split_def;
 
 /* The spilled scalar registers (cidx: each one's number among them, else NOREG) and which of them are live into
    each block: a bit set per block, *pwords words each. */
@@ -6338,7 +6342,7 @@ static u64 *spill_live(u32 nv0, u32 *cidx, u32 *pnc, u32 *pwords)
     int ch;
     for (i = 0; i < nv0; i++) {
         u32 l = mf.loc[i];
-        cidx[i] = l != NOREG && l >= SPILL0 && !(mf.vclass[i] & ~(0x11 | VC_LOW)) ? nc++ : NOREG;
+        cidx[i] = l != NOREG && l >= SPILL0 && (split_vec || !(mf.vclass[i] & ~(0x11 | VC_LOW))) ? nc++ : NOREG;
     }
     words = (nc + 63) / 64;
     lin = (u64 *)xmalloc(((size_t)nb * words * 3 + 1) * sizeof(u64));
@@ -6391,11 +6395,16 @@ static u64 *spill_live(u32 nv0, u32 *cidx, u32 *pnc, u32 *pwords)
    for the stretch, loaded once before the first read; allocation then runs again, and if that one is spilled too
    it is the old slot under another name. Straight-line float code that keeps more than 13 values alive (ufsm's
    fit_vox2: 8 corners' weights and gradients across the calls of its terms) read each of them back again and
-   again. MCC_NORSPLIT: off. */
+   again. MCC_NORSPLIT: off.
+   split_def: the same from where a spilled xmm register is written, if it is read before the next call or the
+   block's end: a register of its own from the write to the last such read, and a copy to the old one after the
+   write if that is still wanted later (the store it was anyway). A value computed, used, and then kept across a
+   call was stored and at once loaded again. If the new one is spilled too, it is the old one's slot and nothing
+   changed. */
 static int split_reloads(void)
 {
     u32 nb = mf.nblk, nv0 = mf.nvreg, b, i, k, nc = 0, words, nsp = 0, nn, at;
-    u32 *cidx, *first, *cnt, *nonf, *last, *open, nopen, *ihead, *cnext, cap = 64, ncp = 0;
+    u32 *cidx, *first, *cnt, *nonf, *last, *open, *defat, nopen, *ihead, *cnext, cap = 64, ncp = 0;
     SplitCp *cp;
     u64 *lin;
     MIns *ni;
@@ -6410,14 +6419,17 @@ static int split_reloads(void)
         free(lin);
         return 0;
     }
-    first = (u32 *)xmalloc((size_t)nc * 5 * sizeof(u32));
+    first = (u32 *)xmalloc((size_t)nc * 6 * sizeof(u32));
     cnt = first + nc;
     nonf = cnt + nc;
     last = nonf + nc;
     open = last + nc;
+    defat = open + nc; /* the instruction that wrote the register, if the stretch begins there (else NOREG) */
     cp = (SplitCp *)xmalloc(cap * sizeof(SplitCp));
-    for (k = 0; k < nc; k++)
+    for (k = 0; k < nc; k++) {
         cnt[k] = 0;
+        defat[k] = NOREG;
+    }
     for (b = 0; b < nb; b++) {
         MBlock *mb = &mf.blk[b];
         u32 end = mb->first + mb->n;
@@ -6438,7 +6450,8 @@ static int split_reloads(void)
                     if (!cnt[c]) {
                         first[c] = i;
                         nonf[c] = 0;
-                        open[nopen++] = r[q] - VREG0;
+                        if (defat[c] == NOREG)
+                            open[nopen++] = r[q] - VREG0;
                     }
                     cnt[c]++;
                     last[c] = i;
@@ -6447,7 +6460,9 @@ static int split_reloads(void)
                                       in->op == X_OR || in->op == X_XOR || in->op == X_CMP || in->op == X_FADD ||
                                       in->op == X_FSUB || in->op == X_FMUL || in->op == X_FDIV || in->op == X_FMAX ||
                                       in->op == X_FMIN || in->op == X_FCMP)) ||
-                          (q == 0 && in->op == X_MOV)))
+                          (q == 0 && in->op == X_MOV) ||
+                          (split_vec && in->op == X_VEX && ((q == 1 && in->w == XF_RVM) || (q == 0 && in->w == XF_RM)) &&
+                           rm_mem_ok((u32)in->imm))))
                         nonf[c]++;
                 }
                 if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0)
@@ -6463,7 +6478,8 @@ static int split_reloads(void)
                     continue;
                 }
                 open[q] = open[--nopen];
-                if (cnt[c] >= 2 && (mode == 2 || nonf[c] >= 2 || (nonf[c] >= 1 && cnt[c] >= 3 && mode != 3))) {
+                if (defat[c] != NOREG ? cnt[c] >= 1
+                                      : cnt[c] >= 2 && (mode == 2 || nonf[c] >= 2 || (nonf[c] >= 1 && cnt[c] >= 3 && mode != 3))) {
                     u32 nr = new_vreg(mf.vclass[v]);
                     /* is the old one alive after the stretch (then its slot holds the value all through)? */
                     for (x = last[c] + 1; x < end && !known; x++) {
@@ -6488,13 +6504,31 @@ static int split_reloads(void)
                         cap *= 2;
                         cp = (SplitCp *)xrealloc(cp, cap * sizeof(SplitCp));
                     }
-                    cp[ncp].kind = same ? SC_SAME : 0;
-                    cp[ncp].at = first[c];
-                    cp[ncp].d = nr;
-                    cp[ncp++].s = VREG0 + v;
+                    if (defat[c] != NOREG) {
+                        mf.ins[defat[c]].d = nr;
+                        if (same) {
+                            cp[ncp].kind = SC_DEF;
+                            cp[ncp].at = defat[c] + 1;
+                            cp[ncp].d = VREG0 + v;
+                            cp[ncp++].s = nr;
+                        }
+                    } else {
+                        cp[ncp].kind = same ? SC_SAME : 0;
+                        cp[ncp].at = first[c];
+                        cp[ncp].d = nr;
+                        cp[ncp++].s = VREG0 + v;
+                    }
                     nsp++;
                 }
                 cnt[c] = 0;
+                defat[c] = NOREG;
+            }
+            /* a stretch that begins with this instruction's write */
+            if (split_def && !all && dc != NOREG && (mf.vclass[in->d - VREG0] & 1) &&
+                !((in->flags & MF_SPLIT) && in->op == X_MOV && in->imm == 1)) {
+                defat[dc] = i;
+                cnt[dc] = 0;
+                open[nopen++] = in->d - VREG0;
             }
         }
     }
@@ -6525,7 +6559,7 @@ static int split_reloads(void)
                     m2->d = cp[k].d;
                     m2->s0 = cp[k].s;
                     m2->s1 = m2->s2 = NOREG;
-                    m2->imm = cp[k].kind & SC_SAME ? 1 : 0;
+                    m2->imm = cp[k].kind & SC_SAME ? 1 : cp[k].kind & SC_DEF ? 2 : 0;
                     if (nloc)
                         nloc[at] = mloc[i];
                     at++;
@@ -7131,6 +7165,8 @@ void x64_gen(Func *fn, Obj *o)
             t.allocatable[0] |= BIT(RBP);
         if (x16)
             x16_mark();
+        split_vec = x16 && !getenv("MCC_NOVSPLIT");
+        split_def = x16 && !getenv("MCC_NODSPLIT");
         if (x16 >= 2) {
             t.allocatable[1] |= XHI_MASK;
             t.ext_first = 1;
@@ -7139,7 +7175,9 @@ void x64_gen(Func *fn, Obj *o)
         if (x16 == 1 && (nsp = x16_spilled()) != 0) {
             /* xmm0-xmm12 were not enough: again with xmm16-xmm31, which the registers that may be there take first
                (the others then find room below; an EVEX encoding is two bytes longer, so only functions that spill
-               pay for it). If no fewer went to memory (they live across calls, or may not be up there), as before. */
+               pay for it). If no fewer went to memory (they live across calls, or may not be up there), once more
+               with xmm16-xmm31 taken last: all as before, but the registers the splitting below makes for the
+               spilled ones' stretches between calls have somewhere to go. */
             MTarget t2 = t;
             t2.allocatable[1] |= XHI_MASK;
             t2.ext_first = 1;
@@ -7157,10 +7195,12 @@ void x64_gen(Func *fn, Obj *o)
                         intern_str(obj->syms[f->sym].name), (unsigned long)nx, (unsigned long)nl, (unsigned long)nsp,
                         (unsigned long)x16_spilled(), (unsigned long)sl, (unsigned long)sv);
             }
-            if (x16_spilled() < nsp)
+            if (x16_spilled() < nsp) {
                 t = t2;
-            else
+            } else {
+                t.allocatable[1] |= XHI_MASK;
                 ra_rerun(&mf, &t);
+            }
         }
         if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
             int rounds = getenv("MCC_SPLITROUNDS") ? atoi(getenv("MCC_SPLITROUNDS")) : 1, r, ch = 0;
@@ -7183,6 +7223,15 @@ void x64_gen(Func *fn, Obj *o)
                         mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
                         mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
                         mf.loc[mi->d - VREG0] = mf.loc[mi->s0 - VREG0];
+                        ch = 1;
+                    }
+                    /* and a register split off where it was written (split_def) that was spilled like the one it
+                       is copied to: that one's slot, which nothing else holds between the write and the copy */
+                    if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->imm == 2 && mi->d >= VREG0 && mi->s0 != NOREG &&
+                        mi->s0 >= VREG0 && mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG &&
+                        mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
+                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
+                        mf.loc[mi->s0 - VREG0] = mf.loc[mi->d - VREG0];
                         ch = 1;
                     }
                 }

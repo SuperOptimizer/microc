@@ -842,6 +842,8 @@ static void pure_add(u32 v)
     pure_tab[npure++] = v;
 }
 
+static int opt_noselcse = -1;
+
 static void gvn(void)
 {
     u32 k, v, nx, n, j, mask;
@@ -1045,6 +1047,14 @@ static void gvn(void)
                     }
                     goto number;
                 }
+                /* x86-64 host: a choice made twice from the same test and values is one (the argument of a min / max
+                   macro, itself a ?:, is written out in both the comparison and the result: fit_vox2's
+                   FIT_IMIN (x, n - 2 < 0 ? 0 : n - 2) computed its clamp twice). MCC_NOSELCSE: off. */
+                if (opt_noselcse < 0)
+                    opt_noselcse = getenv("MCC_NOSELCSE") != 0;
+                if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && !opt_noselcse && f->ins[v].op == OP_SELECT &&
+                    f->ins[v].ty != IT_V128)
+                    goto number;
                 continue;
             }
             }
@@ -1258,6 +1268,7 @@ static int asm_mufu(u32 v)
     return 0;
 }
 
+static int opt_ifcsh = -1;
 /* Is block b empty, or one or two instructions that are safe and cheap to
    execute unconditionally? */
 static int cheap_block(u32 b)
@@ -1451,6 +1462,37 @@ static int jt_eval(int op, int ty, u64 a, u64 b, u64 *r)
     return 1;
 }
 
+/* A comparison of an I32 value known to lie in 0..hi (hi below 2^31: a byte loaded unsigned, a masked value)
+   with the constant k, when every such value compares the same way: a predecessor that brings such a value
+   decides the branch as one that brings a constant does. The case is a decoder's symbol function that
+   returns a table's byte or -1 for failure, tested with "< 0" after inlining (vf_rdec_get in ufsm's volcomp:
+   the symbol went through test / jl once per token). MCC_NOJTR: constants only. */
+static int opt_nojtr = -1;
+
+static int jt_range(int op, u64 hi, u64 k, u64 *r)
+{
+    i64 sk = (i64)(i32)(u32)k, shi = (i64)hi;
+    u64 uk = (u32)k;
+    int v = -1;
+    switch (op) {
+    case OP_SLT: v = sk <= 0 ? 0 : sk > shi ? 1 : -1; break;
+    case OP_SGE: v = sk <= 0 ? 1 : sk > shi ? 0 : -1; break;
+    case OP_SLE: v = sk < 0 ? 0 : sk >= shi ? 1 : -1; break;
+    case OP_SGT: v = sk < 0 ? 1 : sk >= shi ? 0 : -1; break;
+    case OP_ULT: v = uk == 0 ? 0 : uk > hi ? 1 : -1; break;
+    case OP_UGE: v = uk == 0 ? 1 : uk > hi ? 0 : -1; break;
+    case OP_ULE: v = uk >= hi ? 1 : -1; break;
+    case OP_UGT: v = uk >= hi ? 0 : -1; break;
+    case OP_EQ: v = uk > hi ? 0 : -1; break;
+    case OP_NE: v = uk > hi ? 1 : -1; break;
+    default: break;
+    }
+    if (v < 0)
+        return 0;
+    *r = (u64)v;
+    return 1;
+}
+
 /* the block a use is in: a phi's argument k is used at the end of predecessor k */
 static int jt_used_ok(u32 x, u32 B, u32 S1, u32 S2, int s1d, int s2d, u32 *nin)
 {
@@ -1534,6 +1576,8 @@ static int jump_thread(void)
     int changed = 0;
     if (opt_nojt < 0)
         opt_nojt = getenv("MCC_NOJT") != 0;
+    if (opt_nojtr < 0)
+        opt_nojtr = getenv("MCC_NOJTR") != 0;
     if (opt_nojt || opt_dev_fn || opt_cuda)
         return 0;
     compute_dom();
@@ -1577,11 +1621,15 @@ static int jump_thread(void)
                 Ins *i = &f->ins[body[m]];
                 u32 *ops, n, q;
                 u64 a[3] = {0, 0, 0};
+                int ar[3] = {0, 0, 0}, ety = i->ty; /* ar[q]: operand q is not a constant but an I32 in 0..a[q] */
                 IR_OPS(f, i, ops, n);
                 if (n > 2) {
                     ok = 0;
                     break;
                 }
+                /* (a comparison is of its operands' width, not its result's) */
+                if (i->op >= OP_EQ && i->op <= OP_UGE)
+                    ety = f->ins[ir_resolve(f, ops[0])].ty;
                 for (q = 0; q < n && ok; q++) {
                     u32 o = ir_resolve(f, ops[q]), t;
                     int found = 0;
@@ -1592,10 +1640,19 @@ static int jump_thread(void)
                             a[q] = val[t];
                             found = 1;
                         }
-                    if (!found && !ir_is_const(f, o, &a[q]))
-                        ok = 0;
+                    if (!found && !ir_is_const(f, o, &a[q])) {
+                        if (!opt_nojtr && f->ins[o].ty == IT_I32 && ety == IT_I32 && ir_umax32(f, o) < 0x80000000UL) {
+                            a[q] = ir_umax32(f, o);
+                            ar[q] = 1;
+                        } else {
+                            ok = 0;
+                        }
+                    }
                 }
-                if (ok && !jt_eval(i->op, i->ty, a[0], a[1], &val[m]))
+                if (ok && (ar[0] || ar[1])) {
+                    if (ar[1] || !jt_range(i->op, a[0], a[1], &val[m]))
+                        ok = 0;
+                } else if (ok && !jt_eval(i->op, ety, a[0], a[1], &val[m]))
                     ok = 0;
             }
             if (!ok)
@@ -2102,6 +2159,51 @@ static int simplify_cfg(void)
             if (bb->term == TERM_BR && bb->succ[0] != bb->succ[1] && opt_level >= 3 && !opt_size && !opt_dev_fn && hoist_arms(b)) {
                 bb = &f->blk[b];
                 changed = 1;
+            }
+            /* x86-64 host: one way of the branch goes through an empty block that other blocks come through too, the
+               other way straight to the join: this branch gets an empty block of its own on that way, with the same
+               values for the join's phis, and is then a branch around nothing as below (a select of two values that
+               are there already). MCC_NOIFCSH: off. MCC_IFCSH=2: also when the other way is a cheap arm (the 0 of
+               "i < 256 ? 0 : u[i - 256]" and of the "a == 0 ? 0 : (a <= 2 ? 1 : 2)" that follows share one block
+               in ufsm's vll_dense_ctx): not the default, for in the volcomp decoder that took 4.3 G branches of 32 G
+               away and added 3.7 G instructions to 177 G, the arm's selects now computed on every pass. */
+            if (bb->term == TERM_BR && bb->succ[0] != bb->succ[1] && opt_level >= 3 && !opt_size && !opt_dev_fn && !opt_cuda &&
+                opt_arch == ARCH_X64) {
+                int side;
+                if (opt_ifcsh < 0)
+                    opt_ifcsh = getenv("MCC_NOIFCSH") ? 0 : getenv("MCC_IFCSH") ? atoi(getenv("MCC_IFCSH")) : 1;
+                for (side = 0; side < 2 && opt_ifcsh; side++) {
+                    u32 t = bb->succ[side], e = bb->succ[!side], j, n, kt, nphi = 0;
+                    Block *tb = &f->blk[t], *eb = &f->blk[e];
+                    if (t == b || t == 1 || tb->term != TERM_JMP || tb->first || tb->phis || tb->npreds < 2)
+                        continue;
+                    j = tb->succ[0];
+                    if (j == t || j == b || j == 1 || !f->blk[j].phis)
+                        continue;
+                    if (e == j) {
+                        if (pred_index(j, b) == 0xffffffffU)
+                            continue;
+                    } else if (!(opt_ifcsh >= 2 && eb->term == TERM_JMP && eb->succ[0] == j && !eb->phis && eb->npreds == 1 &&
+                                 e != b && e != 1 && pred_index(j, b) == 0xffffffffU && cheap_block(e))) {
+                        continue;
+                    }
+                    for (v = f->blk[j].phis; v; v = f->ins[v].next)
+                        nphi++;
+                    kt = pred_index(j, t);
+                    if (nphi > 2 || kt == 0xffffffffU)
+                        continue;
+                    n = ir_new_block(f);
+                    f->blk[n].term = TERM_JMP;
+                    f->blk[n].succ[0] = j;
+                    ir_add_pred(f, n, b);
+                    f->blk[b].succ[side] = n;
+                    remove_pred(t, pred_index(t, b));
+                    for (v = f->blk[j].phis; v; v = f->ins[v].next)
+                        ir_phi_add_arg(f, v, f->xargs[f->ins[v].a + kt]);
+                    ir_add_pred(f, j, n);
+                    bb = &f->blk[b];
+                    break;
+                }
             }
             if (bb->term == TERM_BR && bb->succ[0] != bb->succ[1]) {
                 u32 t = bb->succ[0], e = bb->succ[1], j = 0, pt, pe, nphi = 0;
@@ -3071,12 +3173,228 @@ void opt_run(Func *fn)
 static void finish_passes(Func *fn);
 static int fuse_sincos(void);
 
+static void addr_shape(Func *fn);
+
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
     ir_loc = 0;
     finish_passes(fn);
+    if (opt_arch == ARCH_X64 && !opt_dev_fn && !opt_cuda && opt_level >= 2)
+        addr_shape(fn);
     ir_loc = saved;
+}
+
+/* x86-64 host, last before selection: the address of a load or store that is a sum with constants in several
+   places is put together again as ((the terms) + one constant) + the index, the shape the selector takes as
+   base + index * scale + displacement. A constant inside a product counts ((x + k) * c is x * c + k * c, also
+   under a widening when x is known small enough for x + k not to wrap). &p->models[5 + ctx].dt[st] in ufsm's
+   volcomp decoder was add 5, imul, add p, add 258 once per symbol: now imul, add p, the rest in the address.
+   Only sums whose inner nodes have no other use, and only when at least one addition goes away: every other
+   address keeps its shape. MCC_NOADDRSHAPE: off. */
+#define AS_MAX 6
+static u32 as_leaf[AS_MAX], as_n, as_consts, as_bad;
+static u64 as_k;
+static u32 *as_uses, as_nuses;
+
+/* a node of the sum that only this sum uses, in the root's block (what was moved out of a loop stays out) */
+static int as_inner(u32 v, u32 blk)
+{
+    return v < as_nuses && as_uses[v] == 1 && f->ins[v].blk == blk;
+}
+
+static void as_collect(u32 v, u32 root, int depth)
+{
+    Ins *i = &f->ins[v];
+    u64 c;
+    if (as_bad)
+        return;
+    if (ir_is_const(f, v, &c)) {
+        as_k += c;
+        as_consts++;
+        return;
+    }
+    if (i->op == OP_ADD && i->ty == IT_I64 && depth < 8 && (v == root || as_inner(v, f->ins[root].blk))) {
+        u32 a = i->a, b = i->b;
+        as_collect(a, root, depth + 1);
+        as_collect(b, root, depth + 1);
+        return;
+    }
+    if (as_n == AS_MAX) {
+        as_bad = 1;
+        return;
+    }
+    as_leaf[as_n++] = v;
+}
+
+/* The leaf v as c * (x + k), k a constant that can leave it: x, c (shift: as a shift count, or -1), k * c, and
+   whether x is widened from 32 bits; 0 if v is not of that form. */
+static int as_scaled(u32 v, u32 blk, u32 *x, u64 *mul, int *shift, u64 *kc, int *widen)
+{
+    Ins *i = &f->ins[v], *xi;
+    u64 c = 1, k;
+    u32 in = v;
+    *shift = -1;
+    *widen = 0;
+    if (!as_inner(v, blk) || i->ty != IT_I64)
+        return 0;
+    if ((i->op == OP_MUL || i->op == OP_SHL) && ir_is_const(f, i->b, &c)) {
+        if (i->op == OP_SHL) {
+            if (c > 31)
+                return 0;
+            *shift = (int)c;
+            c = (u64)1 << c;
+        }
+        in = i->a;
+        if (!as_inner(in, blk))
+            return 0;
+    }
+    xi = &f->ins[in];
+    if (xi->op == OP_ZEXT32) {
+        u32 y = xi->a;
+        Ins *yi = &f->ins[y];
+        if (!as_inner(y, blk) || yi->op != OP_ADD || yi->ty != IT_I32 || !ir_is_const(f, yi->b, &k))
+            return 0;
+        k &= 0xffffffffUL;
+        if (ir_umax32(f, yi->a) >= 0x80000000UL || k >= 0x80000000UL)
+            return 0; /* (the 32-bit sum may wrap) */
+        *widen = 1;
+        *x = yi->a;
+    } else if (xi->op == OP_ADD && xi->ty == IT_I64 && in != v && ir_is_const(f, xi->b, &k)) {
+        *x = xi->a;
+    } else {
+        return 0;
+    }
+    *mul = c;
+    *kc = k * c;
+    return 1;
+}
+
+static void addr_shape(Func *fn)
+{
+    static int off = -1;
+    u32 b, v, k, changed = 0, nroot;
+    u8 *root;
+    if (off < 0)
+        off = getenv("MCC_NOADDRSHAPE") != 0;
+    if (off || fn->nins > 400000)
+        return;
+    f = fn;
+    as_uses = count_uses(&as_nuses);
+    /* the sums to look at: the addresses of loads and stores, and what such an address adds a constant to (the
+       element whose fields are read one by one) */
+    nroot = f->nins;
+    root = (u8 *)xmalloc(nroot);
+    memset(root, 0, nroot);
+    for (b = 1; b < f->nblk; b++) {
+        if (f->blk[b].term == TERM_NONE)
+            continue;
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            u32 r;
+            u64 c;
+            if (f->ins[v].op != OP_LOAD && f->ins[v].op != OP_STORE)
+                continue;
+            r = f->ins[v].a;
+            if (f->ins[r].op != OP_ADD || f->ins[r].ty != IT_I64)
+                continue;
+            root[r] = 1;
+            if (ir_is_const(f, f->ins[r].b, &c) && f->ins[f->ins[r].a].op == OP_ADD && f->ins[f->ins[r].a].ty == IT_I64 &&
+                f->ins[r].a < as_nuses && as_uses[f->ins[r].a] > 1)
+                root[f->ins[r].a] = 1; /* (used once, it is part of r's sum) */
+        }
+    }
+    for (b = 1; b < f->nblk; b++) {
+        if (f->blk[b].term == TERM_NONE)
+            continue;
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            u32 r = v, idx = 0xffffffffU, sum = 0, dist = 0, nu, kk;
+            u32 lx[AS_MAX];
+            u64 lm[AS_MAX], lk[AS_MAX];
+            int lsh[AS_MAX], lw[AS_MAX], ld[AS_MAX];
+            if (r >= nroot || !root[r] || f->ins[r].op != OP_ADD || f->ins[r].ty != IT_I64)
+                continue;
+            as_n = as_consts = as_bad = 0;
+            as_k = 0;
+            as_collect(r, r, 0);
+            if (as_bad || !as_n)
+                continue;
+            for (k = 0; k < as_n; k++) {
+                ld[k] = as_scaled(as_leaf[k], b, &lx[k], &lm[k], &lsh[k], &lk[k], &lw[k]);
+                dist += (u32)ld[k];
+            }
+            /* worth it: constants in two places, or one inside a product */
+            if (as_consts + dist < 2 && !dist)
+                continue;
+            /* the leaves that held a constant, made anew before the root without it */
+            for (k = 0; k < as_n; k++) {
+                u32 x, t;
+                if (!ld[k])
+                    continue;
+                x = lx[k];
+                if (lw[k]) {
+                    t = ir_raw(f, OP_ZEXT32, IT_I64, x, 0);
+                    ir_insert_before(f, r, t);
+                    x = t;
+                }
+                if (lm[k] != 1) {
+                    kk = lsh[k] >= 0 ? ir_const(f, IT_I64, (u64)lsh[k]) : ir_const(f, IT_I64, lm[k]);
+                    t = ir_raw(f, lsh[k] >= 0 ? OP_SHL : OP_MUL, IT_I64, x, kk);
+                    ir_insert_before(f, r, t);
+                    x = t;
+                }
+                as_leaf[k] = x;
+                as_k += lk[k];
+            }
+            /* the index: a leaf shifted by 1..3 if there is one, else the last of several */
+            for (k = 0; k < as_n; k++) {
+                Ins *li = &f->ins[as_leaf[k]];
+                u64 sh;
+                if (li->op == OP_SHL && ir_is_const(f, li->b, &sh) && sh >= 1 && sh <= 3)
+                    idx = k;
+            }
+            if (idx == 0xffffffffU && as_n >= 2)
+                idx = as_n - 1;
+            for (k = 0; k < as_n; k++) {
+                if (k == idx)
+                    continue;
+                if (!sum) {
+                    sum = as_leaf[k];
+                } else {
+                    nu = ir_raw(f, OP_ADD, IT_I64, sum, as_leaf[k]);
+                    ir_insert_before(f, r, nu);
+                    sum = nu;
+                }
+            }
+            kk = ir_const(f, IT_I64, as_k);
+            if (!sum) {
+                /* (one leaf) */
+                f->ins[r].a = as_leaf[idx];
+                f->ins[r].b = kk;
+            } else if (idx == 0xffffffffU) {
+                f->ins[r].a = sum;
+                f->ins[r].b = kk;
+            } else {
+                if (as_k) {
+                    nu = ir_raw(f, OP_ADD, IT_I64, sum, kk);
+                    ir_insert_before(f, r, nu);
+                    sum = nu;
+                }
+                f->ins[r].a = sum;
+                f->ins[r].b = as_leaf[idx];
+            }
+            changed = 1;
+        }
+    }
+    free(as_uses);
+    free(root);
+    as_uses = 0;
+    if (changed) {
+        /* (what the sums no longer use goes; a sum that came to "+ 0" is its other operand) */
+        ir_resolve_all(f);
+        gvn();
+        ir_resolve_all(f);
+        opt_dce(f);
+    }
 }
 
 static void run_passes(Func *fn)

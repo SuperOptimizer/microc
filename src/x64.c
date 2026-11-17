@@ -2828,13 +2828,79 @@ static u32 branch_chance(u32 b)
    whose header is taken to run LOOP_TIMES as often as it is entered. */
 #define LOOP_TIMES 8
 
+/* The innermost loop each block is in, by its header (lp, 0: none), and the loop around each header (lpar): a
+   loop is a block that an edge from a block not before it in the order (pos) comes back to, with the blocks
+   that reach that edge's source without passing the header. Headers are taken in the order, so a loop inside
+   another is found after it and its blocks end up with the inner header. */
+static void find_loops(const u32 *pos, u32 *lp, u32 *lpar)
+{
+    u32 *stack = (u32 *)xmalloc((size_t)f->nblk * 2 * sizeof(u32)), *mark = stack + f->nblk;
+    u32 k, s, sp;
+    memset(lp, 0, f->nblk * sizeof(u32));
+    memset(lpar, 0, f->nblk * sizeof(u32));
+    memset(mark, 0, f->nblk * sizeof(u32));
+    for (k = 0; k < nlayout; k++) {
+        u32 h = layout[k];
+        Block *hb = &f->blk[h];
+        sp = 0;
+        for (s = 0; s < hb->npreds; s++) {
+            u32 p = hb->preds[s];
+            if (f->blk[p].flag == 2 && pos[p] >= k && mark[p] != h) {
+                mark[p] = h;
+                stack[sp++] = p;
+            }
+        }
+        if (!sp)
+            continue;
+        lpar[h] = lp[h];
+        while (sp) {
+            u32 x = stack[--sp];
+            Block *xb = &f->blk[x];
+            lp[x] = h;
+            if (x == h)
+                continue;
+            for (s = 0; s < xb->npreds; s++) {
+                u32 p = xb->preds[s];
+                /* (only blocks after the header: an entry into the middle of the loop does not pull in the code before it) */
+                if (f->blk[p].flag == 2 && mark[p] != h && pos[p] >= k) {
+                    mark[p] = h;
+                    stack[sp++] = p;
+                }
+            }
+        }
+        lp[h] = h;
+    }
+    free(stack);
+}
+
+static int in_loop(const u32 *lp, const u32 *lpar, u32 b, u32 h)
+{
+    u32 x = lp[b], n = 0;
+    while (x && x != h && n++ < 64)
+        x = lpar[x];
+    return x == h;
+}
+
+static int opt_noloopx = -1; /* MCC_NOLOOPX: a branch out of the middle of a loop is guessed like any other */
+static int opt_noifin = -1;  /* MCC_NOIFIN: an if's body is guessed like any other block */
+static u32 ifin_p = 10;      /* (its chance, of 16) */
+
 static void estimate_freq(void)
 {
-    u32 *fr = (u32 *)xmalloc((size_t)f->nblk * 2 * sizeof(u32)), *pos = fr + f->nblk;
+    u32 *fr = (u32 *)xmalloc((size_t)f->nblk * 4 * sizeof(u32)), *pos = fr + f->nblk, *lp = pos + f->nblk, *lpar = lp + f->nblk;
     u32 k, s;
+    if (opt_noloopx < 0)
+        opt_noloopx = getenv("MCC_NOLOOPX") != 0;
+    if (opt_noifin < 0) {
+        opt_noifin = getenv("MCC_NOIFIN") != 0;
+        if (getenv("MCC_IFINP"))
+            ifin_p = (u32)atoi(getenv("MCC_IFINP"));
+    }
     memset(fr, 0, f->nblk * sizeof(u32));
     for (k = 0; k < nlayout; k++)
         pos[layout[k]] = k;
+    if (!opt_noloopx)
+        find_loops(pos, lp, lpar);
     fr[1] = 1024;
     for (k = 0; k < nlayout; k++) {
         u32 b = layout[k], x = fr[b], p0;
@@ -2862,6 +2928,42 @@ static void estimate_freq(void)
                 continue;
             }
             p0 = branch_chance(b); /* of 16 */
+            if (!opt_noloopx && lp[b]) {
+                /* One way stays in the loop and the other leaves it (a break, or the return of a check that
+                   failed: a decoder's "if (!get (...)) return ERR;" once per symbol): the loop runs LOOP_TIMES
+                   on, and a way that ends the function at once is rarer still. Guessed by shape, the small block
+                   that returns looked the likelier side, the loop's body went out of line behind jumps and its
+                   values lost their registers to the error paths (frequencies are also the allocator's weights). */
+                int in0 = in_loop(lp, lpar, bb->succ[0], lp[b]), in1 = in_loop(lp, lpar, bb->succ[1], lp[b]);
+                if (in0 != in1) {
+                    u32 o = bb->succ[in0 ? 1 : 0], hops = 0, px;
+                    while (f->blk[o].term == TERM_JMP && !f->blk[o].first && !f->blk[o].phis && hops++ < 4)
+                        o = f->blk[o].succ[0];
+                    px = f->blk[o].term == TERM_RET ? LOOP_TIMES * 4 : LOOP_TIMES;
+                    fr[bb->succ[in0 ? 1 : 0]] += x / px;
+                    fr[bb->succ[in0 ? 0 : 1]] += x - x / px;
+                    continue;
+                }
+            }
+            if (!opt_noifin) {
+                /* One way is entered from here alone and the other is where other code comes together too: an if
+                   with its body, or a path with a shared way out. The body is guessed the likelier side unless it
+                   only returns, so that it stays in line: out of line it costs a jump there and a jump back each
+                   time it runs, in line nothing when it runs and a taken branch when it does not. Guessed by shape
+                   (the side that stores, the larger side: unlikely) the bodies of "if (0 <= x && x < n) out[x] = ..."
+                   went behind the function (ufsm's warp_w4_ref: 3.7 of its 15 G branches were such jumps). */
+                u32 e[2], q;
+                for (q = 0; q < 2; q++) {
+                    u32 t = bb->succ[q];
+                    e[q] = f->blk[t].npreds;
+                    if (e[q] == 1 && f->blk[t].term == TERM_JMP && !f->blk[t].first && !f->blk[t].phis)
+                        e[q] = f->blk[f->blk[t].succ[0]].npreds > 1 ? 2 : 1; /* (an edge's own block) */
+                }
+                if (e[0] == 1 && e[1] > 1 && f->blk[bb->succ[0]].term != TERM_RET && p0 < ifin_p)
+                    p0 = ifin_p;
+                if (e[1] == 1 && e[0] > 1 && f->blk[bb->succ[1]].term != TERM_RET && p0 > 16 - ifin_p)
+                    p0 = 16 - ifin_p;
+            }
             fr[bb->succ[0]] += (u32)((u64)x * p0 / 16);
             fr[bb->succ[1]] += (u32)((u64)x * (16 - p0) / 16);
         }

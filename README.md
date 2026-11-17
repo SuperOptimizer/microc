@@ -693,6 +693,7 @@ certificate authorities, which is data, and ssh, which is Dropbear built here by
 | `/usr/linux-x64` | the C library (`include`, `lib/crt1.o`, `lib/libc.a`) and the third-party libraries (`ext`) |
 | `/usr/cuda` | `include`: what a `.cu` file includes; `lib64/libcudart.a`: the CUDA run time, which runs kernels on the GPU when NVIDIA's driver is there and on the CPU otherwise (with a `libcublasLt.a` and a `libstdc++.a` that hold nothing) |
 | `/usr/dropbearmulti` | ssh: Dropbear's server, client, `dropbearkey` and `scp` (not ours, built here from source: below), and `/usr/bin/start-ssh` |
+| `/usr/bin/dlcheck` | what a driver's libraries import that our `dlopen` has not (below) |
 | `/etc/passwd`, `group`, `hosts` | root alone; `/tmp`, `/root`, `/proc`, `/sys`, `/dev` are empty |
 | `/etc/ssl/certs/ca-certificates.crt` | the certificate authorities HTTPS trusts (libcurl's default file; `/etc/ssl/cert.pem` is a link to it). **The one file that is data from outside this tree**: a copy of `CACERTS=file` (PEM), by default the build machine's own `/etc/ssl/certs/ca-certificates.crt` (Linux) or `/etc/ssl/cert.pem` (macOS: 128 certificates, readable by anyone; the keychain's list, `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > roots.pem`, also needs no rights and can be given as `CACERTS=roots.pem`). `CACERTS=none` leaves it out. Nothing is downloaded; `mkhostfs.sh` prints the file's SHA-256, and the same file gives the same archive |
 
@@ -732,6 +733,24 @@ brings the driver's libraries and device nodes, as it does for any image.
   thread-local storage is refused with a message (so NVIDIA's `libnvidia-nvvm`, `libcublasLt`, `libnvidia-ml`
   do not load, and are not needed), symbol versions are ignored, nothing is unloaded. A missing name shows in
   `dlerror` (and with `MCC_DLDEBUG=1`, which traces every request) and is a line to add to the table.
+
+  **A new driver is checked before it is tried** with `dlcheck` (`libc/linux/dlcheck.c`; in the image
+  `/usr/bin/dlcheck`, on the build machine `make dlcheck` gives `build/dlcheck`). It reads the libraries'
+  dynamic symbols and lists the undefined ones that the table has not, the strong ones (each makes `dlopen`
+  fail) and the weak ones (they are 0 when the object runs) apart, and says when an object has thread-local
+  storage; its status is 0 when `dlopen` will take them. In a container that has the driver, no argument is
+  needed (it looks where the loader looks); elsewhere, name copies of the two files:
+
+      $ dlcheck            # or: build/dlcheck libcuda.so.620.70.06 libnvidia-ptxjitcompiler.so.620.70.06
+      /usr/lib64/libcuda.so.620.70.06
+        strong: 245 undefined, 0 that this C library has not
+        weak: 4 undefined, 3 that this C library has not:
+          _ITM_deregisterTMCloneTable
+          ...
+      dlcheck: 2 objects, 370 undefined symbols: 0 strong and 6 weak ones are missing (dlopen will take them)
+
+  Driver 620.70 imported three names that 615.71 had not (`rename`, `wcslen`, `dladdr`), and that is how
+  they were found: the weak three (`_ITM_*`, `__gmon_start__`) are missing in any program and are meant to be.
   Objects are looked for in `LD_LIBRARY_PATH`, then `/usr/lib/x86_64-linux-gnu`, `/usr/lib64`, `/lib64`,
   `/usr/lib`, `/usr/local/nvidia/lib64` ... (there is no `ld.so.cache`); when `libcuda.so.1` is nowhere, a
   `libcuda.so.<version>` in those directories is taken: NVIDIA's container run time mounts the driver's
@@ -751,7 +770,14 @@ brings the driver's libraries and device nodes, as it does for any image.
   before it and of the GPU's `mgpu_` (`symprefix.c` rewrites the objects' symbol tables), and each public
   function (`cuda*`, `cublasLt*`, `cu*`, `__mcuda_*`) is two instructions that jump through a slot. At the
   first call the GPU's run time is taken if `libcuda.so.1` loads and `cuInit` finds a device, the CPU's
-  otherwise; `MCUDA_BACKEND=cpu` or `gpu` decides instead, `MCUDA_VERBOSE=1` says which it is. A program that
+  otherwise; `MCUDA_BACKEND=cpu` or `gpu` decides instead, `MCUDA_VERBOSE=1` says which it is. A driver
+  that is there and fails is not taken for a machine without one: when `libcuda` is found and does not load
+  (a name the table lacks, thread-local storage, a relocation the loader has not) or its `cuInit` gives an
+  error other than "no device", the CPU's run time is used but one line on standard error says so, always:
+  `mcuda: the driver (libcuda.so.1) is here but cannot be loaded: undefined symbol: rename
+  (/usr/lib64/libcuda.so.620.70.06 wants it); the CPU run time is used instead (MCUDA_BACKEND=gpu makes this
+  an error, MCUDA_BACKEND=cpu chooses the CPU without asking the driver)`; and under `MCUDA_BACKEND=gpu` the
+  program stops there with status 1. With no driver at all nothing is said. A program that
   never calls CUDA loads nothing. The driver API by name (`cuMemAlloc`, ...) is the CPU run time's alone;
   on the GPU a program gets the driver's functions from `cudaGetDriverEntryPointByVersion`, as ufsm does.
 
@@ -769,7 +795,8 @@ that is a multiple of 4 but not of 8, which `ld.global.nc.v2.u32` does not take 
 The image's ssh is **Dropbear, which is not ours** (Matt Johnston's, MIT licence): the second thing in the
 image, after the certificate authorities, that this tree did not write. It is built from its source by mcc
 against our C library, statically, like everything else (`mkssh.sh MCC DIR`; `make hostfs` runs it when
-`build/ext/dropbear-2026.90` is there): `/usr/dropbearmulti`, one program that is `dropbear` (the server),
+`build/ext/dropbear-2026.90` is there, and otherwise builds an image without ssh and says so in its last
+line; `make hostfs SSH=1` makes that an error): `/usr/dropbearmulti`, one program that is `dropbear` (the server),
 `dbclient` / `ssh` (the client), `dropbearkey` and `scp`. Its `configure` and makefiles are not run:
 `libc/ext/dropbear/config.h` is what configure would find, written by hand, and `localoptions.h` what the
 image wants. For it the C library got the users and groups of `/etc/passwd` and `/etc/group` (`getpwnam`,
@@ -807,24 +834,32 @@ did not know itself under the name `-sh`, which is how a server starts a login s
 passes the command's status on; the smoke test; with `GPU=1` the GPU checks under `docker run --gpus all`,
 with nothing bound by hand; ssh as root in a container with `--network none`. Images and containers are named
 `mcc-hostfs-test*` and removed. With Docker 29.1 and NVIDIA's container toolkit on two RTX 3090 (driver
-615.71, and again 620.70): 132 checks pass, 65 under bubblewrap and 67 under Docker; ufsm's `test_nn` takes 5 s there too.
+615.71, and again 620.70): 152 checks pass, 75 under bubblewrap and 77 under Docker; ufsm's `test_nn` takes 5 s there too.
 
-What NVIDIA's run time puts into this image, as seen there (no `nvidia` runtime was registered with Docker,
-no `/etc/docker/daemon.json`; the toolkit had written a CDI specification, `/var/run/cdi/nvidia.yaml`):
+What NVIDIA's run time puts into this image, as seen there with driver 620.70.06 (no `nvidia` runtime was
+registered with Docker, no `/etc/docker/daemon.json`; the toolkit had written a CDI specification,
+`/var/run/cdi/nvidia.yaml`). With 615.71.10 it was the same but for the version in the names and one library
+fewer in each column:
 
-| | `--gpus all` (or `--gpus device=N`) | `--device nvidia.com/gpu=all` (CDI) | `--runtime=nvidia` |
+| | `--gpus all` (or `--gpus device=N`) | `--device nvidia.com/gpu=all` (or `=N`: CDI) | `--runtime=nvidia` |
 |---|---|---|---|
-| works | yes | yes | no: "unknown or invalid runtime name" (it is not registered) |
-| libraries | `/usr/lib64`, 20 names | `/usr/lib/x86_64-linux-gnu`, 68 names | |
-| `libcuda`, `libnvidia-ptxjitcompiler` | mounted as `libcuda.so.615.71.10` (`.620.70.06` after the driver changed); the link `libcuda.so.1` is made | the same | |
-| devices | `/dev/nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`, `nvidia0`, `nvidia1` (those asked for) | those, `nvidia-modeset`, `/dev/dri/*` | |
+| works | yes | yes | no: "unknown or invalid runtime name: nvidia" (it is not registered) |
+| libraries | `/usr/lib64`, 21 names | `/usr/lib/x86_64-linux-gnu`, 69 names | |
+| `libcuda`, `libnvidia-ptxjitcompiler` | mounted as `libcuda.so.620.70.06`; the link `libcuda.so.1` is made | the same | |
+| devices | `/dev/nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`, and `nvidia0`, `nvidia1` (those asked for) | those, `nvidia-modeset`, `/dev/dri/card*`, `renderD*`, `by-path` | |
 | environment | `NVIDIA_VISIBLE_DEVICES=all` (or the number) | `NVIDIA_VISIBLE_DEVICES=void`, `NVIDIA_CTK_LIBCUDA_DIR=/usr/lib/x86_64-linux-gnu` | |
-| other | `/usr/bin/nvidia-smi` and four more programs (they need glibc: they do not run here), firmware, `/proc/driver/nvidia`, an `/etc/ld.so.cache` | the same | |
+| `ld.so` | an `/etc/ld.so.cache` | an `/etc/ld.so.cache` and two files in `/etc/ld.so.conf.d` | |
+| other | `/usr/bin/nvidia-smi` and four more programs (they need glibc: they do not run here), firmware (`gsp_*.bin`), `/proc/driver/nvidia` (`gpus`, `params`, `registry`, `version`) | the same programs, firmware with `ucodes_*.bin` too, all of `/proc/driver/nvidia` | |
+
+The GPU checks pass under each of the two that work, with both devices and with one (`--gpus device=1`,
+`--device nvidia.com/gpu=1`). The number in `--gpus device=N` is NVIDIA's, not the number of the node: after
+the reboot into 620.70 `--gpus device=0` brought `/dev/nvidia1`.
 
 The image has no `ldconfig` and no `/etc/ld.so.conf`; both ways bring their own, and the short names and the
 cache appear all the same. Our `dlopen` reads no cache: it finds the libraries in either directory, by the
 short name or, were the link missing, by the full one. Without any of these options the same program runs on
-the CPU (`mcuda: the CPU run time (no driver or no device: error 35)`).
+the CPU, and says nothing unless asked (`MCUDA_VERBOSE=1`: `mcuda: the CPU run time (no driver or no device:
+error 35)`).
 
 Not in it: time zones (the library knows UTC), bash and python (ufsm's suite runner and some of its tests),
 sftp. Not tried: RunPod (what its run time injects is taken to be what `--gpus all` does; the name of the

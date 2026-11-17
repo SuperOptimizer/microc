@@ -60,6 +60,12 @@ grep -c '^archive' files.txt | sed 's/^/archives: /'
 grep -c '^script' files.txt | sed 's/^/scripts: /'
 grep -c '^data' files.txt | sed 's/^/other files (headers, text): /'
 grep '^elf' files.txt | grep -v -e '^elf EXEC dyn=0' -e '^elf REL dyn=0' | sed 's/^/FAIL not ours: /'
+# a shared object that wants a name our C library has not (for smoke.sh): made here, the image links none
+if command -v gcc > /dev/null 2>&1; then
+    mkdir -p work/stub
+    printf 'extern int name_the_table_lacks(void);\nint cuInit(unsigned f) { (void)f; return name_the_table_lacks(); }\n' > work/stub/stub.c
+    gcc -shared -fPIC -nostdlib -o work/stub/libcuda.so.1 work/stub/stub.c 2>/dev/null || rm -f work/stub/libcuda.so.1
+fi
 if [ -n "$DOCKER" ]; then cp -R work dwork; fi
 gpu=
 if [ -f work/gpu.sh ]; then

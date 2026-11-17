@@ -6,7 +6,10 @@
      the GPU's run time, when the driver (libcuda.so.1) can be loaded and finds a device;
      the CPU's otherwise.
    MCUDA_BACKEND=cpu or gpu in the environment decides instead (gpu: without a driver or a device every call
-   then fails as it does on a machine without one); MCUDA_VERBOSE=1 says which it is. */
+   then fails as it does on a machine without one); MCUDA_VERBOSE=1 says which it is.
+   A driver that is there and fails (it does not load: a name our C library lacks, thread-local storage; or
+   its cuInit gives an error) is not a machine without one: the CPU's run time is taken, but with a line on
+   standard error that says why, always; and under MCUDA_BACKEND=gpu the program stops there. */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +21,7 @@ extern const int __mcuda_mux_n;
 void mcpu___mcuda_register(struct __mcuda_module *m);
 void mgpu___mcuda_register(struct __mcuda_module *m);
 int mgpu_cudaGetDeviceCount(int *n);
+const char *mgpu_hw_why(void);
 
 void __mcuda_mux_init(void);
 void __mcuda_mux_missing(const char *name);
@@ -30,18 +34,26 @@ static int chosen; /* 0: not yet, 1: the CPU, 2: the GPU */
 /* (first.S calls this with the arguments of the call that came first saved) */
 void __mcuda_mux_init(void)
 {
-    const char *e, *v;
+    const char *e, *v, *why;
     int gpu, n = 0, i, r = 0;
     pthread_mutex_lock(&lock);
     if (!chosen) {
         e = getenv("MCUDA_BACKEND");
         if (e && !strcmp(e, "cpu"))
             gpu = 0;
-        else if (e && !strcmp(e, "gpu"))
-            gpu = 1;
         else {
             r = mgpu_cudaGetDeviceCount(&n);
             gpu = r == 0 && n > 0;
+            why = mgpu_hw_why();
+            if (e && !strcmp(e, "gpu")) {
+                if (!gpu && why[0]) {
+                    fprintf(stderr, "mcuda: %s; MCUDA_BACKEND=gpu, so this is the end (MCUDA_BACKEND=cpu runs it on the CPU)\n", why);
+                    exit(1);
+                }
+                gpu = 1;
+            } else if (!gpu && why[0])
+                fprintf(stderr, "mcuda: %s; the CPU run time is used instead (MCUDA_BACKEND=gpu makes this an error, "
+                                "MCUDA_BACKEND=cpu chooses the CPU without asking the driver)\n", why);
         }
         v = getenv("MCUDA_VERBOSE");
         if (v && v[0] && v[0] != '0') {

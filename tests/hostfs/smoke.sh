@@ -174,6 +174,28 @@ int main(void)
 EOF
         check cuda-link gcc -I/usr/cuda/include -o kmain kmain.c k.o -L/usr/cuda/lib64 -lcudart -lcublasLt -lstdc++ -lm -lpthread
         is cuda-run "$(./kmain)" "kernel 1000"
+        # A driver that is there and does not load is not a machine without one: the CPU's run time is used,
+        # with one line that says why; MCUDA_BACKEND=gpu makes it the end; MCUDA_BACKEND=cpu does not ask.
+        # A driver that is not there: the CPU's run time and not a word.
+        echo "this is not a library" > broken.so
+        is cuda-broken-driver-runs "$(MCUDA_LIBCUDA=$PWD/broken.so ./kmain 2> fb.err)" "kernel 1000"
+        is cuda-broken-driver-said "$(grep -c 'broken.so.*cannot be loaded.*not a shared object.*CPU run time.*MCUDA_BACKEND' fb.err) of $(grep -c . fb.err)" "1 of 1"
+        is cuda-broken-driver-gpu "$(MCUDA_BACKEND=gpu MCUDA_LIBCUDA=$PWD/broken.so ./kmain 2> fbg.err; echo "status $?"; grep -c 'cannot be loaded' fbg.err)" "status 1
+1"
+        is cuda-broken-driver-cpu "$(MCUDA_BACKEND=cpu MCUDA_LIBCUDA=$PWD/broken.so ./kmain 2>&1)" "kernel 1000"
+        is cuda-no-driver-quiet "$(MCUDA_LIBCUDA=/nowhere/libcuda.so.1 ./kmain 2>&1)" "kernel 1000"
+        # a shared object that imports a name our C library has not (tests/hostfs.sh makes it with the
+        # machine's gcc, when it has one): the line names the symbol, and dlcheck tells it beforehand
+        if [ -f /work/stub/libcuda.so.1 ]; then
+            is cuda-undefined-runs "$(MCUDA_LIBCUDA=/work/stub/libcuda.so.1 ./kmain 2> un.err)" "kernel 1000"
+            is cuda-undefined-said "$(grep -c 'undefined symbol: name_the_table_lacks (/work/stub/libcuda.so.1 wants it).*CPU run time' un.err) of $(grep -c . un.err)" "1 of 1"
+            is cuda-undefined-gpu "$(MCUDA_BACKEND=gpu MCUDA_LIBCUDA=/work/stub/libcuda.so.1 ./kmain > /dev/null 2>&1; echo $?)" "1"
+            is dlcheck-stub "$(dlcheck /work/stub/libcuda.so.1 > dlc.out 2>&1; echo "status $?"; grep -c '^    name_the_table_lacks$' dlc.out; grep -c 'strong: 1 undefined, 1 that' dlc.out)" "status 1
+1
+1"
+        else
+            echo "(no /work/stub/libcuda.so.1: the undefined-symbol checks are left out)"
+        fi
     fi
 fi
 

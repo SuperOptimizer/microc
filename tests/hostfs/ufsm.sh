@@ -4,7 +4,8 @@
 mkdir -p /work/ufsm && tar -xf /work/ufsm.tar -C /work/ufsm && cd /work/ufsm || exit 1
 [ -n "$UFSM_TESTS" ] || UFSM_TESTS="test_fuse test_target_erode test_papyrus test_cover test_zcache test_crush test_votes test_wind test_phase_check"
 T=$UFSM_TESTS
-targets=; for t in $T; do targets="$targets /work/out/$t"; done
+# (UFSM_GPU_TESTS: built here, run by gpu.sh)
+targets=; for t in $T $UFSM_GPU_TESTS; do targets="$targets /work/out/$t"; done
 if make -k -j8 ARCH=86 BDIR=/work/out CCACHE= HOSTCC=gcc NVCC=nvcc CUDA=/usr/cuda $targets > /work/ufsm-build.log 2>&1; then
     echo "ok ufsm-build"
 else

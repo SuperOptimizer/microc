@@ -29,6 +29,7 @@ is sed-grep "$(sed -n 's/^9\(9\)9$/x\1/p' nums | grep -c x9)" 1
 is sort-uniq "$(printf 'b\na\nb\n' | sort | uniq -c | tr -s ' ' | tr '\n' ,)" " 1 a, 2 b,"
 is find "$(find . -name nums -type f | wc -l | tr -d ' ')" 1
 is sha1 "$(printf abc | sha1sum | cut -d' ' -f1)" a9993e364706816aba3e25717850c26c9cd0d89d
+is sha256 "$(printf abc | sha256sum | cut -d' ' -f1)" ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 gzip -c nums > nums.gz && gunzip -c nums.gz | cmp -s - nums && ok gzip || bad gzip
 ln -s ../nums sub/link && cp nums sub/copy && chmod 640 sub/copy
 tar -cf a.tar nums sub && mkdir x && tar -xf a.tar -C x && cmp -s x/sub/copy nums && [ "$(readlink x/sub/link)" = ../nums ] &&
@@ -45,6 +46,26 @@ check cc-hello cc -o hello hello.c
 is run-hello "$(./hello a b)" "hello from ./hello, 2 args"
 check gcc-c23 gcc -std=c23 -O3 -march=native -g -Wall -o hello23 hello.c
 is run-hello23 "$(./hello23)" "hello from ./hello23, 0 args"
+# by the names in /bin too (a link to usr/bin: the compiler still finds its headers and library)
+check bin-mcc /bin/mcc -o hellob hello.c
+check bin-cc /bin/cc -o hellob hello.c
+is run-hellob "$(./hellob)" "hello from ./hellob, 0 args"
+# dlopen: a real loader in a static program; a library that is not there fails with a reason
+cat > dl.c <<'EOF'
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+int main(void)
+{
+    void *h = dlopen("libnothere.so.9", RTLD_NOW), *self = dlopen("libc.so.6", RTLD_NOW);
+    const char *e = dlerror();
+    size_t (*len)(const char *) = self ? (size_t (*)(const char *))dlsym(self, "strlen") : 0;
+    printf("%s %s %d\n", h ? "opened" : "refused", e && strstr(e, "libnothere.so.9") ? "named" : "silent", len ? (int)len("four") : -1);
+    return 0;
+}
+EOF
+check cc-dl cc -o dl dl.c
+is run-dl "$(./dl)" "refused named 4"
 cat > thr.c <<'EOF'
 #include <math.h>
 #include <pthread.h>

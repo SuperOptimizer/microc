@@ -10,9 +10,17 @@
 #   /usr/mcc, /usr/mbox          the compiler (make, lex, yacc, linker, binutils) and the shell + tools
 #   /usr/bin                     every tool by name; /bin and /sbin are links to it
 #   /usr/linux-x64               the C library: include, lib/crt1.o, lib/libc.a, ext/{include,lib}
-#   /usr/cuda                    include: what a .cu file includes; lib64/libcudart.a: mcuda, the CPU run time
+#   /usr/cuda                    include: what a .cu file includes; lib64/libcudart.a: the CUDA run time, on the
+#                                GPU when NVIDIA's driver is there (libcuda.so.1, which the container run time
+#                                brings in) and on the CPU otherwise (cuda/mux)
 #   /etc/passwd, group, hosts    root alone; /tmp, /root, /proc, /sys, /dev: empty
-# SOURCE_DATE_EPOCH: the time every member of the archive carries (so that the same tree gives the same archive).
+#   /etc/ssl/certs/ca-certificates.crt   the certificate authorities HTTPS trusts (libcurl reads it): the one
+#                                file here that is neither made by mcc nor from this tree. It is a copy of
+#                                CACERTS, a file of PEM certificates; by default this machine's own:
+#                                /etc/ssl/certs/ca-certificates.crt (Linux) or /etc/ssl/cert.pem (macOS).
+#                                CACERTS=none leaves it out. Nothing is downloaded.
+# SOURCE_DATE_EPOCH: the time every member of the archive carries (so that the same tree, with the same
+# certificates, gives the same archive).
 set -e
 MCC=$1; OUT=$2
 [ -n "$MCC" ] && [ -n "$OUT" ] || { echo "usage: mkhostfs.sh MCC OUTDIR" >&2; exit 2; }
@@ -92,7 +100,7 @@ if [ -d $D/cuda/include ]; then
     mkdir -p $R/usr/cuda
     cp -R $D/cuda/include $R/usr/cuda/include
 fi
-# mcuda, the CUDA run time on the CPU, as the libcudart.a that a Makefile written for NVIDIA's toolkit links
+# the CUDA run time (mkcuda.sh), as the libcudart.a that a Makefile written for NVIDIA's toolkit links
 if [ -f $D/linux-x64/cuda/lib/libmcuda.a ]; then
     mkdir -p $R/usr/cuda/lib64
     cp $D/linux-x64/cuda/lib/libcudart.a $D/linux-x64/cuda/lib/libcublasLt.a $D/linux-x64/cuda/lib/libstdc++.a $R/usr/cuda/lib64/
@@ -101,6 +109,22 @@ fi
 printf 'root:x:0:0:root:/root:/bin/sh\n' > $R/etc/passwd
 printf 'root:x:0:\n' > $R/etc/group
 printf '127.0.0.1 localhost\n' > $R/etc/hosts
+CA=${CACERTS-}
+if [ -z "$CA" ]; then
+    for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem; do
+        if [ -z "$CA" ] && [ -f $f ]; then CA=$f; fi
+    done
+fi
+if [ -n "$CA" ] && [ "$CA" != none ]; then
+    grep -q 'BEGIN CERTIFICATE' "$CA" || { echo "mkhostfs: $CA: no PEM certificates in it" >&2; exit 1; }
+    mkdir -p $R/etc/ssl/certs
+    cp "$CA" $R/etc/ssl/certs/ca-certificates.crt
+    chmod 644 $R/etc/ssl/certs/ca-certificates.crt
+    ln -s certs/ca-certificates.crt $R/etc/ssl/cert.pem
+    echo "hostfs: certificate authorities: $CA ($(grep -c 'BEGIN CERTIFICATE' "$CA") certificates, sha256 $(sha256sum < "$CA" | cut -c1-64))"
+else
+    echo "hostfs: no certificate authorities (CACERTS): HTTPS will not verify anything"
+fi
 chmod 1777 $R/tmp
 chmod 700 $R/root
 

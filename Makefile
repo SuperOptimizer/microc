@@ -64,9 +64,11 @@ hostfs: tools x64 cuda
 	@[ ! -d $(EXT)/zlib-1.4 ] || EXT=$(EXT) ARCH=x86_64 THREADS=$(THREADS) build/stage$(STAGE)/bin/sh mkulibs.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 	@build/stage$(STAGE)/bin/sh mkhostfs.sh build/stage$(STAGE)/mcc build/hostfs
 test-hostfs: hostfs
-	@UFSM=$(UFSM) sh tests/hostfs.sh build/hostfs
+	@UFSM=$(UFSM) GPU=$(GPU) UFSM_GPU_TESTS="$(UFSM_GPU_TESTS)" sh tests/hostfs.sh build/hostfs
 EXT = $(CURDIR)/build/ext
 UFSM =
+GPU =
+UFSM_GPU_TESTS =
 # mcc cross-built for x86-64 Linux, then building itself and running the C tests there
 test-x64-self: x64
 	@sh tests/x64self.sh build/stage$(STAGE)
@@ -100,7 +102,7 @@ test-cuda: cuda
 	@build/stage$(STAGE)/bin/sh tests/cuda.sh build/stage$(STAGE)
 # the same run time and tests for x86-64 Linux, on the x86-64 machine (X64_SSH, X64_DIR)
 test-x64-cuda: x64 cuda
-	@sh tests/x64cuda.sh build/stage$(STAGE)
+	@GPU=$(GPU) sh tests/x64cuda.sh build/stage$(STAGE)
 
 # -flto through the system's linker (glibc mode, x86-64 Linux): tests/ltoglibc.sh
 test-lto: $(MCC) $(LIBC)

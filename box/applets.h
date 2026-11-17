@@ -42,6 +42,7 @@ int uniq_main(int argc, char **argv);
 int od_main(int argc, char **argv);
 int xargs_main(int argc, char **argv);
 int sha1sum_main(int argc, char **argv);
+int sha256sum_main(int argc, char **argv);
 int grep_main(int argc, char **argv);
 int diff_main(int argc, char **argv);
 int bc_main(int argc, char **argv);
@@ -106,6 +107,7 @@ static const struct {
     { "od", od_main },
     { "xargs", xargs_main },
     { "sha1sum", sha1sum_main },
+    { "sha256sum", sha256sum_main },
     { "grep", grep_main },
     { "egrep", grep_main },
     { "fgrep", grep_main },

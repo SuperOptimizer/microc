@@ -97,6 +97,60 @@ Other findings:
 - Left to others: register allocation (live-range splitting, remat, slot sharing: mcc-scalar's rasplit / slotco) and scalar
   loops clang vectorises (mcc-vec). These are the main remaining gap.
 
+## Memory: which object an address is in (2026-11-16, memalias-20261116)
+
+Before: gvn's memory table and licm told two addresses apart only when both were a local or a global named directly, when they
+had the same base value and constant offsets, or by the kind of access (float against int ...). Every call, block copy and
+vector store forgot everything, and a loop head started from nothing.
+
+Now (src/opt.c, `roots_apart`; MCC_NOALIASROOT turns all of it off):
+- The root of an address is what it is made from by adding and subtracting: a local, a global, a pointer parameter
+  (`PARAM_PTR`, set by parse.c), an allocation (`IF_FRESH`: malloc, calloc, realloc, aligned_alloc not defined in the file).
+  Different known roots are different objects; a parameter may still point into a global or where another parameter points,
+  unless it is `restrict` or a record passed by value in memory (`PARAM_RESTRICT`; MCC_NORESTRICT: off).
+- An address of unknown root (read from memory, a phi, a call's result) can be in a local, an allocation or a restrict
+  parameter's object only if that one's address escaped (stored, passed to a call, merged in a phi or select, returned, used in
+  other arithmetic). The scan is per function and does not follow the order of events.
+- gvn: a call keeps what is known of objects it cannot reach; memcpy / memset / a vector store kill their own object only.
+- gvn at a loop head (`mem_enter_loop`; MCC_NOMEMLOOP: off): what the ways in agree on, less what the loop's stores and calls
+  may write, and only values the loop uses anyway or constants (MCC_MEMLOOPALL: all of them).
+- licm: up to 48 stores per loop (16 before), block writes by object. Calls still stop every load (MCC_LICMCALLS: they spare
+  what they cannot reach). MCC_NOLICMROOT: licm as before.
+
+Instructions (G, one run; ufsm perf2 harness, tc built from commit 43b8c9f = "base"):
+
+| test | base | roots (gvn + licm) | + by-value records, licm over calls | + loop head, all values | + loop head, used values (final) |
+|---|---|---|---|---|---|
+| test_spatial_augment | 844.64 | 841.99 | 844.10 | 849.92 | 841.82 |
+| test_repair | 323.04 | 319.40 | 319.40 | 318.81 | 318.81 |
+| test_fit_emb | 89.71 | 88.94 | 88.94 | 88.94 | 88.94 |
+| test_strip | 91.47 | 91.23 | 91.23 | 91.39 | 91.17 |
+| test_wind_sampler | 206.47 | 206.15 | 206.37 | 206.63 | 206.50 |
+| test_volcomp_fast, test_reg | 93.95, 122.13 | same | same | +0.3, same | same |
+
+test_zcache, test_scrollaug and test_crush vary by 3, 0.4 and 0.3 G between runs of one binary (190.85 - 194.16, 103.58 -
+103.99, 97.29 - 97.59 for base), more than the changes move them; test_wind_sampler by 0.15, the other six by 0.02. The seven
+steady ones go from 1771.42 to 1763.34 (-0.46 %); all ten 2163.84 / 2166.44 (base, two runs) to 2155.54 / 2157.12. Gate green
+(tag ma-6), the ten tests pass.
+
+What this showed: **a load removed is not an instruction removed.** A value kept from before a loop, or moved out of one,
+needs a register through the loop. Where there is none it is read from a stack slot instead of from where it was (no gain), and
+where the read was the memory operand of a compare (`cmpl $0, 0x10(%rbx)`) it becomes a load and a test (a loss). Two steps were
+net losses for this reason and are off or narrowed: licm over calls (warp_w4_ref's `sym sy` fields: +2 G) and keeping every
+known value through a loop (+8 G in test_spatial_augment). The allocator could take these back by reading a spilled value from
+the memory it was loaded from when nothing in between can write there (roots_apart answers that), and by using a stack slot as
+the operand of a compare.
+
+Where the remaining non-stack loads and stores are (perf annotate, memory operands that are neither stack nor constants):
+fit_vox2 11 % of its instructions, nearly all fields of `f` read once; fit_grad_terms: `dg[d] +=` and `lp[k] +=` through
+pointers to the caller's locals (clang has them in registers because it inlines fit_grad_terms into the loop); coh_run:
+`acc[ri * 64 + si] +=`, a histogram; filt_axis, emb_at, vll_rebuild: loops clang vectorises 16-64 wide and mcc 8 wide or not
+at all. None of these is an aliasing question.
+
+Not done: pointers against integers of 64 bits by type (both are M_64; fit_vox2 reads f->delta again after each `ic[c] =`),
+a load made available on the one way into a join that lacks it, dead stores, pointers that step through a phi (the root is
+lost there, and the base counts as escaped).
+
 ## Appendix: every CPU-suite line, clang vs mcc main 475ac78 (round 1, G cycles, min of 3)
 
 | test | clang | mcc | mcc / clang | note |

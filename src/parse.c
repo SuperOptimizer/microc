@@ -3335,9 +3335,10 @@ static void call(Expr *e)
     if (!flags && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && type_is_float(ret) && F->ins[callee].op == OP_ADDR &&
         !F->ins[callee].b && O->syms[F->ins[callee].a].name && pure_math(intern_str(O->syms[F->ins[callee].a].name)))
         F->ins[v].flags |= IF_PURE;
-    /* the C library's allocators: the result is the address of new memory (opt.c, roots_apart) */
+    /* the C library's allocators: the result is the address of new memory (opt.c, roots_apart). Not one this file
+       defines itself (so far): an allocator of its own may hand out a global array that is also used by name */
     if (!flags && F->cur && !cur_fn_dev && opt_alias_roots() && ret->kind == TY_PTR && F->ins[callee].op == OP_ADDR &&
-        !F->ins[callee].b && O->syms[F->ins[callee].a].name && F->ins[v].op == OP_CALL) {
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && O->syms[F->ins[callee].a].sec == SEC_UNDEF && F->ins[v].op == OP_CALL) {
         const char *cn = intern_str(O->syms[F->ins[callee].a].name);
         if (strcmp(cn, "malloc") == 0 || strcmp(cn, "calloc") == 0 || strcmp(cn, "realloc") == 0 || strcmp(cn, "aligned_alloc") == 0)
             F->ins[v].flags |= IF_FRESH;

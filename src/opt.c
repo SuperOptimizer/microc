@@ -530,17 +530,34 @@ static MemEntry *out_find(u32 blk, u32 addr, int mem)
    rpo. What the ways in from outside agree on is still so at every trip unless the loop writes there: its stores are
    looked at one by one, its calls spare what they cannot reach (call_spares). So a load inside a loop, or after it,
    of what was read or written before it is that value, even where licm may not move the load (one that not every
-   trip runs). Without this a loop head started from nothing. */
+   trip runs). Without this a loop head started from nothing. (MCC_MEMLOOPALL: also values the loop does not use
+   otherwise, see the end of mem_enter_loop; for measuring.) */
 static int opt_nomemloop = -1;
 static u32 *lp_mark, *lp_stack, lp_cap, lp_stamp;
+
+/* mem_enter_loop: the entries (and their marks in used) that a store at addr (how = 0), a call (1) or a write of some
+   length at addr (2) leaves known. */
+static void mem_kill_used(u32 addr, int mem, int how, u8 *used)
+{
+    u32 j, n = 0;
+    for (j = 0; j < nmem; j++) {
+        const MemEntry *e = &mem_tab[j];
+        if (how == 0 ? may_alias(e->addr, e->mem, addr, mem) : how == 1 ? !call_spares(e->addr) : !roots_apart(e->addr, addr))
+            continue;
+        used[n] = used[j];
+        mem_tab[n++] = *e;
+    }
+    nmem = n;
+}
 
 static void mem_enter_loop(u32 b, u32 k)
 {
     Block *bb = &f->blk[b];
     u32 p, j, q = 0, sp = 0, nin = 0, v;
+    u8 used[MEM_CAP];
     if (opt_nomemloop < 0)
-        opt_nomemloop = getenv("MCC_NOMEMLOOP") != 0;
-    if (opt_nomemloop || !al_on)
+        opt_nomemloop = getenv("MCC_NOMEMLOOP") != 0 ? 1 : getenv("MCC_MEMLOOPALL") != 0 ? 2 : 0;
+    if (opt_nomemloop == 1 || !al_on)
         return;
     for (p = 0; p < bb->npreds; p++) {
         u32 r = rpo_num[bb->preds[p]];
@@ -603,36 +620,63 @@ static void mem_enter_loop(u32 b, u32 k)
             }
         }
     }
+    for (j = 0; j < nmem; j++)
+        used[j] = opt_nomemloop == 2 || (!mem_tab[j].join && !f->ins[mem_tab[j].val].blk);
     for (j = k; j < nrpo && nmem; j++) {
-        u32 x = rpo[j];
+        u32 x = rpo[j], *ops, n, o;
         if (lp_mark[x] != lp_stamp)
             continue;
+        for (p = 0; p < 2; p++)
+            for (v = p ? f->blk[x].first : f->blk[x].phis; v && nmem; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                IR_OPS(f, i, ops, n);
+                for (o = 0; o < n; o++) {
+                    u32 a = ir_resolve(f, ops[o]), e;
+                    for (e = 0; e < nmem; e++)
+                        if (mem_tab[e].val == a)
+                            used[e] = 1;
+                }
+            }
+        if (f->blk[x].arg) {
+            u32 a = ir_resolve(f, f->blk[x].arg), e;
+            for (e = 0; e < nmem; e++)
+                if (mem_tab[e].val == a)
+                    used[e] = 1;
+        }
         for (v = f->blk[x].first; v && nmem; v = f->ins[v].next) {
             Ins *i = &f->ins[v];
             switch (i->op) {
             case OP_STORE:
-                mem_kill(ir_resolve(f, i->a), i->mem); /* (gvn has not been here yet: the operand may be a copy) */
+                mem_kill_used(ir_resolve(f, i->a), i->mem, 0, used); /* (gvn has not been here yet: the operand may be a copy) */
                 break;
             case OP_CALL:
                 if (!(i->flags & IF_PURE))
-                    mem_kill_call();
+                    mem_kill_used(0, 0, 1, used);
                 break;
             case OP_XI:
                 if (i->flags & XI_EFFECT)
-                    mem_kill_call();
+                    mem_kill_used(0, 0, 1, used);
                 break;
             case OP_VSTORE:
                 if (i->c && root_known(root_of(i->c, 0)))
                     nmem = 0;
                 else
-                    mem_kill_object(ir_resolve(f, i->a));
+                    mem_kill_used(ir_resolve(f, i->a), 0, 2, used);
                 break;
             case OP_MEMCPY: case OP_MEMZERO:
-                mem_kill_object(ir_resolve(f, i->a));
+                mem_kill_used(ir_resolve(f, i->a), 0, 2, used);
                 break;
             }
         }
     }
+    /* A value that the loop does not use otherwise would have to be kept through all of it, in a register that the
+       loop may not have to spare: read from a stack slot it is no cheaper than read from where it is, and dearer
+       where the read was part of another instruction (ufsm test_spatial_augment: +8 G instructions when every known
+       value was kept). So only what the loop uses anyway stays known (and constants, which need no register). */
+    for (j = 0, sp = 0; j < nmem; j++)
+        if (used[j])
+            mem_tab[sp++] = mem_tab[j];
+    nmem = sp;
 }
 
 /* The state of memory on entry to block b, the k-th in rpo. */
@@ -2668,9 +2712,11 @@ static int licm(void)
     if (opt_nopurelicm < 0)
         opt_nopurelicm = getenv("MCC_NOPURELICM") != 0;
     if (opt_licmcalls < 0)
-        opt_licmcalls = getenv("MCC_LICMCALLS") != 0;
+        opt_licmcalls = getenv("MCC_NOLICMROOT") ? 2 : getenv("MCC_LICMCALLS") != 0; /* (MCC_NOLICMROOT: licm without roots) */
     compute_dom();
     alias_prepare();
+    if (opt_licmcalls == 2)
+        al_on = 0;
     mark = (u32 *)xmalloc(cap_blocks * 2 * sizeof(u32));
     stack = mark + cap_blocks;
     memset(mark, 0, cap_blocks * sizeof(u32));

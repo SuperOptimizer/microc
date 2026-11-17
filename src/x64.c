@@ -2572,6 +2572,8 @@ static void sel_phi_moves(u32 b, u32 s)
     buf_free(&tmp);
 }
 
+static int br2_lazy(u32 v);
+
 static void sel_term(u32 b, u32 next)
 {
     Block *bb = &f->blk[b];
@@ -2595,6 +2597,16 @@ static void sel_term(u32 b, u32 next)
             for (n2 = 0; n2 < BR2_MAX; n2++)
                 lv[n2] = 0;
             nl = br2_leaves(bb->arg, f->ins[bb->arg].op, lv, 0, 1, b);
+            /* what a later leaf would make on its way only (a constant, an address): made here, for every way */
+            for (n2 = 1; n2 < nl; n2++) {
+                Ins *li = &f->ins[lv[n2]];
+                if (is_compare(li->op) && br2_lazy(lv[n2])) {
+                    if (is_floating(li->a))
+                        reg_of(li->a);
+                    if (is_floating(li->b))
+                        reg_of(li->b);
+                }
+            }
             for (n2 = 0; n2 + 1 < nl; n2++) {
                 cc = emit_cond(lv[n2]);
                 m = emit(X_JCC, 0, NOREG, NOREG, NOREG);
@@ -3037,12 +3049,15 @@ static int is_scale(u32 v)
 
 /* The comparisons at the leaves of v, a tree of op (OP_AND / OP_OR) each node and leaf used once, in the order they are
    evaluated, into lv; how many (0xffffffff if v is not such a tree). check: only count; else the inner nodes become FUSE_BR2. */
+static int br2_nofirst = -1;
 static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk)
 {
     Ins *i = &f->ins[v];
     u32 k, o[2];
     if (n == 0xffffffffU)
         return n;
+    if (br2_nofirst < 0)
+        br2_nofirst = getenv("MCC_NOBR2FIRST") != 0;
     if (i->op == op && i->ty == IT_I32 && uses[v] == 1 && i->blk == blk && (!fused[v] || fused[v] == FUSE_BR2)) {
         if (!check)
             fused[v] = FUSE_BR2;
@@ -3066,7 +3081,10 @@ static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk)
     /* a leaf used elsewhere only as a condition (a later if on the same test): those set the flags again */
     /* (a constant left operand would be put in its register only on the way to this leaf: its later users would find
        it unset) */
-    if (!is_compare(i->op) || br2_lazy(v) || vuses[v] != 1 || (fused[v] && fused[v] != FUSE_CMP) || n >= BR2_MAX || i->blk != blk)
+    /* (sel_term puts such operands in their registers before the first branch, so every way through the block has
+       them: "w <= 1e-7f || ph >= 63", eight times a voxel in ufsm's warp_phase_ref, was two setcc, two movzx and
+       an or before its branch. MCC_NOBR2FIRST: such a comparison is no leaf) */
+    if (!is_compare(i->op) || (br2_lazy(v) && br2_nofirst) || vuses[v] != 1 || (fused[v] && fused[v] != FUSE_CMP) || n >= BR2_MAX || i->blk != blk)
         return 0xffffffffU;
     lv[n] = v;
     return n + 1;
@@ -3346,8 +3364,18 @@ static void prepare(void)
         {
             /* the comparisons are made at the end of the block: nothing after the first of them may write memory
                (a load folded into one would move past it) */
-            u32 u, first = 0, bad = 0;
-            for (u = bb->first; u; u = f->ins[u].next) {
+            u32 u, first = 0, bad = 0, folds = 0;
+            /* (only a load that goes into its comparison moves: one read by something else too is made where it
+               stands, into a register) */
+            for (n = 0; n < nl; n++)
+                if (is_compare(f->ins[lv[n]].op)) {
+                    u32 oa = f->ins[lv[n]].a, ob = f->ins[lv[n]].b;
+                    if ((f->ins[oa].op == OP_LOAD && uses[oa] == 1) || (f->ins[ob].op == OP_LOAD && uses[ob] == 1))
+                        folds = 1;
+                } else {
+                    folds = 1;
+                }
+            for (u = bb->first; u && folds; u = f->ins[u].next) {
                 int op = f->ins[u].op;
                 for (n = 0; n < nl && !first; n++)
                     if (lv[n] == u)
@@ -6637,6 +6665,266 @@ static int split_reloads(void)
     free(lin);
     return nsp != 0;
 }
+
+/* ---- reloads split off over several blocks ----
+   split_reloads looks at one block. A spilled register read once in each of several blocks that follow one another
+   with no call between (the eight corners of a voxel in ufsm's warp_w4_ref, each a block of its own once its test
+   is a branch: the pointers cp and w4, kept in memory across the atan2f further down, were loaded again at every
+   corner) is as many loads. A region is a block without a call and the blocks, also without one, that can only be
+   come to through it (every way into them is from the region); a spilled register that the region reads at least
+   twice where no memory operand will do, and does not write, gets a register of its own for the region, loaded
+   in the last block that every read comes through: where that block first reads it, or, if it does not (a load
+   then that a way through the region with no read pays for nothing: ufsm's vllx_decode_sub_sink lost 9 G to
+   them), before its branches when the region reads it six times at least (MCC_XSPLITMIN; MCC_XSPLITHEAD: never).
+   If the new register is spilled too it is the old slot under another name (the copy is marked as the loops'
+   are). MCC_NOXSPLIT: off. */
+static int split_regions(void)
+{
+    u32 nb = mf.nblk, nv0 = mf.nvreg, b, i, k, nc = 0, words, nsp = 0, nn, at, q;
+    u32 *cidx, *reg, *npred, *pin, *cnt, *nonf, *wr, *firstd, *touched, ntouched, *list, nlist, cap = 64, ncp = 0;
+    u32 *ihead, *cnext, *nloc, *newr, *pos;
+    u8 *call;
+    SplitCp *cp;
+    u64 *lin;
+    MIns *ni;
+    int anyhead;
+    u32 minreads;
+    u64 *dom, *rd;
+    if (!mf.nspill || getenv("MCC_NOXSPLIT"))
+        return 0;
+    anyhead = !getenv("MCC_XSPLITHEAD");
+    minreads = getenv("MCC_XSPLITMIN") ? (u32)atoi(getenv("MCC_XSPLITMIN")) : 6;
+    cidx = (u32 *)xmalloc((nv0 + 1) * sizeof(u32));
+    lin = spill_live(nv0, cidx, &nc, &words);
+    if (!nc || nb < 3) {
+        free(cidx);
+        free(lin);
+        return 0;
+    }
+    reg = (u32 *)xmalloc((size_t)nb * 5 * sizeof(u32));
+    npred = reg + nb;
+    pin = npred + nb;
+    list = pin + nb;
+    pos = list + nb;
+    dom = (u64 *)xmalloc((size_t)(64 + nc) * sizeof(u64));
+    rd = dom + 64;
+    call = (u8 *)xmalloc(nb);
+    cnt = (u32 *)xmalloc((size_t)nc * 6 * sizeof(u32));
+    nonf = cnt + nc;
+    wr = nonf + nc;
+    firstd = wr + nc;
+    touched = firstd + nc;
+    newr = touched + nc;
+    cp = (SplitCp *)xmalloc(cap * sizeof(SplitCp));
+    for (k = 0; k < nc; k++)
+        cnt[k] = nonf[k] = wr[k] = 0;
+    for (b = 0; b < nb; b++) {
+        MBlock *mb = &mf.blk[b];
+        reg[b] = NOREG;
+        npred[b] = 0;
+        call[b] = 0;
+        for (i = mb->first; i < mb->first + mb->n; i++)
+            if ((mf.ins[i].flags & MF_CALL) || mf.ins[i].op == X_ASM)
+                call[b] = 1;
+    }
+    for (b = 0; b < nb; b++)
+        for (q = 0; q < mf.blk[b].nsucc; q++)
+            npred[mf.blk[b].succ[q]]++;
+    for (b = 0; b < nb; b++) {
+        int grew = 1;
+        if (reg[b] != NOREG || call[b])
+            continue;
+        /* the region of b: b, then every block all of whose predecessors are in it already */
+        reg[b] = b;
+        nlist = 0;
+        list[nlist++] = b;
+        while (grew) {
+            grew = 0;
+            for (k = 0; k < nb; k++)
+                pin[k] = 0;
+            for (k = 0; k < nlist; k++)
+                for (q = 0; q < mf.blk[list[k]].nsucc; q++)
+                    pin[mf.blk[list[k]].succ[q]]++;
+            for (k = 0; k < nlist; k++)
+                for (q = 0; q < mf.blk[list[k]].nsucc; q++) {
+                    u32 x = mf.blk[list[k]].succ[q];
+                    if (x != b && x != 0 && reg[x] == NOREG && !call[x] && pin[x] == npred[x] && nlist < 64) {
+                        reg[x] = b;
+                        list[nlist++] = x;
+                        grew = 1;
+                    }
+                }
+        }
+        if (nlist < 2)
+            continue;
+        /* which of the region's blocks (by their place in the list, where a block comes after all that lead to it)
+           every way to a block passes */
+        for (k = 0; k < nlist; k++) {
+            pos[list[k]] = k;
+            dom[k] = ~(u64)0;
+        }
+        dom[0] = 1;
+        for (k = 0; k < nlist; k++) {
+            if (k)
+                dom[k] |= (u64)1 << k;
+            for (q = 0; q < mf.blk[list[k]].nsucc; q++) {
+                u32 x = mf.blk[list[k]].succ[q];
+                if (x != b && reg[x] == b)
+                    dom[pos[x]] &= dom[k];
+            }
+        }
+        ntouched = 0;
+        for (k = 0; k < nlist; k++) {
+            MBlock *mb = &mf.blk[list[k]];
+            for (i = mb->first; i < mb->first + mb->n; i++) {
+                MIns *in = &mf.ins[i];
+                u32 r[3], c;
+                r[0] = in->s0;
+                r[1] = in->s1;
+                r[2] = in->s2;
+                for (q = 0; q < 3; q++) {
+                    if (r[q] == NOREG || r[q] < VREG0 || r[q] - VREG0 >= nv0 || (c = cidx[r[q] - VREG0]) == NOREG)
+                        continue;
+                    if (q && (r[q] == r[0] || (q == 2 && r[q] == r[1])))
+                        continue;
+                    if (!cnt[c] && !wr[c]) {
+                        touched[ntouched++] = r[q] - VREG0;
+                        rd[c] = ~(u64)0;
+                    }
+                    rd[c] &= dom[k];
+                    cnt[c]++;
+                    if (!((q == 1 && (in->op == X_ADD || in->op == X_SUB || in->op == X_IMUL || in->op == X_AND ||
+                                      in->op == X_OR || in->op == X_XOR || in->op == X_CMP || in->op == X_FADD ||
+                                      in->op == X_FSUB || in->op == X_FMUL || in->op == X_FDIV || in->op == X_FMAX ||
+                                      in->op == X_FMIN || in->op == X_FCMP)) ||
+                          (q == 0 && in->op == X_MOV)))
+                        nonf[c]++;
+                }
+                if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0 && (c = cidx[in->d - VREG0]) != NOREG) {
+                    if (!cnt[c] && !wr[c]) {
+                        touched[ntouched++] = in->d - VREG0;
+                        rd[c] = ~(u64)0;
+                    }
+                    wr[c] = 1;
+                }
+            }
+        }
+        for (k = 0; k < ntouched; k++) {
+            u32 v = touched[k], c = cidx[v];
+            u32 lb = 0, fr = NOREG;
+            newr[c] = NOREG;
+            if (wr[c] || nonf[c] < 2 || cnt[c] < 2)
+                continue;
+            /* the last block all the reads come through, and its first read */
+            for (q = 0; q < nlist; q++)
+                if (rd[c] >> q & 1)
+                    lb = q;
+            lb = list[lb];
+            /* (a block may end in several branches, one for each compare of a condition: what comes after the
+               first of them is not on every way out) */
+            for (i = mf.blk[lb].first; i < mf.blk[lb].first + mf.blk[lb].n && fr == NOREG; i++) {
+                if (mf.ins[i].s0 == VREG0 + v || mf.ins[i].s1 == VREG0 + v || mf.ins[i].s2 == VREG0 + v)
+                    fr = i;
+                else if (mf.ins[i].op == X_JCC || mf.ins[i].op == X_JMP)
+                    break;
+            }
+            if (fr == NOREG && i < mf.blk[lb].first + mf.blk[lb].n)
+                fr = i | 0x80000000u;
+            firstd[c] = fr == NOREG ? mf.blk[lb].first : fr & 0x7fffffffu;
+            if ((fr != NOREG && !(fr & 0x80000000u)) || (anyhead && mf.blk[lb].n && nonf[c] >= minreads)) {
+                newr[c] = new_vreg(mf.vclass[v]);
+                if (ncp == cap) {
+                    cap *= 2;
+                    cp = (SplitCp *)xrealloc(cp, cap * sizeof(SplitCp));
+                }
+                cp[ncp].kind = SC_SAME;
+                cp[ncp].at = firstd[c];
+                cp[ncp].d = newr[c];
+                cp[ncp++].s = VREG0 + v;
+                nsp++;
+            }
+        }
+        for (k = 0; k < nlist; k++) {
+            MBlock *mb = &mf.blk[list[k]];
+            for (i = mb->first; i < mb->first + mb->n; i++) {
+                MIns *in = &mf.ins[i];
+                u32 c;
+                if (in->s0 != NOREG && in->s0 >= VREG0 && in->s0 - VREG0 < nv0 && (c = cidx[in->s0 - VREG0]) != NOREG && newr[c] != NOREG)
+                    in->s0 = newr[c];
+                if (in->s1 != NOREG && in->s1 >= VREG0 && in->s1 - VREG0 < nv0 && (c = cidx[in->s1 - VREG0]) != NOREG && newr[c] != NOREG)
+                    in->s1 = newr[c];
+                if (in->s2 != NOREG && in->s2 >= VREG0 && in->s2 - VREG0 < nv0 && (c = cidx[in->s2 - VREG0]) != NOREG && newr[c] != NOREG)
+                    in->s2 = newr[c];
+            }
+        }
+        for (k = 0; k < ntouched; k++) {
+            u32 c = cidx[touched[k]];
+            cnt[c] = nonf[c] = wr[c] = 0;
+            newr[c] = NOREG;
+        }
+    }
+    if (ncp) {
+        /* the copies go in before their instructions (an empty first block has none: its copy would have no place) */
+        nn = mf.n + ncp;
+        ni = (MIns *)xmalloc((nn + 1) * sizeof(MIns));
+        nloc = opt_debug ? (u32 *)xmalloc((nn + 1) * sizeof(u32)) : 0;
+        ihead = (u32 *)xmalloc((mf.n + 1 + ncp) * sizeof(u32));
+        cnext = ihead + mf.n + 1;
+        for (i = 0; i <= mf.n; i++)
+            ihead[i] = NOREG;
+        for (k = 0; k < ncp; k++) {
+            cnext[k] = ihead[cp[k].at];
+            ihead[cp[k].at] = k;
+        }
+        at = 0;
+        for (b = 0; b < nb; b++) {
+            MBlock *mb = &mf.blk[b];
+            u32 end = mb->first + mb->n, nf = at;
+            for (i = mb->first; i < end; i++) {
+                for (k = ihead[i]; k != NOREG; k = cnext[k]) {
+                    MIns *m2 = &ni[at];
+                    memset(m2, 0, sizeof *m2);
+                    m2->op = X_MOV;
+                    m2->w = 1;
+                    m2->flags = MF_SPLIT;
+                    m2->d = cp[k].d;
+                    m2->s0 = cp[k].s;
+                    m2->s1 = m2->s2 = NOREG;
+                    m2->imm = 1;
+                    if (nloc)
+                        nloc[at] = mloc[i];
+                    at++;
+                }
+                ni[at] = mf.ins[i];
+                if (nloc)
+                    nloc[at] = mloc[i];
+                at++;
+            }
+            mb->first = nf;
+            mb->n = at - nf;
+        }
+        free(mf.ins);
+        mf.ins = ni;
+        mf.n = at;
+        mf.cap = nn + 1;
+        if (opt_debug) {
+            free(mloc);
+            mloc = nloc;
+            capmloc = nn + 1;
+        }
+        free(ihead);
+    }
+    if (getenv("MCC_SPLITLOG") && nsp)
+        fprintf(stderr, "region split %s: %lu\n", intern_str(obj->syms[f->sym].name), (unsigned long)nsp);
+    free(cp);
+    free(cnt);
+    free(call);
+    free(reg);
+    free(dom);
+    free(cidx);
+    free(lin);
+    return nsp != 0;
+}
 #undef SPLIT_LIVE
 
 /* ---- live-range splitting at loops (after a first allocation) ----
@@ -7251,6 +7539,10 @@ void x64_gen(Func *fn, Obj *o)
         if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
             int rounds = getenv("MCC_SPLITROUNDS") ? atoi(getenv("MCC_SPLITROUNDS")) : 1, r, ch = 0;
             for (r = 0; r < rounds && split_loops(); r++) {
+                ra_rerun(&mf, &t);
+                ch = 1;
+            }
+            if (split_regions()) {
                 ra_rerun(&mf, &t);
                 ch = 1;
             }

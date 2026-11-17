@@ -331,6 +331,8 @@ void func_realise(Func *f, u32 sym)
 
 /* The calls to each function put aside (as parsed) and whether its address is used otherwise: esc[sym] |= 1. Code in
    blocks no path reaches (the trial reads of the unroller) does not count. */
+/* (bit 2 of esc[sym]: the address is used otherwise than to read or write the object at a fixed place in it: handed
+   on, stored, compared, added to. Bit 4 of esc[0]: one of the functions has assembly in it, which may name anything.) */
 void func_refs(u32 *calls, u8 *esc, u32 nsym)
 {
     u32 s, v, b, k, n, *ops, *stk = 0, cap = 0;
@@ -366,23 +368,25 @@ void func_refs(u32 *calls, u8 *esc, u32 nsym)
                 continue;
             if (i->op == OP_CALL && !(i->flags & (IF_ASM | IF_ATOMIC)) && yb->ins[i->c].op == OP_ADDR && yb->ins[i->c].a < nsym) {
                 if (yb->ins[i->c].b || yb->ins[i->c].a == s)
-                    esc[yb->ins[i->c].a] = 1; /* (an offset, or a call of itself) */
+                    esc[yb->ins[i->c].a] |= 3; /* (an offset, or a call of itself) */
                 calls[yb->ins[i->c].a]++;
             }
+            if (i->op == OP_CALL && (i->flags & IF_ASM))
+                esc[0] |= 4;
             IR_OPS(yb, i, ops, n);
             for (k = 0; k < n; k++)
                 if (ops[k] < yb->nins && yb->ins[ops[k]].op == OP_ADDR && yb->ins[ops[k]].a < nsym)
-                    esc[yb->ins[ops[k]].a] = 1;
+                    esc[yb->ins[ops[k]].a] |= (u8)((i->op == OP_LOAD || i->op == OP_STORE) && k == 0 && &ops[k] == &i->a ? 1 : 3);
         }
         for (b = 1; b < yb->nblk; b++) {
             Block *bb = &yb->blk[b];
             if (seen[b] && bb->arg && bb->arg < yb->nins && yb->ins[bb->arg].op == OP_ADDR && yb->ins[bb->arg].a < nsym)
-                esc[yb->ins[bb->arg].a] = 1;
+                esc[yb->ins[bb->arg].a] |= 3;
             for (v = bb->phis; v && seen[b]; v = yb->ins[v].next) {
                 IR_OPS(yb, &yb->ins[v], ops, n);
                 for (k = 0; k < n; k++)
                     if (ops[k] < yb->nins && yb->ins[ops[k]].op == OP_ADDR && yb->ins[ops[k]].a < nsym)
-                        esc[yb->ins[ops[k]].a] = 1;
+                        esc[yb->ins[ops[k]].a] |= 3;
             }
         }
     }

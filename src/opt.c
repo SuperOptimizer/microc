@@ -388,6 +388,14 @@ static int root_private(u32 r)
     return 0;
 }
 
+/* 1: root r is a static object whose address is in no pointer (parse.c works that out for the whole unit before its
+   functions are generated). Unlike root_private, a call may well write it: only pointers do not reach it. */
+static int root_static(u32 r)
+{
+    const Ins *i = &f->ins[r];
+    return i->op == OP_ADDR && opt_sym_private && i->a < opt_sym_private_n && opt_sym_private[i->a];
+}
+
 /* 1: addresses a and b are known to be in different objects. */
 static int roots_apart(u32 a, u32 b)
 {
@@ -409,13 +417,13 @@ static int roots_apart(u32 a, u32 b)
     if (!ka && !kb)
         return 0;
     if (!ka || !kb)
-        return root_private(ka ? ra : rb);
+        return root_private(ka ? ra : rb) || root_static(ka ? ra : rb);
     ia = &f->ins[ra];
     ib = &f->ins[rb];
     if (ia->op == ib->op && (ia->op == OP_SLOT || ia->op == OP_ADDR))
         return ia->a != ib->a; /* (the same local or global at another offset is another value) */
     if ((ia->op == OP_PARAM && (ib->op == OP_PARAM || ib->op == OP_ADDR)) || (ib->op == OP_PARAM && ia->op == OP_ADDR))
-        return root_private(ra) || root_private(rb); /* (root_private of a global is 0) */
+        return root_private(ra) || root_private(rb) || root_static(ra) || root_static(rb); /* (root_private of a global is 0) */
     return 1; /* a local, a global, what a parameter points to, an allocation: no two of different kinds share
                  memory, nor do two allocations */
 }
@@ -3195,6 +3203,8 @@ static void slot_check(Func *fn, const char *when)
 static void run_passes(Func *fn);
 int opt_noparamfwd; /* MCC_NOPARAMFWD: debugging */
 int opt_wrapv;
+u8 *opt_sym_private;
+u32 opt_sym_private_n;
 
 /* (what the passes make has no source location of its own: the line table carries on with the one before) */
 void opt_run(Func *fn)
@@ -3213,6 +3223,86 @@ static int unselect_calls(void);
 static void addr_shape(Func *fn);
 static void iv_widen(Func *fn);
 
+/* x86-64 host, before selection: a branch on whether a flag is still set that several tests may have cleared,
+       int inside = 1; for (d = 0; d < 3; d++) if (v[d] < 0 || v[d] > P - 1) inside = 0; ... if (!inside) continue;
+   is, after if-conversion, a chain select(c3, 0, select(c2, 0, c1 == 0)) compared with 0: every test made into 0 / 1,
+   or-ed, selected and tested (ufsm's warp_phase_ref / warp_w4_ref: 27 instructions a voxel, where a branch per
+   test is 12). The chain is 0 exactly when one of the tests holds, so the branch is given their or, which the
+   selector turns into a branch per test (x64.c, FUSE_BR2). Only chains used by that branch alone, in its block.
+   MCC_NOBRBOOL: off. */
+static void br_bools(Func *fn)
+{
+    static int off = -1;
+    u32 b, nuses, *uses;
+    if (off < 0)
+        off = getenv("MCC_NOBRBOOL") != 0;
+    if (off)
+        return;
+    f = fn;
+    uses = count_uses(&nuses);
+    for (b = 1; b < f->nblk; b++) {
+        Block *bb = &f->blk[b];
+        u32 x, s, c[8], n = 0, k, t, acc, sw = 0;
+        u64 z;
+        Ins *i;
+        if (bb->term != TERM_BR || !bb->arg)
+            continue;
+        x = ir_resolve(f, bb->arg);
+        i = &f->ins[x];
+        /* the branch is on "the chain is 0" (x = (s == 0)), or on the chain itself (then the two ways change places) */
+        if (i->op == OP_EQ && i->ty == IT_I32 && x < nuses && uses[x] == 1 && i->blk == b && ir_is_const(f, ir_resolve(f, i->b), &z) && z == 0) {
+            s = ir_resolve(f, i->a);
+        } else {
+            s = x;
+            sw = 1;
+        }
+        t = s;
+        while (n < 7) {
+            Ins *si = &f->ins[t];
+            if (si->op != OP_SELECT || si->ty != IT_I32 || t >= nuses || uses[t] != 1 || si->blk != b ||
+                !ir_is_const(f, ir_resolve(f, si->b), &z) || z != 0)
+                break;
+            c[n++] = ir_resolve(f, si->a);
+            t = ir_resolve(f, si->c);
+        }
+        if (!n)
+            continue;
+        /* the innermost: c1 == 0 (its test is c1), or any truth value (its test: that it is 0) */
+        i = &f->ins[t];
+        if (i->op == OP_EQ && i->ty == IT_I32 && t < nuses && uses[t] == 1 && i->blk == b && ir_is_const(f, ir_resolve(f, i->b), &z) && z == 0 &&
+            f->ins[ir_resolve(f, i->a)].ty == IT_I32) {
+            c[n++] = ir_resolve(f, i->a);
+        } else if (ir_is_bool(f, t, 3) && f->ins[t].ty == IT_I32) {
+            u32 e = ir_raw(f, OP_EQ, IT_I32, t, ir_const(f, IT_I32, 0));
+            ir_append(f, b, e);
+            c[n++] = e;
+        } else {
+            continue;
+        }
+        for (k = 0; k < n; k++)
+            if (f->ins[c[k]].ty != IT_I32)
+                break;
+        if (k < n)
+            continue;
+        /* in the order the program made the tests: the innermost first */
+        acc = c[n - 1];
+        for (k = n - 1; k-- > 0;) {
+            u32 o = ir_raw(f, OP_OR, IT_I32, acc, c[k]);
+            ir_append(f, b, o);
+            acc = o;
+        }
+        bb->arg = acc;
+        if (sw) {
+            /* (the chain itself was the condition: it holds when no test does) */
+            u32 t0 = bb->succ[0];
+            bb->succ[0] = bb->succ[1];
+            bb->succ[1] = t0;
+        }
+    }
+    free(uses);
+    opt_dce(f);
+}
+
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
@@ -3221,6 +3311,7 @@ void opt_finish(Func *fn)
     if (opt_arch == ARCH_X64 && !opt_dev_fn && !opt_cuda && opt_level >= 2) {
         iv_widen(fn);
         addr_shape(fn);
+        br_bools(fn);
     }
     ir_loc = saved;
 }

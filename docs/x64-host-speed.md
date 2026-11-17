@@ -174,6 +174,8 @@ test_zcache (+-2 G).
 | + pure calls computed only on the side of a choice that reads them | 1886 | 1.22 |
 | + unread pure calls removed; ldexp / scalbn in line | 1870 | 1.21 |
 | + counters of loops entered from several places, and counters the program adds to as ints, widened | 1869 | 1.21 |
+| + a condition of several compares as a branch for each, also one kept as a flag through a chain of ifs | 1840 | 1.19 |
+| + statics no pointer reaches not read again after a store; a spilled value in a register over blocks without a call | 1836 | 1.19 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -226,6 +228,20 @@ What went in (each with its switch):
   entered from before it and from after it: the taps of a short filter all run there), and a counter whose step is
   an `int` addition the program wrote, which does not wrap (`IF_NSW`, lost when the instruction is moved;
   `MCC_NONSWIV`: not looked at; off under `-fwrapv`). test_reg 114.2 -> 112.8.
+- A branch for each compare (x64.c `FUSE_BR2`): a compare whose operand is still to be worked out is a leaf too
+  (`MCC_NOBR2FIRST`: only as the first), its constants are put in registers before the first branch, and a store
+  between the compares stops the fusion only where a load would be folded past it. `br_bools` (opt.c, last in
+  `opt_finish`, `MCC_NOBRBOOL`): a branch on a flag that a chain of selects made (`inside = 1; if (a || b) inside
+  = 0; ...` unrolled) becomes a branch on the or of the conditions, which is then a branch each. ufsm's warp
+  references: 788 / 802 -> 694 / 767 M per two windows (clang 652 / 726); test_spatial_augment 745 -> 725 G.
+- Statics no pointer reaches (parse.c at the end of the unit, opt.c `root_static`, `MCC_NOSTATICPRIV`,
+  `MCC_STATICPRIVLOG`): a static object whose address the unit uses only to read or write it at a fixed place (no
+  function hands it on, no data holds it, kept-back data included, and the unit has no assembly) is not what a
+  pointer points to, so a store through a pointer does not make it be read again. A call still may write it.
+- Reloads over several blocks (x64.c `split_regions`, `MCC_NOXSPLIT`, `MCC_XSPLITMIN`, `MCC_XSPLITHEAD`): a spilled
+  register read in several blocks that follow one another without a call gets a register for them, loaded in the
+  last block all the reads come through (before its branches; where that block does not read it, only for six
+  reads or more: a load on a way that reads nothing cost test_zcache 9 G). warp_w4_ref 767 -> 757 M.
 - `ldexp` / `scalbn` in line (`MCC_NOLDEXP`, under `-fno-math-errno`): a constant exponent is a multiplication by
   2^k (parse.c); otherwise, with AVX-512, the exponent is converted and `vscalefss` / `vscalefsd` does it (x64.c
   `sel_math`), as clang does.

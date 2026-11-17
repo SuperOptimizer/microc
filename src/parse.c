@@ -203,6 +203,7 @@ static const char *cur_fn_name = "";
 static void nlazy_reset(void);
 static u32 shared_seq;
 static int cur_fn_dev;  /* CUDA: the function being read is device code */
+static int unit_asm;    /* the unit has assembly outside its functions (which may name any of its objects) */
 /* The sums and differences of ints worked out lately, and the blocks they were worked out in: such a one
    did not wrap around where it stands (or nothing is promised), which lets an index be made wider part by
    part. Only what the folder left as it was written is noted: of a sum it put in another order nothing is
@@ -10009,6 +10010,7 @@ static void asm_statement(int top)
         } else {
             gas_text((char *)b.p, strlen((char *)b.p), SEC_TEXT, file, line, 1);
         }
+        unit_asm = 1;
         buf_free(&b);
         return;
     }
@@ -11702,9 +11704,31 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
         for (sec = 0; sec < O->nsec; sec++)
             for (r = 0; r < O->nrel[sec]; r++)
                 if (O->rel[sec][r].sym < n)
-                    esc[O->rel[sec][r].sym] = 1;
+                    esc[O->rel[sec][r].sym] |= 3;
+        /* x86-64 host: a static object whose address the unit never uses but to read or write it at a fixed place
+           (every function is still as it was read, and the data are written) is in no pointer anywhere: a store
+           through a pointer does not change it (opt.c, roots_apart). MCC_NOSTATICPRIV: off. */
+        if (!(esc[0] & 4) && !unit_asm && !opt_cuda && !getenv("MCC_NOSTATICPRIV")) {
+            u32 np = 0, hk;
+            /* (the addresses in data kept back until something refers to it are not relocations yet) */
+            for (hk = 0; hk < nheld; hk++)
+                for (r = 0; r < held[hk].nrel; r++)
+                    if (held[hk].sym < nheld_of && held_of[held[hk].sym] && held[hk].rel[r].sym < n)
+                        esc[held[hk].rel[r].sym] |= 2;
+            opt_sym_private = (u8 *)xmalloc(n + 1);
+            for (k = 0; k < n; k++) {
+                opt_sym_private[k] = (u8)(!(esc[k] & 2) && !O->syms[k].global && O->syms[k].kind == 2 && O->syms[k].sec != SEC_UNDEF &&
+                                          O->syms[k].sec != SEC_COMMON);
+                np += opt_sym_private[k];
+                if (opt_sym_private[k] && getenv("MCC_STATICPRIVLOG"))
+                    fprintf(stderr, "  %s\n", intern_str(O->syms[k].name));
+            }
+            opt_sym_private_n = n;
+            if (getenv("MCC_STATICPRIVLOG"))
+                fprintf(stderr, "static objects no pointer reaches: %lu of %lu symbols\n", (unsigned long)np, (unsigned long)n);
+        }
         for (k = 0; k < n && k < nlazy; k++)
-            if (calls[k] == 1 && !esc[k] && lazy[k].has && !lazy[k].done && !lazy[k].dev && !O->syms[k].global)
+            if (calls[k] == 1 && !(esc[k] & 1) && lazy[k].has && !lazy[k].done && !lazy[k].dev && !O->syms[k].global)
                 func_once(k);
         free(calls);
         free(esc);
@@ -11712,6 +11736,9 @@ void cc_compile(const char *path, Obj *o, int dump_ir)
             if (!lazy[defer_gen[k]].done)
                 lazy_generate(defer_gen[k]);
         ndefer_gen = 0;
+        free(opt_sym_private);
+        opt_sym_private = 0;
+        opt_sym_private_n = 0;
     }
     if (opt_target == TARGET_LINUX) {
         u32 k;

@@ -726,7 +726,7 @@ brings the driver's libraries and device nodes, as it does for any image.
 - **`dlopen` in the C library** (x86-64 Linux, `libc/linux/src/dl.c`): maps a shared object into the static
   program, relocates it, runs its initialisers, and answers `dlsym`. What the object imports from `libc.so.6`,
   `libm`, `libdl`, `libpthread`, `librt` is our library itself, by name from a table (`glibctab.c`, about 270
-  names: what `libcuda.so.1` and `libnvidia-ptxjitcompiler.so.1` of driver 615 import or ask for), with the GNU
+  names: what `libcuda.so.1` and `libnvidia-ptxjitcompiler.so.1` of drivers 615 and 620 import or ask for: 620 wanted `rename`, `wcslen` and `dladdr` more), with the GNU
   library's spellings and layouts where they differ (`glibcabi.c`: `__xstat`, `__isoc99_sscanf`, `sigaction`,
   `strerror_r`, `posix_spawn`, `nftw`, `shm_open`, ...). It is not a general dynamic linker: an object with
   thread-local storage is refused with a message (so NVIDIA's `libnvidia-nvvm`, `libcublasLt`, `libnvidia-ml`
@@ -758,7 +758,7 @@ brings the driver's libraries and device nodes, as it does for any image.
 `GPU=1` makes `tests/hostfs.sh` bind the machine's two driver libraries (read-only) and `/dev/nvidia*` into the
 image the way NVIDIA's container run time does and run `tests/hostfs/gpu.sh` there: `cuInit` and the devices'
 names through `dlopen`, a kernel on the GPU and the same program on the CPU, the cublasLt comparison, and
-with `UFSM_GPU_TESTS` tests of ufsm. On two RTX 3090 (driver 615.71, under bubblewrap) all 63 checks pass
+with `UFSM_GPU_TESTS` tests of ufsm. On two RTX 3090 (drivers 615.71 and 620.70, under bubblewrap) all 65 checks pass
 (with ufsm's and ssh's), and again under Docker (below);
 ufsm's `test_nn` takes 5 s on the GPU (498 s on the CPU's run time). `GPU=1 make test-x64-cuda` runs the
 programs of `tests/cuda` on the GPU: 41 pass; `mx` (for sm_120a) and `ldg` (it reads a `uint2` at an address
@@ -796,8 +796,9 @@ listens on a loopback nobody else can reach: a key pair is made, the server star
 client logs in by `dbclient` and by `ssh`, runs a command, gets its status, copies a file with `scp`; another
 key is refused and no password is asked for. It runs as a user that is not root, because in a user namespace
 made without privilege nobody may set groups, which the server does for root before starting root's shell:
-root's login is shown under Docker (below). A session with a terminal was tried by hand (`dbclient -t`:
-`/dev/pts/0`).
+root's login is shown under Docker (below). For a session with a terminal (`dbclient -t`, and a login shell
+typed into) the test builds a small program that gives the client a pseudo-terminal; that found that mbox
+did not know itself under the name `-sh`, which is how a server starts a login shell.
 
 ### Under Docker
 
@@ -806,7 +807,7 @@ root's login is shown under Docker (below). A session with a terminal was tried 
 passes the command's status on; the smoke test; with `GPU=1` the GPU checks under `docker run --gpus all`,
 with nothing bound by hand; ssh as root in a container with `--network none`. Images and containers are named
 `mcc-hostfs-test*` and removed. With Docker 29.1 and NVIDIA's container toolkit on two RTX 3090 (driver
-615.71): 128 checks pass, 63 under bubblewrap and 65 under Docker; ufsm's `test_nn` takes 5 s there too.
+615.71, and again 620.70): 132 checks pass, 65 under bubblewrap and 67 under Docker; ufsm's `test_nn` takes 5 s there too.
 
 What NVIDIA's run time puts into this image, as seen there (no `nvidia` runtime was registered with Docker,
 no `/etc/docker/daemon.json`; the toolkit had written a CDI specification, `/var/run/cdi/nvidia.yaml`):
@@ -815,7 +816,7 @@ no `/etc/docker/daemon.json`; the toolkit had written a CDI specification, `/var
 |---|---|---|---|
 | works | yes | yes | no: "unknown or invalid runtime name" (it is not registered) |
 | libraries | `/usr/lib64`, 20 names | `/usr/lib/x86_64-linux-gnu`, 68 names | |
-| `libcuda`, `libnvidia-ptxjitcompiler` | mounted as `libcuda.so.615.71.10`; the link `libcuda.so.1` is made | the same | |
+| `libcuda`, `libnvidia-ptxjitcompiler` | mounted as `libcuda.so.615.71.10` (`.620.70.06` after the driver changed); the link `libcuda.so.1` is made | the same | |
 | devices | `/dev/nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`, `nvidia0`, `nvidia1` (those asked for) | those, `nvidia-modeset`, `/dev/dri/*` | |
 | environment | `NVIDIA_VISIBLE_DEVICES=all` (or the number) | `NVIDIA_VISIBLE_DEVICES=void`, `NVIDIA_CTK_LIBCUDA_DIR=/usr/lib/x86_64-linux-gnu` | |
 | other | `/usr/bin/nvidia-smi` and four more programs (they need glibc: they do not run here), firmware, `/proc/driver/nvidia`, an `/etc/ld.so.cache` | the same | |

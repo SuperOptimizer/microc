@@ -338,7 +338,9 @@ int main(int argc, char **argv)
         return 2;
     name = strrchr(argv[0], '/');
     name = name ? name + 1 : argv[0];
-    box_self = self_path(argv[0]);
+    if (name == argv[0] && name[0] == '-' && find_applet(name + 1))
+        name++; /* "-sh": how login and an ssh server name the shell they start for a session */
+    box_self = self_path(name == argv[0] + 1 ? name : argv[0]);
     fn = find_applet(name);
     if (!fn && argc > 1) {
         argv++;

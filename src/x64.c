@@ -2885,7 +2885,7 @@ static int opt_noloopx = -1; /* MCC_NOLOOPX: a branch out of the middle of a loo
 static int opt_noifin = -1;  /* MCC_NOIFIN: an if's body is guessed like any other block */
 static u32 ifin_p = 10;      /* (its chance, of 16) */
 
-static void estimate_freq(void)
+static void estimate_freq(int ifin)
 {
     u32 *fr = (u32 *)xmalloc((size_t)f->nblk * 4 * sizeof(u32)), *pos = fr + f->nblk, *lp = pos + f->nblk, *lpar = lp + f->nblk;
     u32 k, s;
@@ -2945,7 +2945,7 @@ static void estimate_freq(void)
                     continue;
                 }
             }
-            if (!opt_noifin) {
+            if (!opt_noifin && ifin) {
                 /* One way is entered from here alone and the other is where other code comes together too: an if
                    with its body, or a path with a shared way out. The body is guessed the likelier side unless it
                    only returns, so that it stays in line: out of line it costs a jump there and a jump back each
@@ -3105,10 +3105,25 @@ static void prepare(void)
         layout[k] = layout[nlayout - 1 - k];
         layout[nlayout - 1 - k] = t;
     }
-    if (!f->blk[1].freq && opt_level >= 3 && !opt_size)
-        estimate_freq();
-    if (f->blk[1].freq > 1)
+    /* The guess that an if's body is likely is for the layout only: the allocator's spill weights come from the
+       guess without it (with it, values of a dense loop's rarer arms outweighed the loop's own: ufsm test_zcache
+       +14 G instructions). MCC_ONEFREQ: one guess for both. */
+    if (!f->blk[1].freq && opt_level >= 3 && !opt_size) {
+        u32 *sw = 0;
+        if (!getenv("MCC_ONEFREQ")) {
+            estimate_freq(0);
+            sw = (u32 *)xmalloc((f->nblk + 1) * sizeof(u32));
+            for (k = 0; k < f->nblk; k++)
+                sw[k] = f->blk[k].freq;
+        }
+        estimate_freq(1);
         profile_layout();
+        for (k = 0; sw && k < f->nblk; k++)
+            f->blk[k].freq = sw[k];
+        free(sw);
+    } else if (f->blk[1].freq > 1) {
+        profile_layout();
+    }
     for (k = 0; k < nlayout; k++)
         blk_index[layout[k]] = k;
     /* Loop rotation: a loop header that only tests the condition moves below

@@ -82,6 +82,9 @@ enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
 #define PARAM_GLOBAL_NC 2 /* ... a "const T *__restrict__" one: memory the kernel only reads (ld.global.nc) */
 #define PARAM_PTR 1      /* OP_PARAM's flags, x86-64 host: the parameter is a pointer (opt.c: the root of the addresses made from it) */
 #define PARAM_RESTRICT 2 /* ... declared restrict: what is written through it is reached only through it */
+#define IF_NSW 1 /* OP_ADD, OP_SUB of I32, x86-64 host: where this stands, a signed int sum of the program's was worked out,
+                    so it did not wrap there. Set by the parser on a sum it made new; gone as soon as the instruction
+                    is taken out of its block (ir_remove: moved, perhaps to where the program did not add) */
 #define IF_SRET 1 /* OP_CALL: first argument is the struct return pointer */
 #define IF_ALLOCA 4 /* OP_CALL: the one argument is a byte count, the result that much new stack */
 #define IF_ATOMIC 8 /* OP_CALL: an atomic operation done in line. The callee is a constant: ATOM_* kind,

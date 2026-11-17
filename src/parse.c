@@ -2012,12 +2012,16 @@ static void binop(int op, Expr *l, Expr *r, u32 loc)
             u32 la = l->v, rb = r->v;
             Ins *ni;
             u64 c1, c2;
+            u32 nins0 = F->nins;
             l->v = ir_ins(F, irop, it, l->v, r->v);
             ni = &F->ins[l->v];
             if ((irop == OP_ADD || irop == OP_SUB) && t->kind == TY_INT &&
                 ((ni->op == irop && ((ni->a == la && ni->b == rb) || (irop == OP_ADD && ni->a == rb && ni->b == la))) ||
                  (irop == OP_SUB && ni->op == OP_ADD && ni->a == la && ir_is_const(F, rb, &c1) && ir_is_const(F, ni->b, &c2) &&
                   (u32)c2 == (u32)(0 - c1) && (u32)c1 != 0x80000000UL))) {
+                if (l->v >= nins0 && ni->blk && it == IT_I32 && opt_arch == ARCH_X64 && !cur_fn_dev && !opt_dev_parse && !opt_cuda &&
+                    !opt_wrapv)
+                    ni->flags |= IF_NSW;
                 nsw_vals[nsw_at % NNSW] = l->v;
                 nsw_fns[nsw_at % NNSW] = F;
                 nsw_blks[nsw_at++ % NNSW] = F->cur;

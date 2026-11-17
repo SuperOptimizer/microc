@@ -173,6 +173,7 @@ test_zcache (+-2 G).
 | + int sums widened at conversion, test after and/or/xor dropped | 1932 | 1.25 |
 | + pure calls computed only on the side of a choice that reads them | 1886 | 1.22 |
 | + unread pure calls removed; ldexp / scalbn in line | 1870 | 1.21 |
+| + counters of loops entered from several places, and counters the program adds to as ints, widened | 1869 | 1.21 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -221,6 +222,10 @@ What went in (each with its switch):
   (clang 130).
 - Dead pure calls (opt_ssa.c `opt_dce`, `MCC_NOPUREDCE`): an `IF_PURE` call nothing reads is removed (the angles of
   an inlined `svd2` whose caller wants the singular values only).
+- Counter widening (`iv_widen`) also takes a loop entered from several places (what a vector loop leaves over is
+  entered from before it and from after it: the taps of a short filter all run there), and a counter whose step is
+  an `int` addition the program wrote, which does not wrap (`IF_NSW`, lost when the instruction is moved;
+  `MCC_NONSWIV`: not looked at; off under `-fwrapv`). test_reg 114.2 -> 112.8.
 - `ldexp` / `scalbn` in line (`MCC_NOLDEXP`, under `-fno-math-errno`): a constant exponent is a multiplication by
   2^k (parse.c); otherwise, with AVX-512, the exponent is converted and `vscalefss` / `vscalefsd` does it (x64.c
   `sel_math`), as clang does.

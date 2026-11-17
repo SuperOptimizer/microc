@@ -3277,9 +3277,9 @@ static int ivw_fits(int rel, u32 o, i64 c)
 
 static void iv_widen(Func *fn)
 {
-    static int off = -1, log;
+    static int off = -1, log, nonsw;
     struct Cand {
-        u32 h, phi, next, pre, lat, uses, w, wn;
+        u32 h, phi, next, pre, lat, uses, w, wn, li; /* li: which of the header's predecessors is the way back */
         i64 c;
         int nonneg;
     } cand[IVW_MAX];
@@ -3287,31 +3287,37 @@ static void iv_widen(Func *fn)
     if (off < 0) {
         off = getenv("MCC_NOIVWIDEN") != 0;
         log = getenv("MCC_IVWLOG") != 0;
+        nonsw = getenv("MCC_NONSWIV") != 0;
     }
     if (off || fn->nins > 400000)
         return;
     f = fn;
     compute_dom();
     for (k = 0; k < nrpo && nc < IVW_MAX; k++) {
-        u32 h = rpo[k], pi, li, pre, lat;
+        u32 h = rpo[k], pi, li, pre, lat, pj, nback = 0;
         Block *hb = &f->blk[h];
-        if (hb->npreds != 2)
+        /* one way back, and one way in or several (the loop left over after a vector loop is entered from before
+           that and from after it) */
+        if (hb->npreds < 2 || hb->npreds > 6)
             continue;
-        if (rpo_num[hb->preds[0]] == 0xffffffffU || rpo_num[hb->preds[1]] == 0xffffffffU)
+        for (pj = 0, li = 0; pj < hb->npreds; pj++) {
+            if (rpo_num[hb->preds[pj]] == 0xffffffffU)
+                break;
+            if (dominates(h, hb->preds[pj]))
+                li = pj, nback++;
+        }
+        if (pj < hb->npreds || nback != 1)
             continue;
-        li = dominates(h, hb->preds[1]) ? 1 : 0;
-        pi = 1 - li;
+        pi = li ? 0 : 1; /* (the one way in, where there is one) */
         pre = hb->preds[pi];
         lat = hb->preds[li];
-        if (!dominates(h, lat) || dominates(h, pre))
-            continue;
         for (v = hb->phis; v && nc < IVW_MAX; v = f->ins[v].next) {
             Ins *i = &f->ins[v], *ni;
             u32 init, next, o = 0, x, g, steps;
             u64 cv, iv;
             i64 c;
             int ok = 0, rel, nonneg;
-            if (i->ty != IT_I32 || i->b != 2)
+            if (i->ty != IT_I32 || i->b != hb->npreds)
                 continue;
             init = ir_resolve(f, f->xargs[i->a + pi]);
             next = ir_resolve(f, f->xargs[i->a + li]);
@@ -3326,13 +3332,20 @@ static void iv_widen(Func *fn)
             if (f->blk[lat].term == TERM_BR && f->blk[lat].succ[0] != f->blk[lat].succ[1]) {
                 rel = ivw_rel(ir_resolve(f, f->blk[lat].arg), f->blk[lat].succ[0] == h, next, &o);
                 if (rel && ivw_fits(rel, o, c)) {
-                    if (ir_is_const(f, init, &iv)) {
-                        i64 s = (i64)(i32)(u32)iv + c;
-                        ok = s <= 0x7fffffffL && s >= -0x7fffffffL - 1;
-                    } else if (ir_umax32(f, init) < 0x80000000UL) {
-                        ok = c < 0 || ir_umax32(f, init) + (u64)c <= 0x7fffffffUL;
+                    for (pj = 0, ok = 1; pj < hb->npreds && ok; pj++) {
+                        u32 in = ir_resolve(f, f->xargs[i->a + pj]);
+                        if (pj == li)
+                            continue;
+                        if (ir_is_const(f, in, &iv)) {
+                            i64 s = (i64)(i32)(u32)iv + c;
+                            ok = s <= 0x7fffffffL && s >= -0x7fffffffL - 1;
+                        } else if (ir_umax32(f, in) < 0x80000000UL) {
+                            ok = c < 0 || ir_umax32(f, in) + (u64)c <= 0x7fffffffUL;
+                        } else {
+                            ok = 0;
+                        }
                     }
-                    for (g = pre, steps = 0; !ok && steps < 6 && f->blk[g].npreds == 1; steps++) {
+                    for (g = pre, steps = 0; !ok && hb->npreds == 2 && steps < 6 && f->blk[g].npreds == 1; steps++) {
                         u32 q = f->blk[g].preds[0];
                         Block *qb = &f->blk[q];
                         if (qb->term == TERM_BR && qb->succ[0] != qb->succ[1]) {
@@ -3355,14 +3368,25 @@ static void iv_widen(Func *fn)
                     ok = rel && ivw_fits(rel, o, c);
                 }
             }
+            /* or the program added there itself, as ints (IF_NSW): the sum did not wrap. MCC_NONSWIV: not looked at */
+            if (!ok && (ni->flags & IF_NSW) && !opt_wrapv && !nonsw)
+                ok = 1;
+            if (log && !ok)
+                fprintf(stderr, "ivwiden: %s block %lu not bounded (next op flags %d)\n", f->name, (unsigned long)h, ni->flags);
             if (!ok)
                 continue;
-            nonneg = c > 0 && (ir_is_const(f, init, &iv) ? !((u32)iv >> 31) : ir_umax32(f, init) < 0x80000000UL);
+            nonneg = c > 0;
+            for (pj = 0; pj < hb->npreds && nonneg; pj++) {
+                u32 in = ir_resolve(f, f->xargs[i->a + pj]);
+                if (pj != li)
+                    nonneg = ir_is_const(f, in, &iv) ? !((u32)iv >> 31) : ir_umax32(f, in) < 0x80000000UL;
+            }
+            cand[nc].li = li;
             cand[nc].h = h;
             cand[nc].phi = v;
             cand[nc].next = next;
             cand[nc].pre = pre;
-            cand[nc].lat = pi; /* (the index of the entry among the header's predecessors) */
+            cand[nc].lat = hb->npreds == 2 ? pi : 0xffffffffU; /* (the index of the one entry among the header's predecessors) */
             cand[nc].uses = 0;
             cand[nc].c = c;
             cand[nc].nonneg = nonneg;
@@ -3403,7 +3427,7 @@ static void iv_widen(Func *fn)
                 cd = &cand[role[x] / 2 - 1];
                 if (!cd->h || cd->c < 0)
                     continue;
-                if (!cd->nonneg && !(ir_is_const(f, ir_resolve(f, f->xargs[f->ins[cd->phi].a + cd->lat]), &iv) &&
+                if (!cd->nonneg && !(cd->lat != 0xffffffffU && ir_is_const(f, ir_resolve(f, f->xargs[f->ins[cd->phi].a + cd->lat]), &iv) &&
                                      (i64)(i32)(u32)iv + (i64)(i32)(u32)kv >= -0x7fffffffL - 1))
                     continue;
                 hitk[nhit] = (u32)kv;
@@ -3417,22 +3441,27 @@ static void iv_widen(Func *fn)
         }
     }
     for (k = 0; k < nc; k++) {
-        u32 h = cand[k].h, w, wn, s, t, tn, init;
+        u32 h = cand[k].h, w, wn, s, t, tn, init, pj;
         u64 iv;
         if (!h || !cand[k].uses)
             continue;
-        init = ir_resolve(f, f->xargs[f->ins[cand[k].phi].a + cand[k].lat]);
-        if (ir_is_const(f, init, &iv)) {
-            s = ir_const(f, IT_I64, (u64)(i64)(i32)(u32)iv);
-        } else {
-            s = ir_raw(f, OP_SEXT32, IT_I64, init, 0);
-            ir_append(f, cand[k].pre, s);
-        }
         w = ir_phi(f, h, IT_I64);
         wn = ir_raw(f, OP_ADD, IT_I64, w, ir_const(f, IT_I64, (u64)cand[k].c));
         ir_insert_before(f, cand[k].next, wn);
-        f->xargs[f->ins[w].a + cand[k].lat] = s;
-        f->xargs[f->ins[w].a + 1 - cand[k].lat] = wn;
+        for (pj = 0; pj < f->blk[h].npreds; pj++) {
+            if (pj == cand[k].li) {
+                f->xargs[f->ins[w].a + pj] = wn;
+                continue;
+            }
+            init = ir_resolve(f, f->xargs[f->ins[cand[k].phi].a + pj]);
+            if (ir_is_const(f, init, &iv)) {
+                s = ir_const(f, IT_I64, (u64)(i64)(i32)(u32)iv);
+            } else {
+                s = ir_raw(f, OP_SEXT32, IT_I64, init, 0);
+                ir_append(f, f->blk[h].preds[pj], s);
+            }
+            f->xargs[f->ins[w].a + pj] = s;
+        }
         tn = ir_raw(f, OP_TRUNC, IT_I32, wn, 0);
         ir_insert_before(f, cand[k].next, tn);
         t = ir_raw(f, OP_TRUNC, IT_I32, w, 0);

@@ -115,6 +115,8 @@ void ir_remove(Func *f, u32 v)
         b->last = i->prev;
     i->blk = 0;
     i->prev = i->next = 0;
+    if (i->op == OP_ADD || i->op == OP_SUB)
+        i->flags = 0; /* IF_NSW: true only where it stood */
 }
 
 /* ---- floating values, hash-consed ---- */

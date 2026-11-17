@@ -3357,6 +3357,25 @@ static void call(Expr *e)
             return;
         }
     }
+    /* ldexp (x, k), scalbn (x, k), k a constant: x * 2^k, which rounds as the library's does (once, also into the
+       subnormals); not where the library would set errno. MCC_NOLDEXP: the call. */
+    if (!flags && nargs == 2 && F->cur && !cur_fn_dev && opt_arch == ARCH_X64 && !opt_math_errno && F->ins[callee].op == OP_ADDR &&
+        !F->ins[callee].b && O->syms[F->ins[callee].a].name && type_is_float(ret) && F->ins[args[1]].ty == IT_I32 &&
+        F->ins[args[0]].ty == type_ir(ret) && !getenv("MCC_NOLDEXP")) {
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        int f32 = type_ir(ret) == IT_F32;
+        u64 kc;
+        if (strcmp(cn, f32 ? "ldexpf" : "ldexp") == 0 || strcmp(cn, f32 ? "scalbnf" : "scalbn") == 0) {
+            if (ir_is_const(F, args[1], &kc)) {
+                i32 k = (i32)(u32)kc;
+                if (k >= (f32 ? -126 : -1022) && k <= (f32 ? 127 : 1023)) {
+                    u64 bits = f32 ? (u64)(u32)(k + 127) << 23 : (u64)(u32)(k + 1023) << 52;
+                    set_expr(e, ret, ir_ins(F, OP_FMUL, type_ir(ret), args[0], ir_fconst_bits(F, type_ir(ret), bits)), 0);
+                    return;
+                }
+            }
+        }
+    }
     /* (x86-64: a function without a prototype may be variadic too, and is called like one) */
     v = ir_call(F, flags ? IT_VOID : vec_mem(ret) ? vec_ity(vec_mem(ret)) : type_ir(ret), callee, args, nargs,
                 ft->variadic ? ft->nparams + (flags ? 1 : 0) : opt_arch == ARCH_X64 && ft->oldstyle ? nargs : 0xffffffffU, flags);

@@ -858,6 +858,7 @@ static void sel_atomic(u32 v)
         emit(X_MOV, 1, d, RAX, NOREG);
 }
 
+static MIns *emit_vex(u32 enc, int form, u32 d, u32 s0, u32 s1, u32 s2, int imm8);
 int opt_x64_fma;
 int opt_x64_xmm16; /* AVX-512 F, VL, BW and DQ (-march=native / x86-64-v4): xmm16-xmm31 hold the floating and vector values
                       that xmm0-xmm12 have no room for, where every instruction on them has an EVEX form (MCC_NOXMM16: off;
@@ -887,7 +888,8 @@ static int sel_math(u32 v)
     size_t bl;
     int isf;
     MIns *m;
-    if (f->ins[i->c].op != OP_ADDR || f->ins[i->c].b || i->b != 1 || (i->flags & (IF_SRET | IF_ASM | IF_ATOMIC | IF_ALLOCA)))
+    if (f->ins[i->c].op != OP_ADDR || f->ins[i->c].b || (i->b != 1 && i->b != 2) ||
+        (i->flags & (IF_SRET | IF_ASM | IF_ATOMIC | IF_ALLOCA)))
         return 0;
     sym = f->ins[i->c].a;
     if (obj->syms[sym].sec != SEC_UNDEF && obj->syms[sym].sec != SEC_NONE)
@@ -898,6 +900,24 @@ static int sel_math(u32 v)
     isf = bl > 1 && nm[bl - 1] == 'f';
     if (f->ins[x].ty != (isf ? IT_F32 : IT_F64))
         return 0;
+    if (i->b == 2) {
+        /* ldexp (x, n), scalbn (x, n) with AVX-512: n made floating (any int is far past where the result is 0 or
+           infinite before its conversion rounds), then vscalefss / vscalefsd, x * 2^n rounded once as the
+           library's (clang does the same). MCC_NOLDEXP: the call. */
+        u32 n = f->xargs[i->a + 1], t;
+        static int off = -1;
+        if (off < 0)
+            off = getenv("MCC_NOLDEXP") != 0;
+        if (off || !opt_x64_xmm16 || opt_math_errno || f->ins[n].ty != IT_I32 || i->ty != f->ins[x].ty ||
+            (strcmp(nm, isf ? "ldexpf" : "ldexp") != 0 && strcmp(nm, isf ? "scalbnf" : "scalbn") != 0))
+            return 0;
+        t = new_vreg(1);
+        m = emit(X_SITOF, !isf, t, reg_of(n), NOREG);
+        m->cc = 0;
+        /* EVEX.66.0F38 2D, W for double (the VE () fields; VE_Z says EVEX) */
+        emit_vex(0x2du | 2u << 8 | 1u << 10 | (u32)!isf << 12 | 0x20000u, XF_RVM, VREG0 + v, reg_of(x), t, NOREG, -1);
+        return 1;
+    }
     for (k = 0; fns[k].name; k++)
         if (strlen(fns[k].name) == bl - (size_t)isf && strncmp(nm, fns[k].name, bl - (size_t)isf) == 0)
             break;
@@ -1124,6 +1144,8 @@ static MIns *emit_vex(u32 enc, int form, u32 d, u32 s0, u32 s1, u32 s2, int imm8
 static int rm_mem_ok(u32 enc)
 {
     u32 op = XE_OPC(enc);
+    if (XE_MAP(enc) == 2 && op == 0x2d && XE_Z(enc))
+        return 0; /* vscalefss / vscalefsd as sel_math writes them: the displacement would be scaled as a vector's */
     if (XE_MAP(enc) != 1)
         return 1;
     return op != 0x50 && op != 0xd7 && op != 0x12 && op != 0x16 && op != 0xc5 && op != 0xf7;

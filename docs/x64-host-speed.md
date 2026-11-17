@@ -172,6 +172,7 @@ test_zcache (+-2 G).
 | + 32-bit loop counters widened (iv_widen) | 1941 | 1.25 |
 | + int sums widened at conversion, test after and/or/xor dropped | 1932 | 1.25 |
 | + pure calls computed only on the side of a choice that reads them | 1886 | 1.22 |
+| + unread pure calls removed; ldexp / scalbn in line | 1870 | 1.21 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -218,6 +219,11 @@ What went in (each with its switch):
   round them and a phi. ufsm's fixture loops (`w = fx_wind(z, y, x); ... ph[i] = z < 128 ? code(w) : 255`) called
   atan2 and hypot for every voxel where clang calls them for the ones kept: test_wind_sampler 180 -> 137 G
   (clang 130).
+- Dead pure calls (opt_ssa.c `opt_dce`, `MCC_NOPUREDCE`): an `IF_PURE` call nothing reads is removed (the angles of
+  an inlined `svd2` whose caller wants the singular values only).
+- `ldexp` / `scalbn` in line (`MCC_NOLDEXP`, under `-fno-math-errno`): a constant exponent is a multiplication by
+  2^k (parse.c); otherwise, with AVX-512, the exponent is converted and `vscalefss` / `vscalefsd` does it (x64.c
+  `sel_math`), as clang does.
 - `iv_widen` (opt.c, last before selection, `MCC_NOIVWIDEN`, `MCC_IVWLOG`): a 32-bit counter read widened becomes a
   64-bit counter where i + step cannot wrap (the way back is taken only while next < n and the first value is a
   constant, known small or was compared before the loop; or the header leaves unless i < n); `(long)(i - k)` of a

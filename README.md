@@ -676,6 +676,93 @@ dynamic linking by mcc's own linker (local-exec thread-local storage only), `lon
 gcc's), link-time optimisation in the ELF linker (either Linux target). Its code runs mcc itself about 1.2
 times slower than gcc -O2's.
 
+## hostfs: a container root file system
+
+`mkhostfs.sh MCC OUTDIR` (or `make hostfs`, into `build/hostfs`) makes a root file system for x86-64 Linux
+containers in which every program is built by mcc from this tree against our own C library, statically:
+`OUTDIR/rootfs`, the same as `OUTDIR/hostfs.tar` (the archive is written by mbox's `tar`, with owner root and
+one fixed time, so the same tree gives the same bytes), and a `Dockerfile` (`FROM scratch`, `ADD hostfs.tar /`).
+About 10 MB. Nothing in it comes from a distribution; one file is not mcc's work, the list of certificate
+authorities (below).
+
+| path | what |
+| --- | --- |
+| `/usr/mbox` | the shell and the tools (`box/`); `init` and `tar` were added for this |
+| `/usr/mcc` | the compiler, assembler, linker, binutils, make, lex, yacc |
+| `/usr/bin` | every tool by name (links to the two programs); `gcc`, `ld`, `ar`, `nm`, `nvcc`, ... and `pkg-config` are two-line scripts; `/bin` and `/sbin` are links to it |
+| `/usr/linux-x64` | the C library (`include`, `lib/crt1.o`, `lib/libc.a`) and the third-party libraries (`ext`) |
+| `/usr/cuda` | `include`: what a `.cu` file includes; `lib64/libcudart.a`: the CUDA run time, which runs kernels on the GPU when NVIDIA's driver is there and on the CPU otherwise (with a `libcublasLt.a` and a `libstdc++.a` that hold nothing) |
+| `/etc/passwd`, `group`, `hosts` | root alone; `/tmp`, `/root`, `/proc`, `/sys`, `/dev` are empty |
+| `/etc/ssl/certs/ca-certificates.crt` | the certificate authorities HTTPS trusts (libcurl's default file; `/etc/ssl/cert.pem` is a link to it). **The one file that is data from outside this tree**: a copy of `CACERTS=file` (PEM), by default the build machine's own `/etc/ssl/certs/ca-certificates.crt` (Linux) or `/etc/ssl/cert.pem` (macOS: 128 certificates, readable by anyone; the keychain's list, `security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > roots.pem`, also needs no rights and can be given as `CACERTS=roots.pem`). `CACERTS=none` leaves it out. Nothing is downloaded; `mkhostfs.sh` prints the file's SHA-256, and the same file gives the same archive |
+
+`init [COMMAND...]` is the image's entry point: it runs the command (default `/bin/sh`), waits for every
+orphan a process 1 inherits, passes TERM, INT, HUP and QUIT on to the command and leaves with its status.
+`sh` at a terminal prompts and runs each command when it is whole (no history, no job control).
+
+    make hostfs                             # build/hostfs/{rootfs,hostfs.tar,Dockerfile}
+    docker import build/hostfs/hostfs.tar mcc-hostfs     # or: docker build -t mcc-hostfs build/hostfs
+    X64_SSH="ssh user@host" X64_DIR=dir make test-hostfs [UFSM=path/to/ufsm] [GPU=1 [UFSM_GPU_TESTS=test_nn]]
+
+`tests/hostfs.sh` needs no Docker and no root: on the x86-64 machine it unpacks the archive, checks with that
+machine's `readelf` that every ELF file in it is a static executable or a relocatable object (no interpreter,
+no dynamic section), and runs `tests/hostfs/smoke.sh` inside it through bubblewrap (`bwrap --bind rootfs /
+--unshare-all --as-pid-1`), started by the image's `init`: the tools, a C program, one with threads, make with
+`ar` and `ld -r`, a program linking every third-party library through `pkg-config`, a CUDA unit compiled,
+linked with `-lcudart` and its kernel run, and mcc building itself to the bytes of the installed `/usr/mcc`. With `UFSM=dir`, ufsm's tests
+that need no GPU are built there by ufsm's own Makefile and run (`tests/hostfs/ufsm.sh`).
+
+mcuda on x86-64 (`make x64 cuda` builds it into `DIR/linux-x64/cuda`; `make test-x64-cuda` runs the tests of
+`tests/cuda.sh` on the x86-64 machine) is the interpreter alone: what is assembly on arm64 is C over the C
+library there (`cuda/fp_c.c`), the sums of `mma` are the plain C ones, and there is no translator to machine
+code, so kernels run slowly.
+
+### The GPU from a static program
+
+The image has no GNU C library and no `ld.so`, and NVIDIA's driver library `libcuda.so.1` is a shared object
+made for both. Three pieces of ours stand in, and nothing of NVIDIA's is in the image: the container run time
+brings the driver's libraries and device nodes, as it does for any image.
+
+- **`dlopen` in the C library** (x86-64 Linux, `libc/linux/src/dl.c`): maps a shared object into the static
+  program, relocates it, runs its initialisers, and answers `dlsym`. What the object imports from `libc.so.6`,
+  `libm`, `libdl`, `libpthread`, `librt` is our library itself, by name from a table (`glibctab.c`, about 270
+  names: what `libcuda.so.1` and `libnvidia-ptxjitcompiler.so.1` of driver 615 import or ask for), with the GNU
+  library's spellings and layouts where they differ (`glibcabi.c`: `__xstat`, `__isoc99_sscanf`, `sigaction`,
+  `strerror_r`, `posix_spawn`, `nftw`, `shm_open`, ...). It is not a general dynamic linker: an object with
+  thread-local storage is refused with a message (so NVIDIA's `libnvidia-nvvm`, `libcublasLt`, `libnvidia-ml`
+  do not load, and are not needed), symbol versions are ignored, nothing is unloaded. A missing name shows in
+  `dlerror` (and with `MCC_DLDEBUG=1`, which traces every request) and is a line to add to the table.
+  Objects are looked for in `LD_LIBRARY_PATH`, then `/usr/lib/x86_64-linux-gnu`, `/usr/lib64`, `/lib64`,
+  `/usr/lib`, `/usr/local/nvidia/lib64` ... (there is no `ld.so.cache`).
+  `malloc` now returns blocks aligned to 16 bytes, which the driver's code (like any compiled for the ABI)
+  takes for granted.
+- **mcudahw on our C library** (`cuda/hw`, the run time on the driver's API that was built with glibc before):
+  `cuInit`, the PTX that mcc wrote given to `cuModuleLoadData` (the driver's compiler is
+  `libnvidia-ptxjitcompiler.so.1`, loaded the same way), launches, memory, streams. Compiled kernels are kept
+  in `~/.cache/mcudahw` (`MCUDA_CACHE`).
+  `cublasLtMatmul` is a kernel of our own (`cuda/hw/ltk.cu`: 16 x 16 tiles through shared memory), not
+  NVIDIA's cuBLAS: it supports what the CPU's does (`cuda/include/cublasLt.h`) and rounds the same way, so
+  the two give the same bits (`tests/hostfs/ltcmp.cu`: 20 products of fp32, fp16 and bf16 matrices,
+  transposed, batched, with bias and relu). It is a plain kernel, far from cuBLAS in speed on large matrices.
+- **One `libcudart.a` with both run times** (`cuda/mux`): every global name of the CPU's run time gets `mcpu_`
+  before it and of the GPU's `mgpu_` (`symprefix.c` rewrites the objects' symbol tables), and each public
+  function (`cuda*`, `cublasLt*`, `cu*`, `__mcuda_*`) is two instructions that jump through a slot. At the
+  first call the GPU's run time is taken if `libcuda.so.1` loads and `cuInit` finds a device, the CPU's
+  otherwise; `MCUDA_BACKEND=cpu` or `gpu` decides instead, `MCUDA_VERBOSE=1` says which it is. A program that
+  never calls CUDA loads nothing. The driver API by name (`cuMemAlloc`, ...) is the CPU run time's alone;
+  on the GPU a program gets the driver's functions from `cudaGetDriverEntryPointByVersion`, as ufsm does.
+
+`GPU=1` makes `tests/hostfs.sh` bind the machine's two driver libraries (read-only) and `/dev/nvidia*` into the
+image the way NVIDIA's container run time does and run `tests/hostfs/gpu.sh` there: `cuInit` and the devices'
+names through `dlopen`, a kernel on the GPU and the same program on the CPU, the cublasLt comparison, and
+with `UFSM_GPU_TESTS` tests of ufsm. On two RTX 3090 (driver 615.71, under bubblewrap): 52 checks pass;
+ufsm's `test_nn` takes 5 s on the GPU (498 s on the CPU's run time). `GPU=1 make test-x64-cuda` runs the
+programs of `tests/cuda` on the GPU: 41 pass; `mx` (for sm_120a) and `ldg` (it reads a `uint2` at an address
+that is a multiple of 4 but not of 8, which `ld.global.nc.v2.u32` does not take on a real device) are left out.
+
+Not in it: time zones (the library knows UTC), bash and python (ufsm's suite runner and some of its tests),
+an ssh client or server. Not tried: Docker itself and NVIDIA's container run time (the checks above are under
+bubblewrap, with the libraries and devices bound by hand), RunPod.
+
 ## Known gaps
 
 - Structures are always passed and returned by reference. This differs from

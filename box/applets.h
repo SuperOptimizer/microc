@@ -42,6 +42,7 @@ int uniq_main(int argc, char **argv);
 int od_main(int argc, char **argv);
 int xargs_main(int argc, char **argv);
 int sha1sum_main(int argc, char **argv);
+int sha256sum_main(int argc, char **argv);
 int grep_main(int argc, char **argv);
 int diff_main(int argc, char **argv);
 int bc_main(int argc, char **argv);
@@ -50,6 +51,8 @@ int find_main(int argc, char **argv);
 int awk_main(int argc, char **argv);
 int gzip_main(int argc, char **argv);
 int bzip2_main(int argc, char **argv);
+int tar_main(int argc, char **argv);
+int init_main(int argc, char **argv);
 
 static const struct {
     const char *name;
@@ -104,6 +107,7 @@ static const struct {
     { "od", od_main },
     { "xargs", xargs_main },
     { "sha1sum", sha1sum_main },
+    { "sha256sum", sha256sum_main },
     { "grep", grep_main },
     { "egrep", grep_main },
     { "fgrep", grep_main },
@@ -116,5 +120,7 @@ static const struct {
     { "bzip2", bzip2_main },
     { "gunzip", gzip_main },
     { "zcat", gzip_main },
+    { "tar", tar_main },
+    { "init", init_main },
     { 0, 0 }
 };

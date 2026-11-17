@@ -1,9 +1,12 @@
 #!/bin/sh
 # mkcuda.sh MCC DIR: build mcuda, the CUDA runtime that runs PTX on the CPU (cuda/), with MCC, for this machine
-# and for Linux, and install it: the headers under DIR/cuda/include, where the compiler looks for them when it
+# and for Linux (aarch64, and x86-64 when DIR/linux-x64 holds its C library), and install it: the headers under DIR/cuda/include, where the compiler looks for them when it
 # reads a .cu file, and again beside each library, DIR/host/cuda/{include,lib} and DIR/linux/cuda/{include,lib};
 # the library is libmcuda.a. A program links it after its own objects: mcc --hosted ... DIR/host/cuda/lib/libmcuda.a
 # For Linux it is also DIR/cuda/lib64/libcudart.a, with a libcublasLt.a and a libstdc++.a that hold nothing.
+# For x86-64 Linux, DIR/linux-x64/cuda/lib has besides libmcuda.a: libmcudahw.a, the run time on NVIDIA's driver
+# built on mcc's own C library, and libcudart.a, which is both and takes the GPU when the driver finds one
+# (cuda/mux/mkmux.sh).
 #
 # mkcuda.sh MCC DIR hw: build mcudahw instead, the same run time on NVIDIA's driver (cuda/hw), for the machine
 # this runs on, an x86-64 Linux with the driver: the kernels then run on its GPU. MCC must compile for that
@@ -36,10 +39,11 @@ fi
 rm -rf $D/cuda/include && mkdir -p $D/cuda/include
 cp -R cuda/include/. $D/cuda/include/
 if [ -d cuda/devinc ]; then cp -R cuda/devinc/. $D/cuda/include/; fi
-for flavour in host linux; do
+for flavour in host linux linux-x64; do
     T=$D/$flavour/obj/cuda
     L=$D/$flavour/cuda
     if [ $flavour = host ]; then CC="$MCC --hosted"; AS="$MCC as"; asm=cuda/fp_darwin.s
+    elif [ $flavour = linux-x64 ]; then CC="$MCC --target=x86_64-linux-gnu -mno-glibc"; asm= # (cuda/fp_c.c instead)
     else CC="$MCC --target=aarch64-linux-gnu"; AS="$MCC --target=aarch64-linux-gnu -c"; asm=cuda/fp_linux.s; fi
     [ -d $D/$flavour/lib ] || continue
     mkdir -p $T $L/lib
@@ -50,8 +54,10 @@ for flavour in host linux; do
         $CC -fno-strict-aliasing -Icuda -Icuda/include -c $f -o $o
         objs="$objs $o"
     done
-    $AS -o $T/fp.o $asm
-    objs="$objs $T/fp.o"
+    if [ -n "$asm" ]; then
+        $AS -o $T/fp.o $asm
+        objs="$objs $T/fp.o"
+    fi
     rm -f $L/lib/libmcuda.a
     $MCC ar $L/lib/libmcuda.a $objs 2>/dev/null || ${AR:-llvm-ar} rcs $L/lib/libmcuda.a $objs
     if [ $flavour = linux ]; then
@@ -65,5 +71,16 @@ for flavour in host linux; do
             $MCC ar $D/cuda/lib64/lib$l.a $T/empty.o 2>/dev/null || ${AR:-llvm-ar} rcs $D/cuda/lib64/lib$l.a $T/empty.o
         done
         cp $L/lib/libmcuda.a $D/cuda/lib64/libcudart.a
+    fi
+    if [ $flavour = linux-x64 ]; then
+        # the same three for x86-64 Linux, beside its libmcuda.a (mkhostfs.sh makes the image's /usr/cuda/lib64 of them)
+        echo 'int __mcuda_nothing_here;' > $T/empty.c
+        $CC -c $T/empty.c -o $T/empty.o
+        for l in cublasLt stdc++; do
+            rm -f $L/lib/lib$l.a
+            $MCC ar $L/lib/lib$l.a $T/empty.o 2>/dev/null || ${AR:-llvm-ar} rcs $L/lib/lib$l.a $T/empty.o
+        done
+        # libcudart.a: this run time and the GPU's (cuda/hw on mcc's own C library), chosen when the program runs
+        sh cuda/mux/mkmux.sh "$MCC" $D
     fi
 done

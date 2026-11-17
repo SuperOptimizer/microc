@@ -152,6 +152,8 @@ static char *self_dir(const char *argv0)
         dir[n - 4] = 0;
     else if (!os_exists(probe) && strcmp(dir, "bin") == 0)
         strcpy(dir, ".");
+    else if (!os_exists(probe) && (strcmp(dir, "/bin") == 0 || strcmp(dir, "/sbin") == 0))
+        strcpy(dir, "/usr"); /* (a root whose /bin is a link to usr/bin, where the installation is /usr) */
     free(probe);
     return dir;
 }

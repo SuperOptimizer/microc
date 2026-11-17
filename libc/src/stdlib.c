@@ -145,7 +145,10 @@ void *malloc(size_t n)
         UNLOCK(heap_lock);
         return f;
     }
-    size = class_size(c) + HDR;
+    /* a multiple of 16, so that every block is aligned for any object (as the ABIs promise of malloc, and as
+       code that stores vectors into what malloc returned takes for granted): the class of 24 bytes is
+       carved as 32, and goes back to that class when freed */
+    size = (class_size(c) + HDR + 15) & ~(size_t)15;
     if ((size_t)(chunk_end - chunk_p) < size) {
         chunk_p = __map(CHUNK);
         if (!chunk_p) {

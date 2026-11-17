@@ -55,6 +55,20 @@ ulibs-x64: tools x64
 	@ARCH=x86_64 THREADS=$(THREADS) build/stage$(STAGE)/bin/sh mkulibs.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 test-ulibs-x64: ulibs-x64
 	@sh tests/x64ulibs.sh build/stage$(STAGE)
+# hostfs: a root file system for x86-64 Linux containers (build/hostfs/rootfs, hostfs.tar and a Dockerfile, see
+# mkhostfs.sh) in which every program is built by mcc from this tree: the shell and tools, the compiler, the C
+# library, the CUDA headers and, when their sources are under build/ext (libc/ext/fetch.sh), the third-party
+# libraries. test-hostfs runs tests/hostfs/smoke.sh inside it on the x86-64 machine (X64_SSH, X64_DIR; it
+# needs bubblewrap there, not Docker and not root); with UFSM=dir also ufsm's tests that need no GPU.
+hostfs: tools x64 cuda
+	@[ ! -d $(EXT)/zlib-1.4 ] || EXT=$(EXT) ARCH=x86_64 THREADS=$(THREADS) build/stage$(STAGE)/bin/sh mkulibs.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
+	@build/stage$(STAGE)/bin/sh mkhostfs.sh build/stage$(STAGE)/mcc build/hostfs
+test-hostfs: hostfs
+	@UFSM=$(UFSM) GPU=$(GPU) UFSM_GPU_TESTS="$(UFSM_GPU_TESTS)" sh tests/hostfs.sh build/hostfs
+EXT = $(CURDIR)/build/ext
+UFSM =
+GPU =
+UFSM_GPU_TESTS =
 # mcc cross-built for x86-64 Linux, then building itself and running the C tests there
 test-x64-self: x64
 	@sh tests/x64self.sh build/stage$(STAGE)
@@ -86,6 +100,9 @@ cuda: tools
 	@build/stage$(STAGE)/bin/sh mkcuda.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 test-cuda: cuda
 	@build/stage$(STAGE)/bin/sh tests/cuda.sh build/stage$(STAGE)
+# the same run time and tests for x86-64 Linux, on the x86-64 machine (X64_SSH, X64_DIR)
+test-x64-cuda: x64 cuda
+	@GPU=$(GPU) sh tests/x64cuda.sh build/stage$(STAGE)
 
 # -flto through the system's linker (glibc mode, x86-64 Linux): tests/ltoglibc.sh
 test-lto: $(MCC) $(LIBC)
@@ -114,4 +131,4 @@ STAGE = 0
 clean:
 	rm -rf build
 
-.PHONY: all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean
+.PHONY: hostfs test-hostfs test-x64-cuda all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean

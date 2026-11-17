@@ -1345,6 +1345,12 @@ int __mcuda_launch(struct __mcuda_module *m, const char *kernel, const unsigned 
     return ret(mc_launch(f, grid, block, shared_bytes, args));
 }
 
+/* (the driver's profiler: there is none to start or stop here) */
+cudaError_t cudaProfilerStart(void);
+cudaError_t cudaProfilerStop(void);
+cudaError_t cudaProfilerStart(void) { return cudaSuccess; }
+cudaError_t cudaProfilerStop(void) { return cudaSuccess; }
+
 void *__mcuda_symbol(struct __mcuda_module *m, const char *name)
 {
     McModule *h;

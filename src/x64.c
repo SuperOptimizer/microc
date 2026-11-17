@@ -5962,6 +5962,242 @@ static void var_places(u32 start)
     free(byslot);
 }
 
+typedef struct SplitCp {
+    u32 kind; /* SC_TAIL: at the end of block at; SC_HEAD: at its head; SC_EDGE: in the new block at; | SC_SAME */
+    u32 at, d, s;
+} SplitCp;
+enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100 };
+
+/* The spilled scalar registers (cidx: each one's number among them, else NOREG) and which of them are live into
+   each block: a bit set per block, *pwords words each. */
+static u64 *spill_live(u32 nv0, u32 *cidx, u32 *pnc, u32 *pwords)
+{
+    u32 nb = mf.nblk, b, i, k, nc = 0, words;
+    u64 *lin, *gen, *kill;
+    int ch;
+    for (i = 0; i < nv0; i++) {
+        u32 l = mf.loc[i];
+        cidx[i] = l != NOREG && l >= SPILL0 && !(mf.vclass[i] & ~0x11) ? nc++ : NOREG;
+    }
+    words = (nc + 63) / 64;
+    lin = (u64 *)xmalloc(((size_t)nb * words * 3 + 1) * sizeof(u64));
+    memset(lin, 0, ((size_t)nb * words * 3 + 1) * sizeof(u64));
+    gen = lin + (size_t)nb * words;
+    kill = gen + (size_t)nb * words;
+    for (b = 0; b < nb && nc; b++) {
+        MBlock *mb = &mf.blk[b];
+        u64 *g = gen + (size_t)b * words, *kl = kill + (size_t)b * words;
+        for (i = mb->first; i < mb->first + mb->n; i++) {
+            MIns *in = &mf.ins[i];
+            u32 r[3], q, c;
+            r[0] = in->s0;
+            r[1] = in->s1;
+            r[2] = in->s2;
+            for (q = 0; q < 3; q++)
+                if (r[q] != NOREG && r[q] >= VREG0 && r[q] - VREG0 < nv0 && (c = cidx[r[q] - VREG0]) != NOREG &&
+                    !(kl[c >> 6] >> (c & 63) & 1))
+                    g[c >> 6] |= (u64)1 << (c & 63);
+            if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0 && (c = cidx[in->d - VREG0]) != NOREG)
+                kl[c >> 6] |= (u64)1 << (c & 63);
+        }
+    }
+    do {
+        ch = 0;
+        for (b = nb; b-- > 0 && nc;) {
+            MBlock *mb = &mf.blk[b];
+            u64 *in = lin + (size_t)b * words, *g = gen + (size_t)b * words, *kl = kill + (size_t)b * words;
+            for (i = 0; i < words; i++) {
+                u64 out = 0, nw;
+                for (k = 0; k < mb->nsucc; k++)
+                    out |= lin[(size_t)mb->succ[k] * words + i];
+                nw = g[i] | (out & ~kl[i]);
+                if (nw != in[i]) {
+                    in[i] = nw;
+                    ch = 1;
+                }
+            }
+        }
+    } while (ch);
+    *pnc = nc;
+    *pwords = words;
+    return lin;
+}
+
+#define SPLIT_LIVE(v, blk) (lin[(size_t)(blk) * words + (cidx[v] >> 6)] >> (cidx[v] & 63) & 1)
+
+/* ---- reloads split off (after the loops): a spilled register read several times in a stretch of a block with no
+   call and no write of it is a load at each read that cannot take a memory operand. It gets a register of its own
+   for the stretch, loaded once before the first read; allocation then runs again, and if that one is spilled too
+   it is the old slot under another name. Straight-line float code that keeps more than 13 values alive (ufsm's
+   fit_vox2: 8 corners' weights and gradients across the calls of its terms) read each of them back again and
+   again. MCC_NORSPLIT: off. */
+static int split_reloads(void)
+{
+    u32 nb = mf.nblk, nv0 = mf.nvreg, b, i, k, nc = 0, words, nsp = 0, nn, at;
+    u32 *cidx, *first, *cnt, *nonf, *last, *open, nopen, *ihead, *cnext, cap = 64, ncp = 0;
+    SplitCp *cp;
+    u64 *lin;
+    MIns *ni;
+    u32 *nloc;
+    int mode = getenv("MCC_RSPLIT") ? atoi(getenv("MCC_RSPLIT")) : 3; /* (1: also one such read of three; 2: any two reads) */
+    if (!mf.nspill)
+        return 0;
+    cidx = (u32 *)xmalloc((nv0 + 1) * sizeof(u32));
+    lin = spill_live(nv0, cidx, &nc, &words);
+    if (!nc) {
+        free(cidx);
+        free(lin);
+        return 0;
+    }
+    first = (u32 *)xmalloc((size_t)nc * 5 * sizeof(u32));
+    cnt = first + nc;
+    nonf = cnt + nc;
+    last = nonf + nc;
+    open = last + nc;
+    cp = (SplitCp *)xmalloc(cap * sizeof(SplitCp));
+    for (k = 0; k < nc; k++)
+        cnt[k] = 0;
+    for (b = 0; b < nb; b++) {
+        MBlock *mb = &mf.blk[b];
+        u32 end = mb->first + mb->n;
+        nopen = 0;
+        for (i = mb->first; i <= end; i++) {
+            MIns *in = i < end ? &mf.ins[i] : 0;
+            u32 r[3], q, c, dc = NOREG;
+            int all = !in || (in->flags & MF_CALL) || in->op == X_ASM;
+            if (in) {
+                r[0] = in->s0;
+                r[1] = in->s1;
+                r[2] = in->s2;
+                for (q = 0; q < 3 && !all; q++) {
+                    if (r[q] == NOREG || r[q] < VREG0 || r[q] - VREG0 >= nv0 || (c = cidx[r[q] - VREG0]) == NOREG)
+                        continue;
+                    if (q && (r[q] == r[0] || (q == 2 && r[q] == r[1])))
+                        continue; /* (the same register twice in one instruction: one read) */
+                    if (!cnt[c]) {
+                        first[c] = i;
+                        nonf[c] = 0;
+                        open[nopen++] = r[q] - VREG0;
+                    }
+                    cnt[c]++;
+                    last[c] = i;
+                    /* a read that can be the instruction's memory operand costs nothing as it is */
+                    if (!((q == 1 && (in->op == X_ADD || in->op == X_SUB || in->op == X_IMUL || in->op == X_AND ||
+                                      in->op == X_OR || in->op == X_XOR || in->op == X_CMP || in->op == X_FADD ||
+                                      in->op == X_FSUB || in->op == X_FMUL || in->op == X_FDIV || in->op == X_FMAX ||
+                                      in->op == X_FMIN || in->op == X_FCMP)) ||
+                          (q == 0 && in->op == X_MOV)))
+                        nonf[c]++;
+                }
+                if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0)
+                    dc = cidx[in->d - VREG0];
+            }
+            /* stretches that end here: all of them at a call or the block's end, a register's own where it is written */
+            for (q = 0; q < nopen;) {
+                u32 v = open[q], x;
+                int same = 0, known = 0;
+                c = cidx[v];
+                if (!all && c != dc) {
+                    q++;
+                    continue;
+                }
+                open[q] = open[--nopen];
+                if (cnt[c] >= 2 && (mode == 2 || nonf[c] >= 2 || (nonf[c] >= 1 && cnt[c] >= 3 && mode != 3))) {
+                    u32 nr = new_vreg(mf.vclass[v]);
+                    /* is the old one alive after the stretch (then its slot holds the value all through)? */
+                    for (x = last[c] + 1; x < end && !known; x++) {
+                        MIns *y = &mf.ins[x];
+                        if (y->s0 == VREG0 + v || y->s1 == VREG0 + v || y->s2 == VREG0 + v)
+                            same = known = 1;
+                        else if (y->d == VREG0 + v)
+                            known = 1;
+                    }
+                    for (x = 0; x < mb->nsucc && !known; x++)
+                        same |= (int)SPLIT_LIVE(v, mb->succ[x]);
+                    for (x = first[c]; x <= last[c]; x++) {
+                        MIns *y = &mf.ins[x];
+                        if (y->s0 == VREG0 + v)
+                            y->s0 = nr;
+                        if (y->s1 == VREG0 + v)
+                            y->s1 = nr;
+                        if (y->s2 == VREG0 + v)
+                            y->s2 = nr;
+                    }
+                    if (ncp == cap) {
+                        cap *= 2;
+                        cp = (SplitCp *)xrealloc(cp, cap * sizeof(SplitCp));
+                    }
+                    cp[ncp].kind = same ? SC_SAME : 0;
+                    cp[ncp].at = first[c];
+                    cp[ncp].d = nr;
+                    cp[ncp++].s = VREG0 + v;
+                    nsp++;
+                }
+                cnt[c] = 0;
+            }
+        }
+    }
+    if (ncp) {
+        /* the copies go in before their instructions */
+        nn = mf.n + ncp;
+        ni = (MIns *)xmalloc((nn + 1) * sizeof(MIns));
+        nloc = opt_debug ? (u32 *)xmalloc((nn + 1) * sizeof(u32)) : 0;
+        ihead = (u32 *)xmalloc((mf.n + 1 + ncp) * sizeof(u32));
+        cnext = ihead + mf.n + 1;
+        for (i = 0; i <= mf.n; i++)
+            ihead[i] = NOREG;
+        for (k = 0; k < ncp; k++) {
+            cnext[k] = ihead[cp[k].at];
+            ihead[cp[k].at] = k;
+        }
+        at = 0;
+        for (b = 0; b < nb; b++) {
+            MBlock *mb = &mf.blk[b];
+            u32 end = mb->first + mb->n, nf = at;
+            for (i = mb->first; i < end; i++) {
+                for (k = ihead[i]; k != NOREG; k = cnext[k]) {
+                    MIns *m2 = &ni[at];
+                    memset(m2, 0, sizeof *m2);
+                    m2->op = X_MOV;
+                    m2->w = 1;
+                    m2->flags = MF_SPLIT;
+                    m2->d = cp[k].d;
+                    m2->s0 = cp[k].s;
+                    m2->s1 = m2->s2 = NOREG;
+                    m2->imm = cp[k].kind & SC_SAME ? 1 : 0;
+                    if (nloc)
+                        nloc[at] = mloc[i];
+                    at++;
+                }
+                ni[at] = mf.ins[i];
+                if (nloc)
+                    nloc[at] = mloc[i];
+                at++;
+            }
+            mb->first = nf;
+            mb->n = at - nf;
+        }
+        free(mf.ins);
+        mf.ins = ni;
+        mf.n = at;
+        mf.cap = nn + 1;
+        if (opt_debug) {
+            free(mloc);
+            mloc = nloc;
+            capmloc = nn + 1;
+        }
+        free(ihead);
+    }
+    if (getenv("MCC_SPLITLOG") && nsp)
+        fprintf(stderr, "reload split %s: %lu\n", intern_str(obj->syms[f->sym].name), (unsigned long)nsp);
+    free(cp);
+    free(first);
+    free(cidx);
+    free(lin);
+    return nsp != 0;
+}
+#undef SPLIT_LIVE
+
 /* ---- live-range splitting at loops (after a first allocation) ----
    ra.c spills a whole interval: every read of a spilled register is a load, also in the loops where it is read most.
    A spilled register that a loop reads but does not write gets a register of its own for that loop: a copy at the end
@@ -5978,12 +6214,6 @@ static int split_dominates(u32 a, u32 b)
         b = idom[b];
     return b == a;
 }
-
-typedef struct SplitCp {
-    u32 kind; /* SC_TAIL: at the end of block at; SC_HEAD: at its head; SC_EDGE: in the new block at; | SC_SAME */
-    u32 at, d, s;
-} SplitCp;
-enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100 };
 
 static int split_loops(void)
 {
@@ -6104,53 +6334,7 @@ static int split_loops(void)
     nuse = (u32 *)xmalloc((nv0 + 1) * 3 * sizeof(u32));
     ndef = nuse + nv0 + 1;
     cidx = ndef + nv0 + 1;
-    /* the candidates: spilled scalar registers; which of them are live into each block (as the function is now: a
-       register's liveness outside a loop is not changed by renaming it inside) */
-    for (i = 0; i < nv0; i++) {
-        u32 l = mf.loc[i];
-        cidx[i] = l != NOREG && l >= SPILL0 && !(mf.vclass[i] & ~0x11) ? nc++ : NOREG;
-    }
-    words = (nc + 63) / 64;
-    lin = (u64 *)xmalloc(((size_t)nb * words * 3 + 1) * sizeof(u64));
-    memset(lin, 0, ((size_t)nb * words * 3 + 1) * sizeof(u64));
-    {
-        u64 *gen = lin + (size_t)nb * words, *kill = gen + (size_t)nb * words;
-        int ch;
-        for (b = 0; b < nb && nc; b++) {
-            MBlock *mb = &mf.blk[b];
-            u64 *g = gen + (size_t)b * words, *kl = kill + (size_t)b * words;
-            for (i = mb->first; i < mb->first + mb->n; i++) {
-                MIns *in = &mf.ins[i];
-                u32 r[3], q, c;
-                r[0] = in->s0;
-                r[1] = in->s1;
-                r[2] = in->s2;
-                for (q = 0; q < 3; q++)
-                    if (r[q] != NOREG && r[q] >= VREG0 && r[q] - VREG0 < nv0 && (c = cidx[r[q] - VREG0]) != NOREG &&
-                        !(kl[c >> 6] >> (c & 63) & 1))
-                        g[c >> 6] |= (u64)1 << (c & 63);
-                if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0 && (c = cidx[in->d - VREG0]) != NOREG)
-                    kl[c >> 6] |= (u64)1 << (c & 63);
-            }
-        }
-        do {
-            ch = 0;
-            for (b = nb; b-- > 0 && nc;) {
-                MBlock *mb = &mf.blk[b];
-                u64 *in = lin + (size_t)b * words, *g = gen + (size_t)b * words, *kl = kill + (size_t)b * words;
-                for (i = 0; i < words; i++) {
-                    u64 out = 0, nw;
-                    for (k = 0; k < mb->nsucc; k++)
-                        out |= lin[(size_t)mb->succ[k] * words + i];
-                    nw = g[i] | (out & ~kl[i]);
-                    if (nw != in[i]) {
-                        in[i] = nw;
-                        ch = 1;
-                    }
-                }
-            }
-        } while (ch);
-    }
+    lin = spill_live(nv0, cidx, &nc, &words);
 #define SPLIT_LIVE(v, blk) (lin[(size_t)(blk) * words + (cidx[v] >> 6)] >> (cidx[v] & 63) & 1)
     {
         /* the copies to make (SplitCp), the blocks to make on the ways out of loops (their targets in es), and
@@ -6530,6 +6714,10 @@ void x64_gen(Func *fn, Obj *o)
         if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
             int rounds = getenv("MCC_SPLITROUNDS") ? atoi(getenv("MCC_SPLITROUNDS")) : 1, r, ch = 0;
             for (r = 0; r < rounds && split_loops(); r++) {
+                ra_rerun(&mf, &t);
+                ch = 1;
+            }
+            if (!getenv("MCC_NORSPLIT") && split_reloads()) {
                 ra_rerun(&mf, &t);
                 ch = 1;
             }

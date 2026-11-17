@@ -200,6 +200,7 @@ int ptx_single_trip(Func *f); /* device code: loops that run at most once lose t
 extern int opt_nostrip, opt_noldcomb;
 
 int ir_is_const(Func *f, u32 v, u64 *val); /* integer constant */
+int ir_eval_with(Func *f, u32 v, u32 x, u64 k, int depth, u64 *out); /* v if x were the constant k */
 u64 ir_umax32(Func *f, u32 v);             /* a bound of the 32-bit v read as unsigned (0xffffffff: none known) */
 int ir_is_fconst(Func *f, u32 v, double *val);
 

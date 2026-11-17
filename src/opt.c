@@ -4,6 +4,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* x == k ? c : e (or x != k ? e : c) where e is c when x is k: the value e, 0 if the select v is not one.
+   n == 32 ? 0xffffffff : (1 << n) - 1, in 64 bits, is a bit reader's mask. */
+static u32 select_same(Func *f, u32 v)
+{
+    Ins *i = &f->ins[v], *ci = &f->ins[i->a];
+    u32 arm, other;
+    u64 kk, want, got;
+    if ((i->ty != IT_I32 && i->ty != IT_I64) || (ci->op != OP_EQ && ci->op != OP_NE) || !ir_is_const(f, ci->b, &kk) ||
+        getenv("MCC_NOSELSAME"))
+        return 0;
+    arm = ci->op == OP_EQ ? i->b : i->c;
+    other = ci->op == OP_EQ ? i->c : i->b;
+    if (!ir_is_const(f, arm, &want) || ir_is_const(f, other, &got) ||
+        !ir_eval_with(f, other, ir_resolve(f, ci->a), kk, 5, &got))
+        return 0;
+    return (i->ty == IT_I64 ? got == want : (u32)got == (u32)want) ? other : 0;
+}
+
 static Func *f;
 
 /* ---- CFG orderings and dominators ---- */
@@ -588,6 +606,8 @@ static void gvn(void)
                 u64 cv;
                 if (ir_is_const(f, i->a, &cv)) {
                     ir_replace(f, v, cv ? i->b : i->c);
+                } else if (select_same(f, v)) {
+                    ir_replace(f, v, select_same(f, v));
                 } else if (i->b == i->c) {
                     ir_replace(f, v, i->b);
                 } else if (i->ty == IT_I32 && ir_is_bool(f, i->a, 3)) {

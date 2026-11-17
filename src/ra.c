@@ -201,7 +201,7 @@ void ra_rerun(MFunc *m, const MTarget *t)
         capprev = n * 2 + 1;
         prev = (u32 *)xrealloc(prev, capprev * sizeof(u32));
     }
-    if (n)
+    if (n && dense_map != prev)
         memcpy(prev, dense_map, n * sizeof(u32));
     ra_run(m, t); /* dense_map: the first run's numbers -> the second's */
     for (k = 0; k < n; k++)

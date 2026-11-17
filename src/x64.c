@@ -122,6 +122,8 @@ static const MTarget target = {
     X_MOV
 };
 
+static int vex3; /* scalar float arithmetic as AVX's three-operand instructions (-mavx; MCC_NOVEX3: the SSE ones) */
+
 static const u8 arg_gr[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 static Func *f;
@@ -142,6 +144,7 @@ static u32 *vuses;     /* ... of them as a value (not the condition of a branch 
 #define BR2_MAX 8     /* (at most so many comparisons) */
 #define FUSE_DIVR 11 /* quotient or remainder that an earlier division of the same operands in its block also gave */
 #define FUSE_FMA 12  /* a product that its one user, a sum or difference, takes into one vfmadd (-ffp-contract) */
+#define FUSE_BZHI 13 /* (1 << n) - 1 and its shift, used once, by an and: BMI2 bzhi there */
 static u32 br2_leaves(u32 v, int op, u32 *lv, u32 n, int check, u32 blk);
 static u32 div_pair(u32 v, int first);
 #define FUSE_NOT 0x80 /* while counting uses: the value is used as a value */
@@ -2275,6 +2278,12 @@ static void sel_ins(u32 v)
         if (fused[v])
             return;
         op = i->op == OP_AND ? X_AND : i->op == OP_OR ? X_OR : X_XOR;
+        if (i->op == OP_AND && (fused[i->a] == FUSE_BZHI || fused[i->b] == FUSE_BZHI)) {
+            u32 mk = fused[i->a] == FUSE_BZHI ? i->a : i->b, x = mk == i->a ? i->b : i->a;
+            u32 n = f->ins[f->ins[mk].a].b;
+            emit_vex(VE(0xf5, 2, 0, w), XF_RVM, d, reg_of(n), reg_of(x), NOREG, -1); /* bzhi d, x, n */
+            return;
+        }
         if (const_of(i->b, &c)) {
             if (i->op == OP_AND && w && c == 0xffffffffL) {
                 emit(X_MOVZXD, 0, d, reg_of(i->a), NOREG);
@@ -2456,6 +2465,21 @@ static void sel_ins(u32 v)
                 emit(lt ? X_FMAX : X_FMIN, w, d, reg_of(c->b), reg_of(c->a));
                 return;
             }
+        }
+        if (vex3 && is_fp(i->ty) && f->ins[i->a].op >= OP_FEQ && f->ins[i->a].op <= OP_FGE && fused[i->a] == FUSE_CMP &&
+            f->ins[f->ins[i->a].a].ty == i->ty && !getenv("MCC_NOFBLEND")) {
+            /* a float chosen by a comparison of floats of its width: the comparison as a mask (vcmpss / sd, the quiet
+               predicates: what ucomiss tests), then vblendvps / pd. No branch round a copy. */
+            static const u8 pred[6] = { 0x00, 0x04, 0x11, 0x12, 0x1e, 0x1d }; /* eq_oq neq_uq lt_oq le_oq gt_oq ge_oq */
+            Ins *c = &f->ins[i->a];
+            u32 mask = new_vreg(1), ca, cb;
+            rb = reg_of(i->b);
+            rc = reg_of(i->c);
+            ca = reg_of(c->a);
+            cb = reg_of(c->b);
+            emit_vex(VE(0xc2, 1, w ? 3 : 2, 0), XF_RVM, mask, ca, cb, NOREG, pred[c->op - OP_FEQ]);
+            emit_vex(VE(w ? 0x4b : 0x4a, 3, 1, 0), XF_RVMR, d, rc, rb, mask, -1);
+            return;
         }
         rb = reg_of(i->b);
         rc = reg_of(i->c);
@@ -3336,6 +3360,38 @@ static void prepare(void)
             if (y && reg_value(y == i->b ? i->a : i->b) && reg_value(f->ins[y].a))
                 fused[y] = FUSE_SKIP;
         }
+    /* BMI2: x & ((1 << n) - 1) is bzhi x, n (a bit reader's "low n bits": one instruction for five).
+       After the other fusions: an and that is a test or done in memory stays one. A count the
+       shift is not defined for (n >= the width) is the only place they differ. MCC_NOBZHI: off */
+    for (k = 0; opt_x64_bmi2 && !getenv("MCC_NOBZHI") && k < nlayout; k++)
+        for (v = f->blk[layout[k]].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 side;
+            if (i->op != OP_AND || fused[v] || (i->ty != IT_I32 && i->ty != IT_I64))
+                continue;
+            for (side = 0; side < 2; side++) {
+                u32 mk = side ? i->b : i->a, sh;
+                Ins *mi = &f->ins[mk];
+                i64 c1;
+                if (mi->op != OP_ADD || mi->ty != i->ty || uses[mk] != 1 || fused[mk] || !mi->blk || !const_of(mi->b, &c1) || c1 != -1)
+                    continue;
+                sh = mi->a;
+                if (f->ins[sh].op != OP_SHL || f->ins[sh].ty != i->ty || uses[sh] != 1 || fused[sh] || !f->ins[sh].blk ||
+                    !const_of(f->ins[sh].a, &c1) || c1 != 1 || const_of(f->ins[sh].b, &c1) || i->a == i->b)
+                    continue;
+                {
+                    /* the word and the count are read from registers here: a load that was to be the and's memory
+                       operand is one of its own again */
+                    u32 x = side ? i->a : i->b, n = f->ins[sh].b;
+                    if ((fused[n] && fused[n] != FUSE_ALIAS) || (fused[x] && fused[x] != FUSE_ALIAS && fused[x] != FUSE_LOAD))
+                        continue;
+                    if (fused[x] == FUSE_LOAD)
+                        fused[x] = 0;
+                }
+                fused[mk] = fused[sh] = FUSE_BZHI;
+                break;
+            }
+        }
     /* x / y and x % y in one block: one div gives both (i / sy, i % sy of the index -> coordinates idiom) */
     for (k = 0; k < nlayout; k++)
         for (v = f->blk[layout[k]].first; v; v = f->ins[v].next)
@@ -4061,6 +4117,29 @@ static void bin_fp(MIns *i, u32 opc, int commut)
 {
     u32 al = loc_of(i->s0), bl = loc_of(i->s1), dr = dst(i->d, FSCR0);
     u32 op = (i->w ? O_F2 : O_F3) | O_0F | opc;
+    if (vex3) {
+        /* AVX: d = a op b in one instruction, whichever registers they are in (no copy of a first) */
+        u32 enc = opc | 1u << 8 | (i->w ? 3u : 2u) << 10;
+        EA ea;
+        if (is_spill(al) && commut && !is_spill(bl)) {
+            u32 t = al;
+            al = bl;
+            bl = t;
+        }
+        if (is_spill(al)) {
+            u32 t = bl == dr ? FSCR1 : dr;
+            mov_loc(t, al);
+            al = t;
+        }
+        if (is_spill(bl)) {
+            ea_spill(&ea, bl);
+            vex_mem(enc, dr, al, &ea, 0);
+        } else {
+            vex_rr(enc, dr, al, bl);
+        }
+        fin(i->d, dr);
+        return;
+    }
     if (bl == dr && al != dr) {
         if (commut) {
             bl = al;
@@ -4099,6 +4178,15 @@ static void bin_mem(MIns *i, u32 opc, int fp)
     mem_ea(i, b, x, i->imm, &ea);
     if (fp) {
         dr = dst(i->d, FSCR0);
+        if (vex3) {
+            if (is_spill(al)) {
+                mov_loc(dr, al);
+                al = dr;
+            }
+            vex_mem(opc | 1u << 8 | (i->w ? 3u : 2u) << 10, dr, al, &ea, 0);
+            fin(i->d, dr);
+            return;
+        }
         if (al != dr)
             mov_loc(dr, al);
         op_mem((i->w ? O_F2 : O_F3) | O_0F | opc, 0, dr, &ea, 0);
@@ -4616,23 +4704,28 @@ static void encode(MIns *i)
         fin(i->d, dr);
         return;
     case X_GATHER: {
-        u32 enc = (u32)i->imm, base, idx;
+        u32 enc = (u32)i->imm, base, idx, g = loc_of(i->d);
+        /* straight into the result's register unless that is the index's (the three must differ) */
+        if (is_spill(g) || g == loc_of(i->s2) || getenv("MCC_NOGATHERD"))
+            g = FSCR0;
         if (!i->w)
             vex_rr(0x576 | (enc & 0x2000u), FSCR1, FSCR1, FSCR1); /* every lane */
-        if (i->s0 != NOREG)
-            mov_locw(FSCR0, loc_of(i->s0), vw_of(i->s0));
-        else
-            vex_rr(0x5ef, FSCR0, FSCR0, FSCR0);
+        if (i->s0 != NOREG) {
+            if (loc_of(i->s0) != g)
+                mov_locw(g, loc_of(i->s0), vw_of(i->s0));
+        } else {
+            vex_rr(0x5ef, g, g, g);
+        }
         idx = xuse(i->s2, 2);
         base = use(i->s1, SCR0);
         ea_base(&ea, base, 0);
         ea.idx = idx;
         ea.scale = i->cc == 1 ? 0 : i->cc == 2 ? 1 : i->cc == 4 ? 2 : 3;
-        vex_mem(enc, FSCR0, FSCR1, &ea, 0);
+        vex_mem(enc, g, FSCR1, &ea, 0);
         if (is_spill(loc_of(i->d)))
             fin(i->d, FSCR0);
-        else
-            vmov_rr(loc_of(i->d), FSCR0, vw_of(i->d));
+        else if (g != loc_of(i->d))
+            vmov_rr(loc_of(i->d), g, vw_of(i->d));
         return;
     }
     case X_KMOVK:
@@ -5886,10 +5979,17 @@ static int split_dominates(u32 a, u32 b)
     return b == a;
 }
 
+typedef struct SplitCp {
+    u32 kind; /* SC_TAIL: at the end of block at; SC_HEAD: at its head; SC_EDGE: in the new block at; | SC_SAME */
+    u32 at, d, s;
+} SplitCp;
+enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100 };
+
 static int split_loops(void)
 {
-    u32 nb = mf.nblk, b, k, i, *npred, *pred, *pstart, *body, *stack, sp, nsplit = 0, nv0 = mf.nvreg, h;
-    u32 *newv, *useblk;
+    u32 nb = mf.nblk, b, k, i, *npred, *pred, *pstart, *body, *stack, sp, nsplit = 0, nback = 0, nv0 = mf.nvreg, h;
+    u32 *nuse, *ndef, *cidx, nc = 0, words;
+    u64 *lin;
     u8 *inb;
     int any = 0;
     if (getenv("MCC_SPLITLOG") && atoi(getenv("MCC_SPLITLOG")) == 3 && mf.nspill) {
@@ -6001,17 +6101,72 @@ static int split_loops(void)
         } while (ch);
         free(it);
     }
-    newv = (u32 *)xmalloc((nv0 + 1) * sizeof(u32));
-    useblk = (u32 *)xmalloc((nv0 + 1) * sizeof(u32));
-    /* the copies to insert: (block, register, new register), applied at the end */
+    nuse = (u32 *)xmalloc((nv0 + 1) * 3 * sizeof(u32));
+    ndef = nuse + nv0 + 1;
+    cidx = ndef + nv0 + 1;
+    /* the candidates: spilled scalar registers; which of them are live into each block (as the function is now: a
+       register's liveness outside a loop is not changed by renaming it inside) */
+    for (i = 0; i < nv0; i++) {
+        u32 l = mf.loc[i];
+        cidx[i] = l != NOREG && l >= SPILL0 && !(mf.vclass[i] & ~0x11) ? nc++ : NOREG;
+    }
+    words = (nc + 63) / 64;
+    lin = (u64 *)xmalloc(((size_t)nb * words * 3 + 1) * sizeof(u64));
+    memset(lin, 0, ((size_t)nb * words * 3 + 1) * sizeof(u64));
     {
-        u32 cap = 64, ncp = 0, *cp = (u32 *)xmalloc(cap * 3 * sizeof(u32));
-        u32 *order = (u32 *)xmalloc(nb * sizeof(u32)), no = 0, oi;
-        /* inner loops first: a loop's header after the headers of loops inside it in reverse postorder, so the
-           headers latest in it come first */
-        for (k = split_nrpo; k-- > 0;)
+        u64 *gen = lin + (size_t)nb * words, *kill = gen + (size_t)nb * words;
+        int ch;
+        for (b = 0; b < nb && nc; b++) {
+            MBlock *mb = &mf.blk[b];
+            u64 *g = gen + (size_t)b * words, *kl = kill + (size_t)b * words;
+            for (i = mb->first; i < mb->first + mb->n; i++) {
+                MIns *in = &mf.ins[i];
+                u32 r[3], q, c;
+                r[0] = in->s0;
+                r[1] = in->s1;
+                r[2] = in->s2;
+                for (q = 0; q < 3; q++)
+                    if (r[q] != NOREG && r[q] >= VREG0 && r[q] - VREG0 < nv0 && (c = cidx[r[q] - VREG0]) != NOREG &&
+                        !(kl[c >> 6] >> (c & 63) & 1))
+                        g[c >> 6] |= (u64)1 << (c & 63);
+                if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0 && (c = cidx[in->d - VREG0]) != NOREG)
+                    kl[c >> 6] |= (u64)1 << (c & 63);
+            }
+        }
+        do {
+            ch = 0;
+            for (b = nb; b-- > 0 && nc;) {
+                MBlock *mb = &mf.blk[b];
+                u64 *in = lin + (size_t)b * words, *g = gen + (size_t)b * words, *kl = kill + (size_t)b * words;
+                for (i = 0; i < words; i++) {
+                    u64 out = 0, nw;
+                    for (k = 0; k < mb->nsucc; k++)
+                        out |= lin[(size_t)mb->succ[k] * words + i];
+                    nw = g[i] | (out & ~kl[i]);
+                    if (nw != in[i]) {
+                        in[i] = nw;
+                        ch = 1;
+                    }
+                }
+            }
+        } while (ch);
+    }
+#define SPLIT_LIVE(v, blk) (lin[(size_t)(blk) * words + (cidx[v] >> 6)] >> (cidx[v] & 63) & 1)
+    {
+        /* the copies to make (SplitCp), the blocks to make on the ways out of loops (their targets in es), and
+           which branches go through them (rb -> rs by way of re) */
+        u32 cap = 64, ncp = 0, ecap = 16, ne = 0, rcap = 16, nr2 = 0;
+        SplitCp *cp = (SplitCp *)xmalloc(cap * sizeof(SplitCp));
+        u32 *es = (u32 *)xmalloc(ecap * sizeof(u32)), *rb = (u32 *)xmalloc(rcap * 3 * sizeof(u32));
+        u32 *order = (u32 *)xmalloc(nb * sizeof(u32) * 3), *xs = order + nb, *xe = xs + nb, no = 0, oi, nx;
+        int wsplit = !getenv("MCC_NOWSPLIT");
+        /* outer loops first (a loop's header comes before those of the loops inside it in reverse postorder): a
+           register gets the widest loop it can be held over, and no loop inside sees it again in this round (the
+           copies back on the ways out assume that). If it is spilled there too, a further round
+           (MCC_SPLITROUNDS=N) looks at the loops inside: on ufsm's CPU suite that gains nothing over one. */
+        for (k = 0; k < split_nrpo; k++)
             order[no++] = rpo_lst[k];
-        for (oi = 0; oi < no; oi++) {
+        for (oi = 0; oi < no && nc; oi++) {
             u32 nbody = 0, pre = NOREG, nout = 0, j, ok = 1, inner = 1;
             h = order[oi];
             /* back edges into h: from a block at or after it in the layout */
@@ -6058,7 +6213,6 @@ static int split_loops(void)
                 fprintf(stderr, "loop %s h%lu nbody %lu ok %d nout %lu inner %d presucc %d\n", intern_str(obj->syms[f->sym].name),
                         (unsigned long)h, (unsigned long)nbody, (int)ok, (unsigned long)nout, inner,
                         pre == NOREG ? -1 : (int)mf.blk[pre].nsucc);
-            (void)inner;
             /* (an entry block that also goes elsewhere is often the test before a loop that seldom runs, a refill
                in a decoder's token loop: copies there run every time) */
             if (!ok || nout != 1 || nbody > SPLIT_MAXLOOP || mf.blk[pre].nsucc != 1)
@@ -6067,9 +6221,10 @@ static int split_loops(void)
                 continue;
             if (getenv("MCC_SPLITMAXB") && nbody > (u32)atoi(getenv("MCC_SPLITMAXB")))
                 continue;
-            /* spilled scalar registers read and not written in the loop */
+            /* how often the loop reads and writes each register; where it leaves for */
             for (i = 0; i < nv0; i++)
-                useblk[i] = 0;
+                nuse[i] = ndef[i] = 0;
+            nx = 0;
             for (j = 0; j < nbody; j++) {
                 MBlock *mb = &mf.blk[body[j]];
                 for (i = mb->first; i < mb->first + mb->n; i++) {
@@ -6079,26 +6234,80 @@ static int split_loops(void)
                     r[1] = in->s1;
                     r[2] = in->s2;
                     for (q = 0; q < 3; q++)
-                        if (r[q] != NOREG && r[q] >= VREG0 && r[q] - VREG0 < nv0 && useblk[r[q] - VREG0] != 0xffffffffU)
-                            useblk[r[q] - VREG0]++;
+                        if (r[q] != NOREG && r[q] >= VREG0 && r[q] - VREG0 < nv0)
+                            nuse[r[q] - VREG0]++;
                     if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0)
-                        useblk[in->d - VREG0] = 0xffffffffU;
+                        ndef[in->d - VREG0]++;
+                }
+                for (k = 0; k < mb->nsucc; k++) {
+                    u32 s2 = mb->succ[k], q;
+                    if (inb[s2])
+                        continue;
+                    for (q = 0; q < nx && xs[q] != s2; q++)
+                        ;
+                    if (q == nx) {
+                        xs[nx] = s2;
+                        xe[nx++] = NOREG;
+                    }
                 }
             }
             for (i = 0; i < nv0; i++) {
-                u32 l = mf.loc[i], nr;
-                if (!useblk[i] || useblk[i] == 0xffffffffU || l == NOREG || l < SPILL0 || (mf.vclass[i] & ~0x11))
+                u32 nr, q, liveout = 0;
+                int wr = ndef[i] != 0;
+                if ((!nuse[i] && !wr) || cidx[i] == NOREG || (wr && !wsplit))
                     continue;
+                for (q = 0; q < nx; q++)
+                    liveout += (u32)SPLIT_LIVE(i, xs[q]);
+                if (wr && !liveout && !SPLIT_LIVE(i, h))
+                    continue; /* (lives inside the loop only: nothing to split off) */
                 nr = new_vreg(mf.vclass[i]);
-                newv[i] = nr;
-                if (ncp == cap) {
-                    cap *= 2;
-                    cp = (u32 *)xrealloc(cp, cap * 3 * sizeof(u32));
+                if (ncp + nx + 1 > cap) {
+                    cap = cap * 2 + nx + 1;
+                    cp = (SplitCp *)xrealloc(cp, cap * sizeof(SplitCp));
                 }
-                cp[ncp * 3] = pre;
-                cp[ncp * 3 + 1] = VREG0 + i;
-                cp[ncp * 3 + 2] = nr;
-                ncp++;
+                if (!wr || SPLIT_LIVE(i, h)) {
+                    /* the loop's own register, set on the way in. One the loop does not write that lives on after it
+                       holds the same value as the old one all through: if both go to memory, one slot will do */
+                    cp[ncp].kind = SC_TAIL | (!wr && liveout ? SC_SAME : 0);
+                    cp[ncp].at = pre;
+                    cp[ncp].d = nr;
+                    cp[ncp++].s = VREG0 + i;
+                }
+                for (q = 0; q < nx && wr; q++) {
+                    /* written in the loop: back to the old register on each way out where it is still wanted. At
+                       the head of the block there if only this loop comes to it, else in a block of its own that
+                       the loop's branches to it are sent through */
+                    u32 s2 = xs[q], allin = 1;
+                    if (!SPLIT_LIVE(i, s2))
+                        continue;
+                    for (k = pstart[s2]; k < pstart[s2 + 1]; k++)
+                        if (!inb[pred[k]])
+                            allin = 0;
+                    if (!allin && xe[q] == NOREG) {
+                        if (ne == ecap) {
+                            ecap *= 2;
+                            es = (u32 *)xrealloc(es, ecap * sizeof(u32));
+                        }
+                        es[ne] = s2;
+                        xe[q] = ne++;
+                        for (j = 0; j < nbody; j++)
+                            for (k = 0; k < mf.blk[body[j]].nsucc; k++)
+                                if (mf.blk[body[j]].succ[k] == s2 && !(k == 1 && mf.blk[body[j]].succ[0] == s2)) {
+                                    if (nr2 == rcap) {
+                                        rcap *= 2;
+                                        rb = (u32 *)xrealloc(rb, rcap * 3 * sizeof(u32));
+                                    }
+                                    rb[nr2 * 3] = body[j];
+                                    rb[nr2 * 3 + 1] = s2;
+                                    rb[nr2++ * 3 + 2] = xe[q];
+                                }
+                    }
+                    cp[ncp].kind = allin ? SC_HEAD : SC_EDGE;
+                    cp[ncp].at = allin ? s2 : xe[q];
+                    cp[ncp].d = VREG0 + i;
+                    cp[ncp++].s = nr;
+                    nback++;
+                }
                 nsplit++;
                 for (j = 0; j < nbody; j++) {
                     MBlock *mb = &mf.blk[body[j]];
@@ -6111,85 +6320,182 @@ static int split_loops(void)
                             in->s1 = nr;
                         if (in->s2 == VREG0 + i)
                             in->s2 = nr;
+                        if (in->d == VREG0 + i)
+                            in->d = nr;
                     }
                 }
             }
         }
-        free(order);
         if (ncp) {
-            /* insert: each copy at the end of its block, before a closing jump; blocks in order, so one pass from
-               the back moves every instruction once */
-            u32 nn = mf.n + ncp, at, c;
-            u32 *cnt = (u32 *)xmalloc(nb * sizeof(u32));
-            memset(cnt, 0, nb * sizeof(u32));
-            for (c = 0; c < ncp; c++)
-                cnt[cp[c * 3]]++;
-            if (nn > mf.cap) {
-                mf.cap = nn + 64;
-                mf.ins = (MIns *)xrealloc(mf.ins, mf.cap * sizeof(MIns));
+            /* The function written out again: before each block the new blocks on the ways to it (the one the
+               block before falls into first; each ends with a jump unless the block follows it), the block's
+               copies at its head, and those at its end before its closing jumps. Branches name blocks by their
+               new numbers. */
+            u32 nn = 0, cnn = mf.n + ncp + ne + nb + 1, nnb = nb + ne, *newidx, *eidx, *efirst, bn = 0, c, e, x;
+            MIns *ni = (MIns *)xmalloc(cnn * sizeof(MIns));
+            MBlock *nblk = (MBlock *)xmalloc((nnb + 1) * sizeof(MBlock));
+            u32 *nloc = opt_debug ? (u32 *)xmalloc(cnn * sizeof(u32)) : 0;
+            newidx = (u32 *)xmalloc((nb + 2 * ne + nb + 1) * sizeof(u32));
+            eidx = newidx + nb;
+            efirst = eidx + ne; /* per block: the new block the one before it falls into, if any */
+            for (b = 0; b < nb; b++) {
+                efirst[b] = NOREG;
+                if (b && mf.blk[b - 1].nsucc && mf.blk[b - 1].n && mf.ins[mf.blk[b - 1].first + mf.blk[b - 1].n - 1].op != X_JMP)
+                    for (k = 0; k < nr2; k++)
+                        if (rb[k * 3] == b - 1 && rb[k * 3 + 1] == b)
+                            efirst[b] = rb[k * 3 + 2];
             }
-            if (opt_debug && nn > capmloc) {
-                capmloc = mf.cap;
-                mloc = (u32 *)xrealloc(mloc, capmloc * sizeof(u32));
+            for (b = 0; b < nb; b++) {
+                if (efirst[b] != NOREG)
+                    eidx[efirst[b]] = bn++;
+                for (e = 0; e < ne; e++)
+                    if (es[e] == b && e != efirst[b])
+                        eidx[e] = bn++;
+                newidx[b] = bn++;
             }
-            at = nn;
-            for (b = nb; b-- > 0;) {
-                MBlock *mb = &mf.blk[b];
-                u32 end = mb->first + mb->n, tail = end, x;
-                /* before the closing jumps (a copy changes no flags) */
-                while (cnt[b] && tail > mb->first && (mf.ins[tail - 1].op == X_JMP || mf.ins[tail - 1].op == X_JCC))
-                    tail--;
-                for (x = end; x-- > tail;) {
-                    at--;
-                    mf.ins[at] = mf.ins[x];
-                    if (opt_debug)
-                        mloc[at] = mloc[x];
-                }
-                if (cnt[b]) {
-                    u32 lc = opt_debug && end > mb->first ? mloc[end - 1] : 0;
-                    for (c = ncp; c-- > 0;) {
-                        MIns *m2;
-                        if (cp[c * 3] != b)
+#define SPLIT_PUT(dd, ss, same, lc) \
+    do { \
+        MIns *m2 = &ni[nn]; \
+        memset(m2, 0, sizeof *m2); \
+        m2->op = X_MOV; \
+        m2->w = 1; \
+        m2->flags = MF_SPLIT; \
+        m2->d = (dd); \
+        m2->s0 = (ss); \
+        m2->s1 = m2->s2 = NOREG; \
+        m2->imm = (same); \
+        if (nloc) \
+            nloc[nn] = (lc); \
+        nn++; \
+    } while (0)
+            for (b = 0; b < nb; b++) {
+                MBlock ob = mf.blk[b], *mb;
+                u32 end = ob.first + ob.n, tail = end, lc0 = opt_debug && ob.n ? mloc[ob.first] : 0, pass, ntail = 0, ft;
+                for (pass = 0; pass < 2; pass++)
+                    for (e = 0; e < ne; e++) {
+                        if (es[e] != b || (pass == 0) != (e == efirst[b]))
                             continue;
-                        at--;
-                        m2 = &mf.ins[at];
+                        mb = &nblk[eidx[e]];
+                        mb->first = nn;
+                        for (c = 0; c < ncp; c++)
+                            if ((cp[c].kind & 0xff) == SC_EDGE && cp[c].at == e)
+                                SPLIT_PUT(cp[c].d, cp[c].s, 0, lc0);
+                        if (eidx[e] + 1 != newidx[b]) {
+                            MIns *m2 = &ni[nn];
+                            memset(m2, 0, sizeof *m2);
+                            m2->op = X_JMP;
+                            m2->d = m2->s0 = m2->s1 = m2->s2 = NOREG;
+                            m2->imm = newidx[b];
+                            if (nloc)
+                                nloc[nn] = lc0;
+                            nn++;
+                        }
+                        mb->n = nn - mb->first;
+                        mb->nsucc = 1;
+                        mb->succ[0] = newidx[b];
+                        mb->succ[1] = 0;
+                        mb->freq = ob.freq;
+                    }
+                mb = &nblk[newidx[b]];
+                *mb = ob;
+                mb->first = nn;
+                for (c = 0; c < ncp; c++)
+                    if ((cp[c].kind & 0xff) == SC_HEAD && cp[c].at == b)
+                        SPLIT_PUT(cp[c].d, cp[c].s, 0, lc0);
+                for (c = 0; c < ncp; c++)
+                    if ((cp[c].kind & 0xff) == SC_TAIL && cp[c].at == b)
+                        ntail++;
+                /* before the closing jumps (a copy changes no flags) */
+                while (ntail && tail > ob.first && (mf.ins[tail - 1].op == X_JMP || mf.ins[tail - 1].op == X_JCC))
+                    tail--;
+                for (x = ob.first; x < end; x++) {
+                    if (x == tail)
+                        for (c = 0; c < ncp; c++)
+                            if ((cp[c].kind & 0xff) == SC_TAIL && cp[c].at == b)
+                                SPLIT_PUT(cp[c].d, cp[c].s, cp[c].kind & SC_SAME ? 1 : 0, opt_debug && end > ob.first ? mloc[end - 1] : 0);
+                    ni[nn] = mf.ins[x];
+                    if (nloc)
+                        nloc[nn] = mloc[x];
+                    if (ni[nn].op == X_JMP || ni[nn].op == X_JCC) {
+                        u32 tg = (u32)ni[nn].imm, to = newidx[tg];
+                        for (k = 0; k < nr2; k++)
+                            if (rb[k * 3] == b && rb[k * 3 + 1] == tg)
+                                to = eidx[rb[k * 3 + 2]];
+                        ni[nn].imm = to;
+                    }
+                    nn++;
+                }
+                if (tail == end)
+                    for (c = 0; c < ncp; c++)
+                        if ((cp[c].kind & 0xff) == SC_TAIL && cp[c].at == b)
+                            SPLIT_PUT(cp[c].d, cp[c].s, cp[c].kind & SC_SAME ? 1 : 0, opt_debug && end > ob.first ? mloc[end - 1] : 0);
+                /* a block that ran on into the next one: if something else follows it now, a jump */
+                ft = NOREG;
+                if (b + 1 < nb && ob.nsucc && (!ob.n || mf.ins[end - 1].op != X_JMP) &&
+                    (ob.succ[0] == b + 1 || (ob.nsucc > 1 && ob.succ[1] == b + 1))) {
+                    ft = newidx[b + 1];
+                    for (k = 0; k < nr2; k++)
+                        if (rb[k * 3] == b && rb[k * 3 + 1] == b + 1)
+                            ft = eidx[rb[k * 3 + 2]];
+                    if (ft != newidx[b] + 1) {
+                        MIns *m2 = &ni[nn];
                         memset(m2, 0, sizeof *m2);
-                        m2->op = X_MOV;
-                        m2->w = 1;
-                        m2->flags = MF_SPLIT;
-                        m2->d = cp[c * 3 + 2];
-                        m2->s0 = cp[c * 3 + 1];
-                        m2->s1 = m2->s2 = NOREG;
-                        m2->sym = 0;
-                        if (opt_debug)
-                            mloc[at] = lc;
+                        m2->op = X_JMP;
+                        m2->d = m2->s0 = m2->s1 = m2->s2 = NOREG;
+                        m2->imm = ft;
+                        if (nloc)
+                            nloc[nn] = opt_debug && end > ob.first ? mloc[end - 1] : 0;
+                        nn++;
                     }
                 }
-                for (x = tail; x-- > mb->first;) {
-                    at--;
-                    mf.ins[at] = mf.ins[x];
-                    if (opt_debug)
-                        mloc[at] = mloc[x];
+                mb->n = nn - mb->first;
+                for (k = 0; k < ob.nsucc; k++) {
+                    u32 tg = ob.succ[k], to = newidx[tg], q;
+                    for (q = 0; q < nr2; q++)
+                        if (rb[q * 3] == b && rb[q * 3 + 1] == tg)
+                            to = eidx[rb[q * 3 + 2]];
+                    mb->succ[k] = to;
                 }
-                mb->first = at;
-                mb->n += cnt[b];
             }
+#undef SPLIT_PUT
+            if (nn > cnn)
+                die("internal: x86-64: loop splitting wrote too much in %s", f->name);
+            free(mf.ins);
+            mf.ins = ni;
             mf.n = nn;
-            free(cnt);
+            mf.cap = cnn;
+            if (opt_debug) {
+                free(mloc);
+                mloc = nloc;
+                capmloc = cnn;
+            }
+            if (mf.capblk < nnb) {
+                mf.capblk = nnb * 2;
+                mf.blk = (MBlock *)xrealloc(mf.blk, mf.capblk * sizeof(MBlock));
+            }
+            memcpy(mf.blk, nblk, nnb * sizeof(MBlock));
+            mf.nblk = nnb;
+            free(nblk);
+            free(newidx);
             any = 1;
         }
+        free(order);
         free(cp);
+        free(es);
+        free(rb);
     }
+#undef SPLIT_LIVE
     if (getenv("MCC_SPLITLOG") && nsplit)
-        fprintf(stderr, "split %s: %lu\n", intern_str(obj->syms[f->sym].name), (unsigned long)nsplit);
+        fprintf(stderr, "split %s: %lu (%lu copies back)\n", intern_str(obj->syms[f->sym].name), (unsigned long)nsplit,
+                (unsigned long)nback);
     free(npred);
     free(pred);
     free(inb);
     free(rpo_of);
     rpo_of = rpo_lst = idom = 0;
     split_nrpo = 0;
-    free(newv);
-    free(useblk);
+    free(nuse);
+    free(lin);
     return any;
 }
 
@@ -6207,6 +6513,7 @@ void x64_gen(Func *fn, Obj *o)
     if (getenv("MCC_DUMPIR") && strstr(intern_str(o->syms[fn->sym].name), getenv("MCC_DUMPIR")))
         ir_dump(fn); /* (debugging: the IR a function is selected from; --ir shows it before the whole-unit passes) */
     sel_loc = opt_debug ? dwarf_get_func_loc(f->sym) : 0;
+    vex3 = opt_avx && !getenv("MCC_NOVEX3");
     prepare();
     select_all();
     if (opt_nofpo < 0)
@@ -6220,16 +6527,26 @@ void x64_gen(Func *fn, Obj *o)
         if (fpo)
             t.allocatable[0] |= BIT(RBP);
         ra_run(&mf, &t);
-        if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT") && split_loops()) {
-            ra_rerun(&mf, &t);
-            /* a loop's copy that did not get a register either: the original's slot, which holds the same value all
-               through the loop, so the copy is no move at all */
-            for (k = 0; k < mf.n; k++) {
-                MIns *mi = &mf.ins[k];
-                if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->d >= VREG0 && mi->s0 != NOREG && mi->s0 >= VREG0 &&
-                    mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG && mf.loc[mi->s0 - VREG0] >= SPILL0 &&
-                    mf.loc[mi->s0 - VREG0] != NOREG)
-                    mf.loc[mi->d - VREG0] = mf.loc[mi->s0 - VREG0];
+        if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
+            int rounds = getenv("MCC_SPLITROUNDS") ? atoi(getenv("MCC_SPLITROUNDS")) : 1, r, ch = 0;
+            for (r = 0; r < rounds && split_loops(); r++) {
+                ra_rerun(&mf, &t);
+                ch = 1;
+            }
+            /* a loop's copy (of a register the loop only reads, alive after it) that did not get a register either:
+               the original's slot, which holds the same value all through the loop, so the copy is no move at all */
+            while (ch) {
+                ch = 0;
+                for (k = 0; k < mf.n; k++) {
+                    MIns *mi = &mf.ins[k];
+                    if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->imm == 1 && mi->d >= VREG0 && mi->s0 != NOREG &&
+                        mi->s0 >= VREG0 && mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG &&
+                        mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
+                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
+                        mf.loc[mi->d - VREG0] = mf.loc[mi->s0 - VREG0];
+                        ch = 1;
+                    }
+                }
             }
         }
     }

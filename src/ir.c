@@ -457,6 +457,47 @@ static int fold_int(int op, int w64, u64 x, u64 y, u64 *out)
     return 1;
 }
 
+/* What v comes to if x is the constant k: 1 and *out when a few steps of integer arithmetic tell (x == 32 ?
+   0xffffffff : (1 << x) - 1 is its second arm). I32 values sign-extended, as constants are kept. */
+int ir_eval_with(Func *f, u32 v, u32 x, u64 k, int depth, u64 *out)
+{
+    Ins *i;
+    u64 a, b, r;
+    v = ir_resolve(f, v);
+    i = &f->ins[v];
+    if (v == x) {
+        *out = i->ty == IT_I32 ? (u64)(i64)(i32)(u32)k : k;
+        return 1;
+    }
+    if (ir_is_const(f, v, out))
+        return i->ty == IT_I32 || i->ty == IT_I64;
+    if (!depth || (i->ty != IT_I32 && i->ty != IT_I64))
+        return 0;
+    switch (i->op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR: case OP_SAR:
+        if (!ir_eval_with(f, i->a, x, k, depth - 1, &a) || !ir_eval_with(f, i->b, x, k, depth - 1, &b) ||
+            ((i->op == OP_SHL || i->op == OP_SHR || i->op == OP_SAR) && b >= (i->ty == IT_I64 ? 64u : 32u)) ||
+            !fold_int(i->op, i->ty == IT_I64, a, b, &r))
+            return 0; /* (a count the shift is not defined for: the targets disagree) */
+        break;
+    case OP_ZEXT32:
+        if (!ir_eval_with(f, i->a, x, k, depth - 1, &a))
+            return 0;
+        r = (u64)(u32)a;
+        break;
+    case OP_SEXT32:
+    case OP_TRUNC:
+        if (!ir_eval_with(f, i->a, x, k, depth - 1, &a))
+            return 0;
+        r = a;
+        break;
+    default:
+        return 0;
+    }
+    *out = i->ty == IT_I32 ? (u64)(i64)(i32)(u32)r : r;
+    return 1;
+}
+
 static u64 log2u64(u64 v)
 {
     u64 n = 0;

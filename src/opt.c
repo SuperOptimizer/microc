@@ -466,6 +466,36 @@ static void mem_kill(u32 addr, int mem)
 }
 
 /* After a call: what is known of memory the callee cannot reach stays known. */
+/* After a call of a library function that writes nothing but errno (IF_NOWRITE): what is in a local or a named
+   global other than errno itself is as it was. (ufsm's wind fixture: a getenv between two hypot calls of the same
+   sums of a global made the second one a call again: 1.5 times clang's instructions in hypot and atan2.)
+   MCC_NONOWRITE: such a call is like any other. */
+static int opt_nonowrite = -1;
+
+static int call_nowrite(const Ins *i)
+{
+    if (opt_nonowrite < 0)
+        opt_nonowrite = getenv("MCC_NONOWRITE") != 0;
+    return al_on && !opt_nonowrite && (i->flags & (IF_NOWRITE | IF_SRET | IF_ASM | IF_ATOMIC | IF_ALLOCA)) == IF_NOWRITE;
+}
+
+static int nowrite_spares(u32 addr)
+{
+    const Ins *r = &f->ins[root_of(addr, 0)];
+    if (r->op == OP_SLOT)
+        return 1;
+    return r->op == OP_ADDR && opt_obj->syms[r->a].name && strcmp(intern_str(opt_obj->syms[r->a].name), "errno") != 0;
+}
+
+static void mem_kill_nowrite(void)
+{
+    u32 k, n = 0;
+    for (k = 0; k < nmem; k++)
+        if (nowrite_spares(mem_tab[k].addr))
+            mem_tab[n++] = mem_tab[k];
+    nmem = n;
+}
+
 static void mem_kill_call(void)
 {
     u32 k, n = 0;
@@ -542,7 +572,7 @@ static void mem_kill_used(u32 addr, int mem, int how, u8 *used)
     u32 j, n = 0;
     for (j = 0; j < nmem; j++) {
         const MemEntry *e = &mem_tab[j];
-        if (how == 0 ? may_alias(e->addr, e->mem, addr, mem) : how == 1 ? !call_spares(e->addr) : !roots_apart(e->addr, addr))
+        if (how == 0 ? may_alias(e->addr, e->mem, addr, mem) : how == 1 ? !call_spares(e->addr) : how == 3 ? !nowrite_spares(e->addr) : !roots_apart(e->addr, addr))
             continue;
         used[n] = used[j];
         mem_tab[n++] = *e;
@@ -651,7 +681,7 @@ static void mem_enter_loop(u32 b, u32 k)
                 break;
             case OP_CALL:
                 if (!(i->flags & IF_PURE))
-                    mem_kill_used(0, 0, 1, used);
+                    mem_kill_used(0, 0, call_nowrite(i) ? 3 : 1, used);
                 break;
             case OP_XI:
                 if (i->flags & XI_EFFECT)
@@ -978,7 +1008,10 @@ static void gvn(void)
                         pure_add(v);
                     continue;
                 }
-                mem_kill_call();
+                if (call_nowrite(i))
+                    mem_kill_nowrite();
+                else
+                    mem_kill_call();
                 continue;
             case OP_VSTORE:
                 if (i->c && (!al_on || root_known(root_of(i->c, 0)))) { /* (the address is a + c: a is taken for the pointer) */

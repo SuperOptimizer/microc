@@ -8,6 +8,9 @@
 int opt_size;
 int opt_level = 2; /* 3: spend compile time freely */
 int opt_inline_limit = 12; /* instructions, beyond one per parameter */
+int opt_inline_host = 20;  /* the same for host code: a helper of two library calls and a little arithmetic goes into its
+                              callers, where what it computes is often already there (ufsm's CPU tests: -1.3 % instructions,
+                              no larger; 32 and 48 are no better). -finline-limit=N sets both. */
 #define MAX_INLINE_BLOCKS 48
 #define ONCE_INLINE_INS 200 /* a function called from one place only */
 #define MAX_CALLER_INS 60000
@@ -79,7 +82,7 @@ int opt_inline_hot = 40; /* limit at call sites a profile shows to be hot */
    loop) keeps every field in memory for the whole function. -finline-slotarg=N; 0: off */
 int opt_inline_slotarg = 160;
 int opt_hot_shift = 10;  /* hot: runs at least 1/2^n as often as the busiest block of the program */
-#define LIMIT (opt_size ? 3 : opt_inline_limit)
+#define LIMIT (opt_size ? 3 : opt_dev_fn || opt_cuda ? opt_inline_limit : opt_inline_host)
 
 int opt_inline_mode; /* of the function being optimised: 0 inline by size, 1 always, 2 never, 3 by size, declared inline */
 int opt_novec;       /* of the function being optimised: no vector code, which only the processor's back end takes */

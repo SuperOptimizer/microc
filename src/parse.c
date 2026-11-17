@@ -3343,6 +3343,19 @@ static void call(Expr *e)
         if (strcmp(cn, "malloc") == 0 || strcmp(cn, "calloc") == 0 || strcmp(cn, "realloc") == 0 || strcmp(cn, "aligned_alloc") == 0)
             F->ins[v].flags |= IF_FRESH;
     }
+    /* and its functions that write nothing but errno (opt.c, call_nowrite) */
+    if (!flags && F->cur && !cur_fn_dev && opt_alias_roots() && F->ins[callee].op == OP_ADDR && !F->ins[callee].b &&
+        O->syms[F->ins[callee].a].name && O->syms[F->ins[callee].a].sec == SEC_UNDEF && F->ins[v].op == OP_CALL && !F->ins[v].flags) {
+        static const char *const nw[] = {"getenv", "strlen", "strnlen", "strcmp", "strncmp", "strcasecmp", "strncasecmp", "memcmp",
+                                         "strchr", "strrchr", "strstr", "memchr", "atoi", "atol", "atoll", "atof", "abs", "labs",
+                                         "llabs", "lround", "lroundf", "llround", "llroundf", "lrint", "lrintf", "llrint",
+                                         "llrintf", 0};
+        const char *cn = intern_str(O->syms[F->ins[callee].a].name);
+        int q;
+        for (q = 0; nw[q]; q++)
+            if (strcmp(cn, nw[q]) == 0)
+                F->ins[v].flags |= IF_NOWRITE;
+    }
     if (!flags && vec_mem(ret)) {
         u32 tmp = new_temp(ret);
         ir_store(F, vec_mem(ret), tmp, v);

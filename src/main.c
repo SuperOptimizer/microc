@@ -797,7 +797,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
         else if (strncmp(a, "-j", 2) == 0 && a[2] >= '0' && a[2] <= '9')
             jobs = atoi(a + 2);
         else if (strncmp(a, "-finline-limit=", 15) == 0)
-            opt_inline_limit = atoi(a + 15);
+            opt_inline_limit = opt_inline_host = atoi(a + 15);
         else if (strncmp(a, "-finline-hint=", 14) == 0)
             opt_inline_hint = atoi(a + 14);
         else if (strncmp(a, "-finline-slotarg=", 17) == 0)
@@ -1013,6 +1013,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
         }
         opt_cuda = force_cuda || has_suffix(in, ".cu");
         opt_nounroll = getenv("MCC_NOUNROLL") != 0;
+        if (getenv("MCC_INLINELIMIT")) /* (-finline-limit=N from the environment, for measuring) */
+            opt_inline_limit = opt_inline_host = atoi(getenv("MCC_INLINELIMIT"));
         opt_nolocal = getenv("MCC_NOLOCAL") != 0; /* PTX: the frame through generic [%SP] */
         opt_noldcomb = getenv("MCC_NOLDCOMB") != 0; /* PTX: loads of neighbouring bytes stay apart */
         opt_nostrip = getenv("MCC_NOSTRIP") != 0; /* device code: a loop that runs at most once keeps its way back */

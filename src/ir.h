@@ -96,6 +96,8 @@ enum { ATOM_LOAD, ATOM_STORE, ATOM_XCHG, ATOM_ADD, ATOM_SUB, ATOM_AND, ATOM_OR, 
 #define IF_SSE1 0x20 /* the second eight; Func.has_sret says the same with 0x40 and 0x80 */
 #define IF_FRESH 0x40 /* OP_CALL, x86-64 host: malloc, calloc, realloc, aligned_alloc: the result is the address of memory nothing
                          else points to */
+#define IF_NOWRITE 0x10 /* OP_CALL without IF_SRET, x86-64 host: a C library function that writes no memory but errno
+                           (getenv, strlen, strcmp, atof ...): what is known of locals and named globals stays known */
 #define IF_PURE 0x80 /* OP_CALL, x86-64 host: a C library math function of its arguments alone (no memory read or written, no
                         errno under -fno-math-errno): gvn shares two alike */
 #define IF_ASM 2  /* OP_CALL: inline assembly. The callee is the constant index of an AsmStmt; the
@@ -262,7 +264,7 @@ int opt_vectorise(Func *f); /* opt_vec.c; returns the number of loops rewritten 
 /* opt_inline.c */
 void inline_reset(void);
 extern int opt_inline_once;
-extern int opt_inline_limit;
+extern int opt_inline_limit, opt_inline_host;
 extern int opt_inline_hint; /* -finline-hint=: the limit for functions declared inline */
 extern int opt_inline_slotarg; /* -finline-slotarg=: the limit at host call sites passing the address of a local */
 extern int opt_level;

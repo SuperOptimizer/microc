@@ -1093,7 +1093,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
                 "__global__=__attribute__((global))", "__device__=__attribute__((device))",
                 "__host__=__attribute__((host))", "__shared__=__attribute__((shared))",
                 "__constant__=__attribute__((constant))", "__forceinline__=__inline__ __attribute__((always_inline))",
-                "__noinline__=__attribute__((noinline))", "__launch_bounds__(...)=__attribute__((launch_bounds(__VA_ARGS__)))", "__align__(n)=__attribute__((aligned(n)))", 0};
+                "__noinline__=__attribute__((noinline))", "__launch_bounds__(...)=__attribute__((launch_bounds(__VA_ARGS__)))", "__cluster_dims__(...)=__attribute__((cluster_dims(__VA_ARGS__)))", "__align__(n)=__attribute__((aligned(n)))", 0};
             static int cuda_inc_done;
             char *cuda_include = home_path(argv0, "cuda/include");
             char archdef[48];

@@ -46,6 +46,7 @@ typedef struct Sym {
     u8 is_tls;    /* thread-local */
     u32 aflags;   /* AT_* from attributes */
     u32 maxntid;  /* CUDA: from launch_bounds, 0 if none */
+    u32 cluster;  /* CUDA: __cluster_dims__ x | y << 8 | z << 16, 0 if none */
     u32 section, alias, asmname; /* interned strings from attributes, 0 if none */
     Type *ty;
     u32 slot;
@@ -785,6 +786,7 @@ typedef struct Attr {
     u32 mode;    /* size in bytes asked for by mode(), 0 if none */
     u32 vecsize; /* bytes asked for by vector_size(), 0 if none */
     u32 maxntid; /* CUDA, launch_bounds(): the most threads a block of the kernel is launched with */
+    u32 cluster; /* CUDA, cluster_dims(): the kernel's thread-block cluster, x | y << 8 | z << 16 */
 } Attr;
 
 static Attr ds_attr;  /* attributes among the last declaration specifiers */
@@ -896,6 +898,26 @@ static void attributes(Attr *a)
                 expect(T_LPAREN);
                 a->vecsize = (u32)const_int_expr();
                 expect(T_RPAREN);
+                continue;
+            } else if (strcmp(name, "cluster_dims") == 0) {
+                /* (x[, y[, z]]): the kernel runs in clusters of so many blocks (PTX .reqnctapercluster, sm_90 on): a
+                   plain launch takes the shape from the kernel; the blocks of one cluster share their shared memory */
+                u32 d[3] = {1, 1, 1}, k = 0;
+                expect(T_LPAREN);
+                do {
+                    u32 x = (u32)const_int_expr();
+                    if (k < 3)
+                        d[k] = x;
+                    k++;
+                } while (accept(T_COMMA));
+                expect(T_RPAREN);
+                /* (a template's value parameter while the template itself is read stands as TP_SENT + its number: not
+                   known yet, and its instance reads the attribute again with the value) */
+                if (d[0] < 0x40000000UL && d[1] < 0x40000000UL && d[2] < 0x40000000UL) {
+                    if (!d[0] || !d[1] || !d[2] || (u64)d[0] * d[1] * d[2] > 255)
+                        error_at(tok.loc, "cluster_dims: each extent at least 1, at most 255 blocks in a cluster");
+                    a->cluster = d[0] | d[1] << 8 | d[2] << 16;
+                }
                 continue;
             } else if (strcmp(name, "launch_bounds") == 0) {
                 /* (threads of a block[, blocks wanted on a processor[, at most]]): the first is a promise the
@@ -9374,6 +9396,8 @@ static void sym_attrs(Sym *s, const Attr *a, int is_inline, int storage)
     s->aflags |= a->flags;
     if (a->maxntid)
         s->maxntid = a->maxntid;
+    if (a->cluster)
+        s->cluster = a->cluster;
     if (a->section)
         s->section = a->section;
     if (a->alias && !s->alias) {
@@ -11009,6 +11033,7 @@ typedef struct LazyFn {
     u8 kernel; /* CUDA: a __global__ function */
     u8 ptx;    /* its PTX has been written */
     u32 maxntid; /* a kernel's launch_bounds */
+    u32 cluster; /* and its cluster_dims */
 } LazyFn;
 
 static LazyFn *lazy;
@@ -11093,6 +11118,7 @@ static void ptx_one(u32 sym, int entry)
     func_unstash(fn_func, sym);
     opt_finish(fn_func);
     ptx_maxntid = entry ? lazy[sym].maxntid : 0;
+    ptx_cluster = entry ? lazy[sym].cluster : 0;
     ptx_gen(fn_func, O, entry);
 }
 
@@ -11373,6 +11399,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         lf->dev = (u8)(!cur_fn_dev ? 0 : (s->aflags & AT_HOST) && !(s->aflags & AT_GLOBAL) ? 2 : 1);
         lf->kernel = (u8)((s->aflags & AT_GLOBAL) != 0);
         lf->maxntid = s->maxntid;
+        lf->cluster = s->cluster;
         lf->sec = s->section ? (u32)obj_section(O, s->section, SF_ALLOC | SF_EXEC) : SEC_TEXT;
         lf->noemit = (u8)def_extern_inline;
         /* (+4: device code, which has no vector operations) */

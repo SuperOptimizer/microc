@@ -7538,6 +7538,7 @@ void x64_gen(Func *fn, Obj *o)
         }
         if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
             int rounds = getenv("MCC_SPLITROUNDS") ? atoi(getenv("MCC_SPLITROUNDS")) : 1, r, ch = 0;
+            u32 *slot_use = 0;
             for (r = 0; r < rounds && split_loops(); r++) {
                 ra_rerun(&mf, &t);
                 ch = 1;
@@ -7552,6 +7553,23 @@ void x64_gen(Func *fn, Obj *o)
             }
             /* a loop's copy (of a register the loop only reads, alive after it) that did not get a register either:
                the original's slot, which holds the same value all through the loop, so the copy is no move at all */
+            /* ... only where the original is its slot's one register (as the allocation left it): ra.c gives the two
+               sides of a copy that are never live at once one slot, so once the original's range ends at the split
+               copy, a register written in the stretch may be in that slot (a counter's next value moved back into
+               it), and the copy would read that (ufsm nn_w4.cu cpu_runs: runs + a with a + 1). MCC_SLOTSHAREALL: as
+               before */
+            if (ch) {
+                u32 v2;
+                slot_use = (u32 *)xmalloc((mf.nspill + 1) * sizeof(u32));
+                memset(slot_use, 0, (mf.nspill + 1) * sizeof(u32));
+                for (v2 = 0; v2 < mf.nvreg; v2++)
+                    if (mf.loc[v2] != NOREG && mf.loc[v2] >= SPILL0 && mf.loc[v2] - SPILL0 < mf.nspill)
+                        slot_use[mf.loc[v2] - SPILL0]++;
+                if (getenv("MCC_SLOTSHAREALL"))
+                    for (v2 = 0; v2 <= mf.nspill; v2++)
+                        slot_use[v2] = 1;
+            }
+#define SLOT_ALONE(l) ((l) - SPILL0 < mf.nspill && slot_use[(l) - SPILL0] == 1)
             while (ch) {
                 ch = 0;
                 for (k = 0; k < mf.n; k++) {
@@ -7559,7 +7577,7 @@ void x64_gen(Func *fn, Obj *o)
                     if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->imm == 1 && mi->d >= VREG0 && mi->s0 != NOREG &&
                         mi->s0 >= VREG0 && mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG &&
                         mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
-                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
+                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0] && SLOT_ALONE(mf.loc[mi->s0 - VREG0])) {
                         mf.loc[mi->d - VREG0] = mf.loc[mi->s0 - VREG0];
                         ch = 1;
                     }
@@ -7568,12 +7586,14 @@ void x64_gen(Func *fn, Obj *o)
                     if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->imm == 2 && mi->d >= VREG0 && mi->s0 != NOREG &&
                         mi->s0 >= VREG0 && mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG &&
                         mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
-                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
+                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0] && SLOT_ALONE(mf.loc[mi->d - VREG0])) {
                         mf.loc[mi->s0 - VREG0] = mf.loc[mi->d - VREG0];
                         ch = 1;
                     }
                 }
             }
+#undef SLOT_ALONE
+            free(slot_use);
         }
     }
 

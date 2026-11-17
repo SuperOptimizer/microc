@@ -6193,9 +6193,163 @@ static int split_loops(void)
     return any;
 }
 
+/* ---- live-range splitting at calls (after a first allocation, with the loop splits) ----
+   Every xmm register is caller-saved, so ra.c keeps a float that lives across a call in memory all its life: each read
+   a load (fit_vox2: 540 of 1574 instructions on the stack; its values live across sincosf / logf / atan2f). A spilled
+   register that a run of a block between calls reads at least twice and does not write gets a register of its own for
+   that run: one copy before the first read, the reads renamed. A copy that gets no register is given the original's
+   slot afterwards (the same value through the run: no move) when no other register shares that slot. MCC_NOSPLITCALL: off;
+   MCC_SPLITCALLMAX=N: the first N copies only (bisecting); MCC_SPLITLOG=3: each copy. */
+static int split_calls(u32 nvlim)
+{
+    u32 b, j, nnew = 0, cap = 64, *cp, *cnt, *fu, *touch, ntouch;
+    u8 *def;
+    int any = 0;
+    if (getenv("MCC_NOSPLITCALL") || !mf.nspill)
+        return 0;
+    cp = (u32 *)xmalloc(cap * 3 * sizeof(u32));
+    cnt = (u32 *)xmalloc((nvlim + 1) * sizeof(u32) * 3);
+    fu = cnt + nvlim + 1;
+    touch = fu + nvlim + 1;
+    def = (u8 *)xmalloc(nvlim + 1);
+    memset(cnt, 0, (nvlim + 1) * sizeof(u32));
+    memset(def, 0, nvlim + 1);
+    for (b = 0; b < mf.nblk; b++) {
+        MBlock *mb = &mf.blk[b];
+        u32 rs = mb->first, end = mb->first + mb->n, x;
+        while (rs < end) {
+            u32 re = rs;
+            /* the run: up to and including the next call (the call reads its operands in the run) */
+            while (re < end && !(mf.ins[re].flags & MF_CALL))
+                re++;
+            if (re < end)
+                re++;
+            ntouch = 0;
+            for (x = rs; x < re; x++) {
+                MIns *in = &mf.ins[x];
+                u32 r[3], q;
+                r[0] = in->s0;
+                r[1] = in->s1;
+                r[2] = in->s2;
+                for (q = 0; q < 3; q++) {
+                    u32 v = r[q];
+                    if (v == NOREG || v < VREG0 || v - VREG0 >= nvlim)
+                        continue;
+                    v -= VREG0;
+                    if (mf.loc[v] == NOREG || mf.loc[v] < SPILL0 || (mf.vclass[v] & ~0x11))
+                        continue;
+                    if (!cnt[v]) {
+                        fu[v] = x;
+                        if (!def[v])
+                            touch[ntouch++] = v; /* (once per run: a written one is listed already) */
+                    }
+                    cnt[v]++;
+                }
+                if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nvlim) {
+                    u32 v = in->d - VREG0;
+                    if (!def[v] && !cnt[v])
+                        touch[ntouch++] = v;
+                    def[v] = 1;
+                }
+            }
+            for (j = 0; j < ntouch; j++) {
+                u32 v = touch[j], nr;
+                static long bis = -2;
+                if (bis == -2)
+                    bis = getenv("MCC_SPLITCALLMAX") ? atol(getenv("MCC_SPLITCALLMAX")) : -1;
+                if (cnt[v] >= 2 && !def[v] && (bis < 0 || (bis > 0 && bis-- > 0))) {
+                    if (getenv("MCC_SPLITLOG") && atoi(getenv("MCC_SPLITLOG")) > 2)
+                        fprintf(stderr, "callsplit %s v%lu at %lu (%lu reads)\n", intern_str(obj->syms[f->sym].name), (unsigned long)v,
+                                (unsigned long)fu[v], (unsigned long)cnt[v]);
+                    nr = new_vreg(mf.vclass[v]);
+                    if (nnew == cap) {
+                        cap *= 2;
+                        cp = (u32 *)xrealloc(cp, cap * 3 * sizeof(u32));
+                    }
+                    cp[nnew * 3] = fu[v];
+                    cp[nnew * 3 + 1] = VREG0 + v;
+                    cp[nnew * 3 + 2] = nr;
+                    nnew++;
+                    for (x = fu[v]; x < re; x++) {
+                        MIns *in = &mf.ins[x];
+                        if (in->s0 == VREG0 + v)
+                            in->s0 = nr;
+                        if (in->s1 == VREG0 + v)
+                            in->s1 = nr;
+                        if (in->s2 == VREG0 + v)
+                            in->s2 = nr;
+                    }
+                }
+            }
+            for (j = 0; j < ntouch; j++)
+                cnt[touch[j]] = 0, def[touch[j]] = 0;
+            rs = re;
+        }
+    }
+    if (nnew) {
+        /* insert each copy before its position: the copies are in block and position order, so one pass from the back */
+        u32 nn = mf.n + nnew, at = nn, c = nnew, src;
+        if (nn > mf.cap) {
+            mf.cap = nn + 64;
+            mf.ins = (MIns *)xrealloc(mf.ins, mf.cap * sizeof(MIns));
+        }
+        if (opt_debug && nn > capmloc) {
+            capmloc = mf.cap;
+            mloc = (u32 *)xrealloc(mloc, capmloc * sizeof(u32));
+        }
+        /* (positions ascend with c within a run, runs and blocks ascend: sort is not needed, but equal positions may
+           come in any order) */
+        for (src = mf.n; src-- > 0;) {
+            at--;
+            mf.ins[at] = mf.ins[src];
+            if (opt_debug)
+                mloc[at] = mloc[src];
+            while (c > 0 && cp[(c - 1) * 3] == src) {
+                MIns *m2;
+                c--;
+                at--;
+                m2 = &mf.ins[at];
+                memset(m2, 0, sizeof *m2);
+                m2->op = X_MOV;
+                m2->w = 1;
+                m2->flags = MF_SPLIT;
+                m2->d = cp[c * 3 + 2];
+                m2->s0 = cp[c * 3 + 1];
+                m2->s1 = m2->s2 = NOREG;
+                if (opt_debug)
+                    mloc[at] = mloc[at + 1];
+            }
+        }
+        /* the blocks: each first moves by the copies before it, each n by its own */
+        {
+            u32 k2 = 0, shift = 0;
+            for (b = 0; b < mf.nblk; b++) {
+                MBlock *mb = &mf.blk[b];
+                u32 first = mb->first, last = mb->first + mb->n, own = 0;
+                while (k2 < nnew && cp[k2 * 3] < first)
+                    k2++, shift++; /* (cannot be: every copy is inside a block) */
+                while (k2 < nnew && cp[k2 * 3] < last)
+                    k2++, own++;
+                mb->first = first + shift;
+                mb->n += own;
+                shift += own;
+            }
+        }
+        mf.n = nn;
+        any = 1;
+        if (getenv("MCC_SPLITLOG"))
+            fprintf(stderr, "callsplit %s: %lu\n", intern_str(obj->syms[f->sym].name), (unsigned long)nnew);
+    }
+    free(cp);
+    free(cnt);
+    free(def);
+    return any;
+}
+
 void x64_gen(Func *fn, Obj *o)
 {
     u32 k, n, off, start, nsaved, first_rel;
+    int split_any = 0;
     u32 *blk_off, saved_loc = ir_loc, last_loc = 0, body_at = 0;
     int has_asm = 0;
 
@@ -6220,16 +6374,35 @@ void x64_gen(Func *fn, Obj *o)
         if (fpo)
             t.allocatable[0] |= BIT(RBP);
         ra_run(&mf, &t);
-        if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT") && split_loops()) {
+        if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
+            u32 nvr = mf.nvreg; /* (the calls' split looks at the registers the first allocation placed, not the loops' copies) */
+            int sl = split_loops();
+            split_any = split_calls(nvr) | sl;
+        }
+        if (split_any) {
             ra_rerun(&mf, &t);
             /* a loop's copy that did not get a register either: the original's slot, which holds the same value all
                through the loop, so the copy is no move at all */
-            for (k = 0; k < mf.n; k++) {
-                MIns *mi = &mf.ins[k];
-                if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->d >= VREG0 && mi->s0 != NOREG && mi->s0 >= VREG0 &&
-                    mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG && mf.loc[mi->s0 - VREG0] >= SPILL0 &&
-                    mf.loc[mi->s0 - VREG0] != NOREG)
-                    mf.loc[mi->d - VREG0] = mf.loc[mi->s0 - VREG0];
+            /* ... only where the original is the slot's one register: once its range ends at the copy, the allocator may
+               put a register written in the run on the same place (a loop counter's next value moved back into it), and
+               the copy would read that (ufsm nn_w4.cu cpu_runs: runs + a with a + 1) */
+            {
+                u32 *use = (u32 *)xmalloc((mf.nspill + 1) * sizeof(u32)), v2;
+                memset(use, 0, (mf.nspill + 1) * sizeof(u32));
+                for (v2 = 0; v2 < mf.nvreg; v2++)
+                    if (mf.loc[v2] != NOREG && mf.loc[v2] >= SPILL0 && mf.loc[v2] - SPILL0 < mf.nspill)
+                        use[mf.loc[v2] - SPILL0]++;
+                for (k = 0; k < mf.n; k++) {
+                    MIns *mi = &mf.ins[k];
+                    u32 ls;
+                    if (!((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->d >= VREG0 && mi->s0 != NOREG && mi->s0 >= VREG0))
+                        continue;
+                    ls = mf.loc[mi->s0 - VREG0];
+                    if (mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG && ls >= SPILL0 && ls != NOREG &&
+                        ls - SPILL0 < mf.nspill && use[ls - SPILL0] == 1)
+                        mf.loc[mi->d - VREG0] = ls;
+                }
+                free(use);
             }
         }
     }

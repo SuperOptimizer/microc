@@ -38,6 +38,7 @@ int opt_norange, opt_nofastexp, opt_noifasm, opt_shsym, opt_nocondrec, opt_nodiv
 u32 opt_automax = 0xffffffffU, opt_aumax = 0xffffffffU;
 int opt_dev_code, opt_dolicm, opt_slotcheck, opt_norounds, opt_nosh32, opt_nochain, opt_nowide, opt_dev_parse, opt_plaindiv, opt_noasmco, opt_nopred, opt_nodist, opt_noifcall, opt_nolocal, opt_noxrem, opt_nowiden, opt_nominmax, opt_noselk, opt_noglobal, opt_premat, opt_nospecial1, opt_ifc = 6, opt_noparm;
 u32 ptx_maxntid;
+u32 ptx_cluster;
 static u32 *byoff;     /* of an OP_BYVAL: where in the frame its copy is */
 static u32 *hostsyms;  /* host objects the device code addresses */
 static u32 *kernsyms, nkern, capkern; /* the unit's kernels */
@@ -4243,6 +4244,9 @@ void ptx_gen(Func *f, Obj *o, int entry)
         BP(&head, "\n.maxntid %u, 1, 1", ptx_maxntid & 0xffff);
     if (entry && ptx_maxntid >> 16)
         BP(&head, "\n.minnctapersm %u", ptx_maxntid >> 16);
+    /* (sm_90 on: clusters; for an older target the kernel is built without, as one block per cluster is) */
+    if (entry && ptx_cluster && atoi(opt_cuda_target + 3) >= 90)
+        BP(&head, "\n.reqnctapercluster %u, %u, %u", ptx_cluster & 0xff, ptx_cluster >> 8 & 0xff, ptx_cluster >> 16 & 0xff);
     BP(&head, "\n{\n");
     for (k = 0; k < 4; k++)
         if (nreg[k])

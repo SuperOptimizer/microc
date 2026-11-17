@@ -1589,6 +1589,7 @@ static void sel_avx_more(u32 v)
         }
         m = emit(X_GATHER, 0, g, NOREG, reg_of(i->a));
         m->s2 = idx;
+        m->flags |= MF_NOTS1; /* (the result apart from the index) */
         m->cc = (u8)(1 << sc);
         m->imm = (i64)(VE(ek == M_F32 ? 0x92 : 0x90, 2, 1, 0) | L);
         if (eb == 32)
@@ -1803,6 +1804,7 @@ static void sel_xi(u32 v)
             emit(X_MOV, 1, FSCR1, reg_of(args[3]), NOREG);
         m = emit(X_GATHER, masked, d, src, base);
         m->s2 = idx;
+        m->flags |= MF_NOTS1; /* (the result apart from the index) */
         m->cc = (u8)imm;
         m->imm = enc;
         return;
@@ -2374,7 +2376,10 @@ static void sel_ins(u32 v)
         return;
     case OP_SITOF:
     case OP_UITOF:
-        m = emit(i->op == OP_SITOF ? X_SITOF : X_UITOF, w, d, reg_of(i->a), NOREG);
+        /* (an unsigned 32-bit value known not to have its top bit set, a byte say: the signed conversion, with no
+           widening copy first) */
+        m = emit(i->op == OP_SITOF || (f->ins[i->a].ty == IT_I32 && ir_nonneg(f, i->a)) ? X_SITOF : X_UITOF, w, d, reg_of(i->a),
+                 NOREG);
         m->cc = f->ins[i->a].ty == IT_I64;
         return;
     case OP_FTOSI:

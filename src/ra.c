@@ -457,8 +457,13 @@ void ra_run(MFunc *m, const MTarget *t)
                 if (in2->d >= VREG0) {
                     v = in2->d - VREG0;
                     weight[v] += bw;
-                    if ((in2->flags & MF_NOTS1) && in2->s1 != NOREG && in2->s1 >= VREG0 && in2->s1 != in2->s0)
-                        avoid[v] = in2->s1 - VREG0;
+                    if ((in2->flags & MF_NOTS1) && in2->s1 != NOREG && in2->s1 >= VREG0 && in2->s1 != in2->s0) {
+                        /* (s1 of the other register file, a gather's base: it is s2, the index, that is meant) */
+                        if (!((m->vclass[v] ^ m->vclass[in2->s1 - VREG0]) & 1))
+                            avoid[v] = in2->s1 - VREG0;
+                        else if (in2->s2 != NOREG && in2->s2 >= VREG0 && in2->s2 != in2->s0)
+                            avoid[v] = in2->s2 - VREG0;
+                    }
                     if (stamp[v] == b + 1) {
                         rg_start[head[v]] = wr; /* the range begins at this definition */
                         stamp[v] = 0;

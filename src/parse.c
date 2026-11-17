@@ -10446,7 +10446,7 @@ static void statement(void)
                             break_level = s_bl;
                             cont_level = s_cl;
                             grown = F->nins - n0;
-                            if ((u64)grown * k <= (cur_fn_dev ? UNROLL_AUTO_INS : UNROLL_HOST_INS) ||
+                            if ((u64)grown * k <= (cur_fn_dev ? UNROLL_AUTO_INS : getenv("MCC_UNROLLINS") ? (u32)atoi(getenv("MCC_UNROLLINS")) : UNROLL_HOST_INS) ||
                                 (!cur_fn_dev && k >= 4 && (u64)grown * k <= UNROLL_HOST_LINE && unroll_straight(btk, bn))) {
                                 auto_n++;
                                 ur = k + 1;

@@ -11272,9 +11272,17 @@ static void func_def(Sym *s, Type *ty, u32 loc)
             v = ir_add_param(F, IT_I64);
             if (!cur_fn_dev && opt_alias_roots() && F->ins[v].op == OP_PARAM)
                 F->ins[v].flags = PARAM_PTR | PARAM_RESTRICT; /* (the caller's copy, made for this call: see x64_param) */
-            p->slot = ir_new_slot(F, 8, 8);
-            p->byref = 1;
-            ir_store(F, M_64, ir_slot_addr(F, p->slot, 0), v);
+            if (cur_fn_kernel) {
+                /* a kernel's: the launch made one copy for all the threads, and a thread may write its parameter
+                   (tests/cuda/parmblk.cu, kesc: p.t[i + 1] -= 2 was seen by the thread next to it). So every
+                   thread starts with a copy of its own. (x86-64 hands the block itself over: x64_param.) */
+                p->slot = ir_new_slot(F, (u32)type_size(pt), type_align(pt) > 8 ? type_align(pt) : 8);
+                emit_mem(OP_MEMCPY, ir_slot_addr(F, p->slot, 0), v, type_size(pt), type_align(pt));
+            } else {
+                p->slot = ir_new_slot(F, 8, 8);
+                p->byref = 1;
+                ir_store(F, M_64, ir_slot_addr(F, p->slot, 0), v);
+            }
         } else if (ty->oldstyle && pt->kind == TY_FLOAT) {
             v = ir_add_param(F, IT_F64);
             p->slot = ir_new_slot(F, 4, 4);

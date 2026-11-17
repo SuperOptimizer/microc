@@ -2,6 +2,16 @@
    (libcublasLt.so.13, or the one that MCUDA_LIBCUBLASLT names); the descriptors are that library's own, which
    the header's opaque types have the size of. The library works in the thread's current context, which is the
    run time's (the device's primary context), and a stream of the run time is the driver's stream. */
+#ifdef MCUDA_LT_OWN
+/* Built with MCUDA_LT_OWN: nothing of NVIDIA's but the driver. The descriptors and the checks are those of the
+   CPU run time (cuda/cublaslt.c), and the product is the kernel of ltk.cu, launched on the caller's stream. */
+#include "hw.h"
+int __mcudahw_lt_gemm(const void *A, const void *B, const void *C, void *D, const void *bias, int m, int n, int k, long lda, long ldb,
+                      long ldc, long ldd, long sa, long sb, long sc, long sd, int batch, int types, int flags, float alpha, float beta,
+                      void *stream);
+#define MCUDA_LT_HW
+#include "../cublaslt.c"
+#else
 #include "hw.h"
 #include <cublasLt.h>
 #include <dlfcn.h>
@@ -242,3 +252,4 @@ St cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t h, cublasLtMatmulDesc_t desc,
     READY;
     return lt.MatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Dd, pref, want, results, got);
 }
+#endif

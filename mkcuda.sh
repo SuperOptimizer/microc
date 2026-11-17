@@ -4,6 +4,9 @@
 # reads a .cu file, and again beside each library, DIR/host/cuda/{include,lib} and DIR/linux/cuda/{include,lib};
 # the library is libmcuda.a. A program links it after its own objects: mcc --hosted ... DIR/host/cuda/lib/libmcuda.a
 # For Linux it is also DIR/cuda/lib64/libcudart.a, with a libcublasLt.a and a libstdc++.a that hold nothing.
+# For x86-64 Linux, DIR/linux-x64/cuda/lib has besides libmcuda.a: libmcudahw.a, the run time on NVIDIA's driver
+# built on mcc's own C library, and libcudart.a, which is both and takes the GPU when the driver finds one
+# (cuda/mux/mkmux.sh).
 #
 # mkcuda.sh MCC DIR hw: build mcudahw instead, the same run time on NVIDIA's driver (cuda/hw), for the machine
 # this runs on, an x86-64 Linux with the driver: the kernels then run on its GPU. MCC must compile for that
@@ -77,6 +80,7 @@ for flavour in host linux linux-x64; do
             rm -f $L/lib/lib$l.a
             $MCC ar $L/lib/lib$l.a $T/empty.o 2>/dev/null || ${AR:-llvm-ar} rcs $L/lib/lib$l.a $T/empty.o
         done
-        cp $L/lib/libmcuda.a $L/lib/libcudart.a
+        # libcudart.a: this run time and the GPU's (cuda/hw on mcc's own C library), chosen when the program runs
+        sh cuda/mux/mkmux.sh "$MCC" $D
     fi
 done

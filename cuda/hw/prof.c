@@ -7,7 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
-#include <ucontext.h>
+
+/* the interrupted registers, as the x86-64 kernel lays a signal's context out (uc_flags, uc_link, uc_stack,
+   then the general registers: the same in every C library, so no <ucontext.h> is asked of this one) */
+#define CTX_REG(ctx, i) (((const unsigned long *)(const void *)((const char *)(ctx) + 40))[i])
 
 #define PROF_MAX (1L << 20)
 static unsigned long *prof_pc;
@@ -22,14 +25,14 @@ static void prof_tick(int sig, siginfo_t *si, void *ctx)
     (void)si;
 #if defined(__x86_64__)
     if (k < PROF_MAX) {
-        unsigned long pc = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.gregs[16 /* REG_RIP */];
+        unsigned long pc = CTX_REG(ctx, 16) /* rip */;
         unsigned long lo = (unsigned long)__executable_start, hi = (unsigned long)etext;
         prof_pc[2 * k] = pc;
         prof_pc[2 * k + 1] = 0;
         if (pc < lo || pc >= hi) {
             /* in a shared library: the first word up the stack that points into the program's own code is
                (nearly always) where the program called out */
-            const unsigned long *sp = (const unsigned long *)((ucontext_t *)ctx)->uc_mcontext.gregs[15 /* REG_RSP */];
+            const unsigned long *sp = (const unsigned long *)CTX_REG(ctx, 15) /* rsp */;
             int j;
             for (j = 0; j < 600; j++)
                 if (sp[j] >= lo && sp[j] < hi) {
@@ -64,8 +67,8 @@ static void prof_dump(void)
 static void segv_report(int sig, siginfo_t *si, void *ctx)
 {
 #if defined(__x86_64__)
-    unsigned long pc = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.gregs[16];
-    const unsigned long *sp = (const unsigned long *)((ucontext_t *)ctx)->uc_mcontext.gregs[15];
+    unsigned long pc = CTX_REG(ctx, 16);
+    const unsigned long *sp = (const unsigned long *)CTX_REG(ctx, 15);
     unsigned long lo = (unsigned long)__executable_start, hi = (unsigned long)etext;
     int j, n = 0;
     fprintf(stderr, "mcuda: signal %d at pc %lx, address %lx; stack:", sig, pc, (unsigned long)si->si_addr);

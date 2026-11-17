@@ -161,6 +161,8 @@ static u64 rd(const unsigned char *p, int n)
     return v;
 }
 
+extern int main(void);
+
 static void elf_read(void)
 {
     FILE *f = fopen("/proc/self/exe", "rb");
@@ -198,8 +200,9 @@ static void elf_read(void)
     str[strsize] = 0;
     for (k = 0; k + 24 <= symsize; k += 24) {
         u64 nm = rd(st + k, 4);
-        if (nm < strsize && strcmp((char *)str + nm, "__mcuda_register") == 0)
-            base = (u64)(size_t)(void *)__mcuda_register - rd(st + k + 8, 8);
+        /* (where the program was loaded: by main, whose name is the same however this library was built) */
+        if (nm < strsize && strcmp((char *)str + nm, "main") == 0 && (st[k + 4] & 15) == 2 && rd(st + k + 6, 2))
+            base = (u64)(size_t)(void *)main - rd(st + k + 8, 8);
     }
     esyms = xrealloc(0, (size_t)(symsize / 24 + 1) * sizeof *esyms);
     for (k = 0; k + 24 <= symsize; k += 24)

@@ -1,5 +1,7 @@
 /* cublasLt on the CPU: descriptors and cublasLtMatmul for real 32-bit, half and bfloat16 matrices with
-   single-precision accumulation. cublasLt.h says exactly what is supported and how results are rounded. */
+   single-precision accumulation. cublasLt.h says exactly what is supported and how results are rounded.
+   With MCUDA_LT_HW defined (cuda/hw/lt.c includes this file so) the same descriptors and the same checks,
+   and the product by a kernel of ours on the GPU (cuda/hw/ltk.cu), which rounds the same way. */
 #define MCUDA_INTERNAL
 #include "mc.h"
 #include <mcuda.h>
@@ -136,8 +138,13 @@ cublasStatus_t cublasLtCreate(cublasLtHandle_t *ph)
     if (!ph)
         return CUBLAS_STATUS_INVALID_VALUE;
     *ph = 0;
+#ifdef MCUDA_LT_HW
+    if (hw_enter())
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+#else
     if (!mcuda_dev_count())
         return CUBLAS_STATUS_NOT_INITIALIZED;
+#endif
     h = (cublasLtHandle_t)malloc(sizeof *h);
     if (!h)
         return CUBLAS_STATUS_ALLOC_FAILED;
@@ -337,13 +344,14 @@ cublasStatus_t cublasLtMatmulPreferenceGetAttribute(cublasLtMatmulPreference_t p
 
 /* ---- matmul ---- */
 
+static int type_ok(u32 t) { return t == CUDA_R_32F || t == CUDA_R_16F || t == CUDA_R_16BF; }
+static u64 type_size(u32 t) { return t == CUDA_R_32F ? 4 : 2; }
+
+#ifndef MCUDA_LT_HW
 typedef union {
     float f;
     u32 u;
 } Bits;
-
-static int type_ok(u32 t) { return t == CUDA_R_32F || t == CUDA_R_16F || t == CUDA_R_16BF; }
-static u64 type_size(u32 t) { return t == CUDA_R_32F ? 4 : 2; }
 
 /* n elements of `type` from src, every `step`-th one, to floats. */
 static void to_float(float *dst, const void *src, u32 type, u64 n, u64 step)
@@ -388,6 +396,7 @@ static float dot(const float *a, const float *b, u64 k)
         s2 += a[l + 2] * b[l + 2];
     return (s0 + s1) + (s2 + s3);
 }
+#endif
 
 typedef struct {
     u64 m, n, k;
@@ -478,11 +487,14 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc, con
     const Layout *la = (const Layout *)Adesc, *lb = (const Layout *)Bdesc, *lc = (const Layout *)Cdesc, *ld = (const Layout *)Ddesc;
     Shape sh;
     cublasStatus_t s;
-    float alpha, beta, *pa, *pb, *bias = 0, *col;
-    u64 m, n, k, i, j, l;
+    float alpha, beta;
     int relu, have_bias;
+#ifndef MCUDA_LT_HW
+    float *pa, *pb, *bias = 0, *col;
+    u64 m, n, k, i, j, l;
     s32 b;
     Bits bits;
+#endif
     (void)algo; /* 0 is allowed: the heuristic's choice, and there is one algorithm */
     (void)workspace;
     (void)workspace_size;
@@ -491,14 +503,32 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc, con
     s = check(d, la, lb, lc, ld, &sh);
     if (s)
         return s;
+#ifdef MCUDA_LT_HW
+    if (!alpha_p || !beta_p || !A || !B || !D)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    if (hw_enter())
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+#else
     if (!alpha_p || !beta_p || !A || !B || !D || !mcuda_stream_ok(stream))
         return CUBLAS_STATUS_INVALID_VALUE;
+#endif
     alpha = *(const float *)alpha_p;
     beta = *(const float *)beta_p;
     relu = (d->epilogue & CUBLASLT_EPILOGUE_RELU) != 0;
     have_bias = (d->epilogue & CUBLASLT_EPILOGUE_BIAS) != 0;
     if ((beta != 0 && !C) || (have_bias && !d->bias))
         return CUBLAS_STATUS_INVALID_VALUE;
+#ifdef MCUDA_LT_HW
+    if (sh.batch > 65535 || (sh.n + 15) / 16 > 65535)
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    /* A (and B) overlapping D is not for the kernel: each block of D is written while others still read */
+    return __mcudahw_lt_gemm(A, B, beta != 0 ? C : 0, D, have_bias ? d->bias : 0, (int)sh.m, (int)sh.n, (int)sh.k, la->ld, lb->ld,
+                             lc->ld, ld->ld, la->stride, lb->stride, lc->stride, ld->stride, sh.batch,
+                             (int)(la->type | lb->type << 4 | ld->type << 8 | sh.bias_type << 12), sh.ta | sh.tb << 1 | relu << 2,
+                             alpha, beta, stream)
+               ? CUBLAS_STATUS_EXECUTION_FAILED
+               : CUBLAS_STATUS_SUCCESS;
+#else
     m = sh.m;
     n = sh.n;
     k = sh.k;
@@ -569,4 +599,5 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc, con
     free(col);
     free(bias);
     return CUBLAS_STATUS_SUCCESS;
+#endif
 }

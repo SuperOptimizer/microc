@@ -151,6 +151,69 @@ Not done: pointers against integers of 64 bits by type (both are M_64; fit_vox2 
 a load made available on the one way into a join that lacks it, dead stores, pointers that step through a phi (the root is
 lost there, and the base counts as escaped).
 
+## Round 3 (2026-11-16 / 17, hostperf-20261116): instructions on ten tests
+
+Yardstick: user instructions (`perf stat -e instructions:u`, UFSM_NCPU=1) of ten CPU tests on forlindesk2 (Zen 5):
+test_volcomp_fast, test_zcache, test_wind_sampler, test_spatial_augment, test_reg, test_scrollaug, test_strip, test_fit_emb,
+test_crush, test_repair (UFSM_TEST_QUICK=1). Cycles were not usable (the desk was loaded). Repeatable to ~0.1 % except
+test_zcache (+-2 G).
+
+| | G instructions | vs clang |
+|---|---|---|
+| clang | 1547 | 1.00 |
+| mcc main 16cd2b7 | 2292 | 1.48 |
+| + loop splits of written registers, vex3, float blend, bzhi, select fold, reload splits, gather hint | 2145 | 1.39 |
+| + memalias, veccover, branchfold branches | 2064 | 1.33 |
+| + spill weights apart from layout weights | 2056 | 1.33 |
+| + host inline limit 20, no-write library calls | 2029 | 1.31 |
+
+Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
+reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
+
+What went in (each with its switch):
+
+- x64 `split_loops`: a spilled register a loop writes gets the loop's own register (copy in at the preheader, copy back
+  on each way out where it is alive; outer loops first). `MCC_NOWSPLIT`, `MCC_SPLITROUNDS=N`.
+- x64 `split_reloads`: a spilled register read twice or more in a call-free stretch of a block is loaded once.
+  `MCC_NORSPLIT`, `MCC_RSPLIT=1|2`.
+- AVX scalar float arithmetic with three operands (`MCC_NOVEX3`); a float chosen by a float comparison as vcmpss +
+  vblendvps (`MCC_NOFBLEND`); `x & ((1 << n) - 1)` as bzhi (`MCC_NOBZHI`); `x == k ? c : e` where e is c at x == k
+  (`MCC_NOSELSAME`); a gather writes its result register and the allocator keeps that apart from the index
+  (`MCC_NOGATHERD`); uitof of a non-negative 32-bit value as the signed conversion.
+- Spill weights come from the block frequency guess without the if-body rule; the layout keeps the rule
+  (`MCC_ONEFREQ`). With one guess for both, test_zcache lost 14 G.
+- Host inline limit 20 instructions (was 12; `-finline-limit=N`, `MCC_INLINELIMIT=N`): -27 G, no larger binaries; 32 and
+  48 are no better.
+- Library calls that write nothing but errno (getenv, strlen, strcmp, atof ...) keep what gvn knows of locals and
+  named globals (`MCC_NONOWRITE`).
+- `MCC_UNROLLINS=N` (measuring only): the unasked unrolling budget. 4000 is -12 G on test_spatial_augment and +8 G on
+  test_zcache; the default (1200) stays.
+- From the branches: see "Memory" above; opt_vec.c narrowing / narrow lanes / exact counts / bit reductions
+  (`MCC_NOVECNARROW`, `MCC_NOVECZX`, `MCC_NOVECEXT`, `MCC_NOVECEXACT`, `MCC_NOVECBITRED`, `MCC_VECEPI=1`); jump threading
+  on ranges, selects value-numbered, loop exits and if bodies in the frequency guess, address sums reshaped
+  (`MCC_NOJTR`, `MCC_NOSELCSE`, `MCC_NOLOOPX`, `MCC_NOIFIN`, `MCC_NOADDRSHAPE`, `MCC_NOIFCSH`).
+
+Measuring, learned the hard way:
+
+- `perf record -e instructions:u -c 1000003` lost two thirds of its samples on the loaded desk, and not evenly: the
+  per-function tables it gave were wrong. At `-c 10000019` the sample total equals perf stat's count. Check that sum.
+- The profile's branch class is skid-biased; `perf record -b` gives exact branch counts.
+- `worker` in test_scrollaug / test_wind_sampler is a spin wait: ~20 G of mcc's count there is waiting, not code.
+- Much of test_spatial_augment's excess (~120 G of 250) is the test's reference code (write_spatial_ref, warp_*_ref,
+  ws_cmp), not production paths.
+
+Where the rest is (10M-instruction samples over the ten tests, clang 153 k, mcc 204 k): stack loads +126 G, arithmetic
++134 G, library code +65 G (more calls: helpers not inlined into loops, so their hypot / atan2 are not merged with
+the caller's), other loads +60 G, stack stores +41 G, branches +32 G, copies +31 G, other stores +18 G.
+
+- Float / vector code with more than 13 live values (fit_vox2, write_spatial_tm, warp_phase_w4): xmm16-31 on AVX-512
+  targets is the fix (in work, branch xmm16-20261117).
+- Small leaf functions use callee-saved registers and pay six saves and restores (rblk_sample); r10 / r11 are emission
+  scratch and not allocatable.
+- Vectoriser: filt_axis (clamped gather, strict reductions), 16-trip loops the parser unrolls first (needs SLP),
+  f32 / f64 mixed lanes.
+- Layout: unconditional jumps are still several times clang's.
+
 ## Appendix: every CPU-suite line, clang vs mcc main 475ac78 (round 1, G cycles, min of 3)
 
 | test | clang | mcc | mcc / clang | note |

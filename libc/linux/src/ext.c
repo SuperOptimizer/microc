@@ -2,6 +2,7 @@
    busybox and the kernel build asked for: aligned allocation, the malloc.h extras, file and memory advice,
    fmemopen, dlopen (which always fails: programs are static), qsort_r, and other small pieces. */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -220,7 +221,8 @@ FILE *fmemopen(void *buf, size_t size, const char *mode)
     return f;
 }
 
-/* ---- dlopen: there is no dynamic loader in a static program ---- */
+/* ---- dlopen: there is no dynamic loader in a static program (but on x86-64: dl.c) ---- */
+#ifndef __x86_64__
 
 static const char *dl_msg;
 
@@ -259,6 +261,50 @@ int dladdr(const void *addr, Dl_info *info)
     (void)addr;
     (void)info;
     return 0;
+}
+#endif
+
+/* ---- directories ---- */
+
+int alphasort(const struct dirent **a, const struct dirent **b) { return strcmp((*a)->d_name, (*b)->d_name); }
+
+int scandir(const char *path, struct dirent ***list, int (*sel)(const struct dirent *),
+            int (*cmp)(const struct dirent **, const struct dirent **))
+{
+    DIR *d = opendir(path);
+    struct dirent *de, **v = 0;
+    int n = 0, cap = 0;
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != 0) {
+        struct dirent *copy;
+        if (sel && !sel(de))
+            continue;
+        if (n == cap) {
+            struct dirent **nv = (struct dirent **)realloc(v, (size_t)(cap + 32) * sizeof *v);
+            if (!nv)
+                goto fail;
+            v = nv;
+            cap += 32;
+        }
+        copy = (struct dirent *)malloc(sizeof *copy);
+        if (!copy)
+            goto fail;
+        memcpy(copy, de, sizeof *copy);
+        v[n++] = copy;
+    }
+    closedir(d);
+    if (cmp && n > 1)
+        qsort(v, (size_t)n, sizeof *v, (int (*)(const void *, const void *))cmp);
+    *list = v;
+    return n;
+fail:
+    while (n > 0)
+        free(v[--n]);
+    free(v);
+    closedir(d);
+    errno = ENOMEM;
+    return -1;
 }
 
 /* ---- strings and numbers ---- */

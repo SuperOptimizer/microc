@@ -4,12 +4,13 @@
 # (for `docker import`, or the `FROM scratch` Dockerfile written beside it). Nothing of a distribution is in it.
 # MCC's directory must hold the tools (mkbox.sh: bin/, used here instead of the system's) and the x86-64
 # Linux C library (mklxlibc.sh MCC DIR x86_64). What it also holds goes in when it is there: the third-party
-# libraries (ARCH=x86_64 mkulibs.sh: linux-x64/ext) and the CUDA headers (mkcuda.sh: cuda/include).
+# libraries (ARCH=x86_64 mkulibs.sh: linux-x64/ext), the CUDA headers and run time (mkcuda.sh: cuda/include,
+# linux-x64/cuda/lib).
 #
 #   /usr/mcc, /usr/mbox          the compiler (make, lex, yacc, linker, binutils) and the shell + tools
 #   /usr/bin                     every tool by name; /bin and /sbin are links to it
 #   /usr/linux-x64               the C library: include, lib/crt1.o, lib/libc.a, ext/{include,lib}
-#   /usr/cuda/include            what a .cu file includes
+#   /usr/cuda                    include: what a .cu file includes; lib64/libcudart.a: mcuda, the CPU run time
 #   /etc/passwd, group, hosts    root alone; /tmp, /root, /proc, /sys, /dev: empty
 # SOURCE_DATE_EPOCH: the time every member of the archive carries (so that the same tree gives the same archive).
 set -e
@@ -91,11 +92,10 @@ if [ -d $D/cuda/include ]; then
     mkdir -p $R/usr/cuda
     cp -R $D/cuda/include $R/usr/cuda/include
 fi
-# mcuda for x86-64 (mkcuda.sh MCC DIR x86_64), when it was built
+# mcuda, the CUDA run time on the CPU, as the libcudart.a that a Makefile written for NVIDIA's toolkit links
 if [ -f $D/linux-x64/cuda/lib/libmcuda.a ]; then
     mkdir -p $R/usr/cuda/lib64
-    cp $D/linux-x64/cuda/lib/libmcuda.a $R/usr/cuda/lib64/libcudart.a
-    cp $D/linux-x64/cuda/lib/libcublasLt.a $D/linux-x64/cuda/lib/libstdc++.a $R/usr/cuda/lib64/
+    cp $D/linux-x64/cuda/lib/libcudart.a $D/linux-x64/cuda/lib/libcublasLt.a $D/linux-x64/cuda/lib/libstdc++.a $R/usr/cuda/lib64/
 fi
 
 printf 'root:x:0:0:root:/root:/bin/sh\n' > $R/etc/passwd

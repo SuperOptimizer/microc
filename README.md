@@ -690,7 +690,7 @@ About 9 MB. Nothing in it comes from a distribution.
 | `/usr/mcc` | the compiler, assembler, linker, binutils, make, lex, yacc |
 | `/usr/bin` | every tool by name (links to the two programs); `gcc`, `ld`, `ar`, `nm`, `nvcc`, ... and `pkg-config` are two-line scripts; `/bin` and `/sbin` are links to it |
 | `/usr/linux-x64` | the C library (`include`, `lib/crt1.o`, `lib/libc.a`) and the third-party libraries (`ext`) |
-| `/usr/cuda/include` | what a `.cu` file includes |
+| `/usr/cuda` | `include`: what a `.cu` file includes; `lib64/libcudart.a`: mcuda, the run time that runs kernels on the CPU (with a `libcublasLt.a` and a `libstdc++.a` that hold nothing) |
 | `/etc/passwd`, `group`, `hosts` | root alone; `/tmp`, `/root`, `/proc`, `/sys`, `/dev` are empty |
 
 `init [COMMAND...]` is the image's entry point: it runs the command (default `/bin/sh`), waits for every
@@ -705,13 +705,17 @@ orphan a process 1 inherits, passes TERM, INT, HUP and QUIT on to the command an
 machine's `readelf` that every ELF file in it is a static executable or a relocatable object (no interpreter,
 no dynamic section), and runs `tests/hostfs/smoke.sh` inside it through bubblewrap (`bwrap --bind rootfs /
 --unshare-all --as-pid-1`), started by the image's `init`: the tools, a C program, one with threads, make with
-`ar` and `ld -r`, a program linking every third-party library through `pkg-config`, a CUDA unit compiled to
-an object, and mcc building itself to the bytes of the installed `/usr/mcc`. With `UFSM=dir`, ufsm's tests
+`ar` and `ld -r`, a program linking every third-party library through `pkg-config`, a CUDA unit compiled,
+linked with `-lcudart` and its kernel run, and mcc building itself to the bytes of the installed `/usr/mcc`. With `UFSM=dir`, ufsm's tests
 that need no GPU are built there by ufsm's own Makefile and run (`tests/hostfs/ufsm.sh`).
 
-Not in it: a CUDA run time for x86-64 (mcuda, the CPU one, is built for arm64 only; the GPU one needs
-NVIDIA's `libcuda.so.1`, a shared library of the GNU C library, and a dynamic loader, which the image has
-not), certificates for HTTPS (`/etc/ssl/certs/ca-certificates.crt` is data to be supplied), time zones
+mcuda on x86-64 (`make x64 cuda` builds it into `DIR/linux-x64/cuda`; `make test-x64-cuda` runs the tests of
+`tests/cuda.sh` on the x86-64 machine) is the interpreter alone: what is assembly on arm64 is C over the C
+library there (`cuda/fp_c.c`), the sums of `mma` are the plain C ones, and there is no translator to machine
+code, so kernels run slowly.
+
+Not in it: a way to a real GPU (that is NVIDIA's `libcuda.so.1`, a shared library of the GNU C library, which
+needs a dynamic loader and that library: the image has neither), certificates for HTTPS (`/etc/ssl/certs/ca-certificates.crt` is data to be supplied), time zones
 (the library knows UTC), bash and python (ufsm's suite runner and some of its tests), an ssh server.
 
 ## Known gaps

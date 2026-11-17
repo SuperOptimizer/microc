@@ -125,10 +125,35 @@ fi
 if [ -d /usr/cuda/include ]; then
     cat > k.cu <<'EOF'
 __global__ void scale(float *p, int n, float f) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) p[i] *= f; }
-void run(float *p, int n) { scale<<<(n + 255) / 256, 256>>>(p, n, 2.0f); }
+extern "C" void run(float *p, int n) { scale<<<(n + 255) / 256, 256>>>(p, n, 2.0f); }
 EOF
     check nvcc nvcc -O3 -arch=sm_86 -c k.cu -o k.o
     nm k.o | grep -q ' T ' && ok nvcc-object || bad nvcc-object
+    # and runs, on the CPU run time (mcuda), linked as a Makefile written for NVIDIA's toolkit links
+    if [ -f /usr/cuda/lib64/libcudart.a ]; then
+        cat > kmain.c <<'EOF'
+#include <cuda_runtime.h>
+#include <stdio.h>
+void run(float *p, int n);
+int main(void)
+{
+    static float h[1000];
+    float *d;
+    int i, good = 0;
+    for (i = 0; i < 1000; i++) h[i] = (float)i;
+    if (cudaMalloc((void **)&d, sizeof h) != cudaSuccess) return 1;
+    cudaMemcpy(d, h, sizeof h, cudaMemcpyHostToDevice);
+    run(d, 1000);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 2;
+    cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost);
+    for (i = 0; i < 1000; i++) good += h[i] == (float)(2 * i);
+    printf("kernel %d\n", good);
+    return 0;
+}
+EOF
+        check cuda-link gcc -I/usr/cuda/include -o kmain kmain.c k.o -L/usr/cuda/lib64 -lcudart -lcublasLt -lstdc++ -lm -lpthread
+        is cuda-run "$(./kmain)" "kernel 1000"
+    fi
 fi
 
 # the compiler builds itself here, to the bytes of the one that is installed

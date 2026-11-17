@@ -98,6 +98,9 @@ cuda: tools
 	@build/stage$(STAGE)/bin/sh mkcuda.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 test-cuda: cuda
 	@build/stage$(STAGE)/bin/sh tests/cuda.sh build/stage$(STAGE)
+# the same run time and tests for x86-64 Linux, on the x86-64 machine (X64_SSH, X64_DIR)
+test-x64-cuda: x64 cuda
+	@sh tests/x64cuda.sh build/stage$(STAGE)
 
 # -flto through the system's linker (glibc mode, x86-64 Linux): tests/ltoglibc.sh
 test-lto: $(MCC) $(LIBC)
@@ -126,4 +129,4 @@ STAGE = 0
 clean:
 	rm -rf build
 
-.PHONY: hostfs test-hostfs all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean
+.PHONY: hostfs test-hostfs test-x64-cuda all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean

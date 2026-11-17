@@ -547,15 +547,20 @@ static s32 mma_int(int ty, u32 e)
 }
 
 /* D = A B + C for the 16 x 8 x K product a warp holds in fragments. */
-/* MCUDA_MMA=0: the sums of mma in plain C, to check mc_mma_rows against */
+/* MCUDA_MMA=0: the sums of mma in plain C, to check mc_mma_rows against (and always where the matrix
+   routines are not written: they are arm64 assembly, fp_linux.s, and x86-64 has fp_c.c) */
 static int mma_scalar(void)
 {
+#if defined(__x86_64__)
+    return 1;
+#else
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("MCUDA_MMA");
         v = e && e[0] == '0';
     }
     return v;
+#endif
 }
 
 /* MCUDA_MMA_HW=1: the sums of a floating-point mma as the hardware makes them (seen on sm_120; tests/cuda/

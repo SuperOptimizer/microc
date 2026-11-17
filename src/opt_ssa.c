@@ -1282,13 +1282,20 @@ void opt_dce(Func *f)
     u8 *live = (u8 *)xmalloc(f->nins);
     u32 *stack = (u32 *)xmalloc(f->nins * sizeof(u32));
     u32 sp = 0, b, v, k, n, nx;
+    static int nopuredce = -1;
 
+    if (nopuredce < 0)
+        nopuredce = getenv("MCC_NOPUREDCE") != 0;
     memset(live, 0, f->nins);
     for (b = 1; b < f->nblk; b++) {
         Block *bb = &f->blk[b];
         for (v = bb->first; v; v = f->ins[v].next) {
             int op = f->ins[v].op;
-            if (op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_PARAM || op == OP_VSTORE ||
+            /* (a pure library call, IF_PURE, is only what it returns: unread, it goes. MCC_NOPUREDCE: it stays) */
+            if (op == OP_STORE ||
+                (op == OP_CALL && (!(f->ins[v].flags & IF_PURE) || (f->ins[v].flags & (IF_SRET | IF_ASM | IF_ATOMIC | IF_ALLOCA)) ||
+                                   nopuredce)) ||
+                op == OP_MEMCPY || op == OP_MEMZERO || op == OP_PARAM || op == OP_VSTORE ||
                 (op == OP_XI && (f->ins[v].flags & XI_EFFECT))) {
                 live[v] = 1;
                 stack[sp++] = v;

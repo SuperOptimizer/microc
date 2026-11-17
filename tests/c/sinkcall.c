@@ -51,8 +51,25 @@ static int branchy(double a, int c, int d)
     return r;
 }
 
+static void svd(const double *j, double *s1, double *s2, double *phi)
+{
+    double e = (j[0] + j[3]) / 2, f = (j[0] - j[3]) / 2, g = (j[2] + j[1]) / 2, h = (j[2] - j[1]) / 2;
+    double q = sqrt(e * e + h * h), r = sqrt(f * f + g * g), a1 = atan2(g, f), a2 = atan2(h, e);
+    *s1 = q + r;
+    *s2 = q - r;
+    *phi = (a2 + a1) / 2;
+}
+
+static double ratio(const double *j)
+{
+    double s1, s2, ph; /* ph is never read: its two calls are dead */
+    svd(j, &s1, &s2, &ph);
+    return s1 / s2;
+}
+
 int main(void)
 {
+    static const double jj[4] = {2.0, 0.5, -0.25, 1.5};
     unsigned long sum = 0;
     int k;
     volatile int one = 1, zero = 0;
@@ -63,5 +80,6 @@ int main(void)
     printf("%.6f %.6f\n", both(0.5, 0.25, one), both(0.5, 0.25, zero));
     printf("%.6f %.6f\n", shared(2.0, one), shared(2.0, zero));
     printf("%d %d %d\n", branchy(1.0, one, one), branchy(1.0, one, zero), branchy(1.0, zero, one));
+    printf("%.6f\n", ratio(jj));
     return 0;
 }

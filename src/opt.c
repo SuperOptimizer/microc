@@ -3280,6 +3280,7 @@ static int unselect_calls(void);
 
 static void addr_shape(Func *fn);
 static void iv_widen(Func *fn);
+static void unswitch(Func *fn);
 
 /* x86-64 host, before selection: a branch on whether a flag is still set that several tests may have cleared,
        int inside = 1; for (d = 0; d < 3; d++) if (v[d] < 0 || v[d] > P - 1) inside = 0; ... if (!inside) continue;
@@ -3358,6 +3359,432 @@ static void br_bools(Func *fn)
         }
     }
     free(uses);
+    opt_dce(f);
+}
+
+/* ---- loop unswitching (x86-64 host) ----
+   A branch inside a loop on a value the loop does not change goes the same way every trip. Where a loop has
+   several such branches on one value (ufsm's write_spatial_ref and its kin: `ap ? ap->lut[c] : (c - mean) * isd`
+   and `if (!hard)` at each of the eight corners of every voxel, the corner loops unrolled: a test, a branch and a
+   jump each, 27 G of the 151 G there), the loop is made twice, the value is tested once before them, and each
+   copy keeps the side that is its own. What the loop computes and something after it reads goes through a stack
+   slot while there are two loops (opt_promote makes values of the slots again). The copies cost code: a loop of
+   at most UNSW_LOOP instructions, UNSW_TOTAL new ones in a function, and only for two branches or more on the
+   value (MCC_UNSWMIN) and one for every UNSW_PER instructions of the loop (MCC_UNSWPER: two branches in the 1900
+   instructions of ufsm's vf_decode_sub made test_volcomp_fast 1 G slower). Done before the vectoriser, on the function with its calls inlined. MCC_NOUNSWITCH: off;
+   MCC_UNSWLOG: what was done. */
+#define UNSW_LOOP 4000
+#define UNSW_TOTAL 12000
+#define UNSW_PER 300 /* instructions of loop for each branch that goes */
+
+/* the value a condition is about: x != 0 and x == 0 say what x says (*inv: the other way round) */
+static u32 unsw_base(u32 c, int *inv)
+{
+    u64 z;
+    *inv = 0;
+    c = ir_resolve(f, c);
+    while ((f->ins[c].op == OP_EQ || f->ins[c].op == OP_NE) && ir_is_const(f, f->ins[c].b, &z) && z == 0 &&
+           (f->ins[ir_resolve(f, f->ins[c].a)].ty == IT_I32 || f->ins[ir_resolve(f, f->ins[c].a)].ty == IT_I64)) {
+        *inv ^= f->ins[c].op == OP_EQ;
+        c = ir_resolve(f, f->ins[c].a);
+    }
+    return c;
+}
+
+static int unsw_mem(int ty)
+{
+    return ty == IT_I32 ? M_32 : ty == IT_I64 ? M_64 : ty == IT_F32 ? M_F32 : ty == IT_F64 ? M_F64 : ty == IT_V128 ? M_V128 :
+           ty == IT_V256 ? M_V256 : M_V512;
+}
+
+/* One loop unswitched on one value. Returns the number of instructions copied, 0 if nothing was done. */
+static u32 unswitch_one(u32 room, u32 minbr, u32 per, int *slots)
+{
+    u32 *mark, *stack, *vmap, *bmap, *lblk, nl, k, p, v, sp, n0, nb0, q;
+    u32 best_h = 0, best_c = 0, best_n = 0, best_size = 0, h, c, pre, N, done = 0;
+    compute_dom();
+    nb0 = f->nblk;
+    mark = (u32 *)xmalloc((size_t)nb0 * 4 * sizeof(u32));
+    stack = mark + nb0;
+    bmap = stack + nb0;
+    lblk = bmap + nb0;
+    /* the loop and the value: the most branches, of the innermost loops first */
+    for (k = nrpo; k-- > 0;) {
+        u32 size = 0, cand[16], cnt[16], nc = 0, nout = 0;
+        Block *hb;
+        int ok = 1;
+        h = rpo[k];
+        hb = &f->blk[h];
+        sp = 0;
+        for (p = 0; p < hb->npreds; p++) {
+            q = hb->preds[p];
+            if (q < nb0 && rpo_num[q] != 0xffffffffU && dominates(h, q))
+                stack[sp++] = q;
+            else
+                nout++;
+        }
+        if (getenv("MCC_UNSWLOG") && atoi(getenv("MCC_UNSWLOG")) > 2)
+            fprintf(stderr, "  head b%lu: %lu back, %lu other\n", (unsigned long)h, (unsigned long)sp, (unsigned long)nout);
+        if (!sp || nout != 1 || h == 1)
+            continue;
+        for (p = 0; p < nb0; p++)
+            mark[p] = 0;
+        mark[h] = h;
+        while (sp) {
+            u32 x = stack[--sp];
+            if (mark[x] == h)
+                continue;
+            mark[x] = h;
+            for (p = 0; p < f->blk[x].npreds; p++) {
+                q = f->blk[x].preds[p];
+                if (mark[q] != h && sp < nb0)
+                    stack[sp++] = q;
+                else if (mark[q] != h)
+                    ok = 0;
+            }
+        }
+        for (p = 1; p < nb0 && ok; p++) {
+            Block *bb = &f->blk[p];
+            if (mark[p] != h)
+                continue;
+            if (rpo_num[p] == 0xffffffffU || (bb->term != TERM_JMP && bb->term != TERM_BR)) {
+                ok = 0;
+                break;
+            }
+            for (v = bb->phis; v; v = f->ins[v].next)
+                size++;
+            for (v = bb->first; v && ok; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                size++;
+                if ((i->op == OP_CALL && (i->flags & (IF_ALLOCA | IF_ASM))) ||
+                    (ir_opcount_tab[i->op] == 255 && i->op != OP_CALL && i->op != OP_XI) || i->op == OP_COPY || i->op == OP_NOP)
+                    ok = 0;
+            }
+            if (bb->term == TERM_BR && bb->succ[0] != bb->succ[1] && bb->arg) {
+                int inv;
+                u64 z;
+                c = unsw_base(bb->arg, &inv);
+                if (!ir_is_const(f, c, &z) && defined_outside(c, mark, h) && f->ins[c].blk) {
+                    for (q = 0; q < nc && cand[q] != c; q++)
+                        ;
+                    if (q < nc)
+                        cnt[q]++;
+                    else if (nc < 16) {
+                        cand[nc] = c;
+                        cnt[nc++] = 1;
+                    }
+                }
+            }
+        }
+        if (getenv("MCC_UNSWLOG") && atoi(getenv("MCC_UNSWLOG")) > 1)
+            fprintf(stderr, "  %s loop b%lu: ok %d, %lu instructions, %lu values\n", f->name ? f->name : "?", (unsigned long)h, ok, (unsigned long)size, (unsigned long)nc);
+        if (!ok || size > UNSW_LOOP || size > room)
+            continue;
+        for (q = 0; q < nc; q++)
+            if (cnt[q] >= minbr && cnt[q] > best_n && size <= cnt[q] * per) {
+                best_n = cnt[q];
+                best_c = cand[q];
+                best_h = h;
+                best_size = size;
+            }
+    }
+    if (!best_h) {
+        free(mark);
+        return 0;
+    }
+    h = best_h;
+    c = best_c;
+    /* the loop's blocks again */
+    for (p = 0; p < nb0; p++)
+        mark[p] = 0;
+    sp = 0;
+    pre = 0;
+    for (p = 0; p < f->blk[h].npreds; p++) {
+        q = f->blk[h].preds[p];
+        if (rpo_num[q] != 0xffffffffU && dominates(h, q))
+            stack[sp++] = q;
+        else
+            pre = q;
+    }
+    mark[h] = h;
+    while (sp) {
+        u32 x = stack[--sp];
+        if (mark[x] == h)
+            continue;
+        mark[x] = h;
+        for (p = 0; p < f->blk[x].npreds; p++)
+            if (mark[f->blk[x].preds[p]] != h)
+                stack[sp++] = f->blk[x].preds[p];
+    }
+    nl = 0;
+    for (p = 1; p < nb0; p++)
+        if (mark[p] == h)
+            lblk[nl++] = p;
+    n0 = f->nins;
+    /* what the loop makes and something outside it reads (but a phi where the loop leaves, which gets the copy's
+       value on the copy's edge): through a slot */
+    {
+        u32 *sl = (u32 *)xmalloc((size_t)n0 * sizeof(u32)), b, n, j;
+        memset(sl, 0, (size_t)n0 * sizeof(u32));
+#define UNSW_IN(x) ((x) < n0 && f->ins[x].blk && f->ins[x].blk < nb0 && mark[f->ins[x].blk] == h && \
+                    f->ins[x].op != OP_CONST && f->ins[x].op != OP_FCONST && f->ins[x].op != OP_ADDR && f->ins[x].op != OP_SLOT)
+#define UNSW_SLOT(x) \
+    do { \
+        if (!sl[x]) { \
+            int ty_ = f->ins[x].ty; \
+            u32 st_; \
+            u32 sz_ = M_SIZE(unsw_mem(ty_)); \
+            sl[x] = 1 + ir_new_slot(f, sz_, sz_); \
+            st_ = ir_raw(f, OP_STORE, IT_VOID, ir_slot_addr(f, sl[x] - 1, 0), x); \
+            f->ins[st_].mem = (u8)unsw_mem(ty_); \
+            if (f->ins[x].op == OP_PHI) { \
+                if (f->blk[f->ins[x].blk].first) \
+                    ir_insert_before(f, f->blk[f->ins[x].blk].first, st_); \
+                else \
+                    ir_append(f, f->ins[x].blk, st_); \
+            } else if (f->ins[x].next) \
+                ir_insert_before(f, f->ins[x].next, st_); \
+            else \
+                ir_append(f, f->ins[x].blk, st_); \
+            *slots = 1; \
+        } \
+    } while (0)
+#define UNSW_LOAD(x, ld) \
+    do { \
+        (ld) = ir_raw(f, OP_LOAD, f->ins[x].ty, ir_slot_addr(f, sl[x] - 1, 0), 0); \
+        f->ins[ld].mem = (u8)unsw_mem(f->ins[x].ty); \
+    } while (0)
+        for (b = 1; b < nb0; b++) {
+            u32 nx;
+            if (mark[b] == h || f->blk[b].term == TERM_NONE)
+                continue;
+            for (v = f->blk[b].phis; v; v = f->ins[v].next)
+                for (j = 0; j < f->ins[v].b; j++) {
+                    u32 x = ir_resolve(f, f->xargs[f->ins[v].a + j]), ld, pb = f->blk[b].preds[j];
+                    if (!UNSW_IN(x) || mark[pb] == h)
+                        continue;
+                    UNSW_SLOT(x);
+                    UNSW_LOAD(x, ld);
+                    ir_append(f, pb, ld);
+                    f->xargs[f->ins[v].a + j] = ld;
+                }
+            for (v = f->blk[b].first; v; v = nx) {
+                nx = f->ins[v].next;
+                if (v >= n0)
+                    continue; /* (a load just put in) */
+                n = ir_opcount(f, v);
+                for (j = 0; j < n; j++) {
+                    u32 x = ir_resolve(f, *ir_opref(f, v, j)), ld;
+                    if (!UNSW_IN(x))
+                        continue;
+                    UNSW_SLOT(x);
+                    UNSW_LOAD(x, ld);
+                    ir_insert_before(f, v, ld);
+                    *ir_opref(f, v, j) = ld;
+                }
+                if (f->ins[v].op == OP_CALL) {
+                    u32 x = ir_resolve(f, f->ins[v].c), ld;
+                    if (UNSW_IN(x)) {
+                        UNSW_SLOT(x);
+                        UNSW_LOAD(x, ld);
+                        ir_insert_before(f, v, ld);
+                        f->ins[v].c = ld;
+                    }
+                }
+            }
+            if (f->blk[b].arg) {
+                u32 x = ir_resolve(f, f->blk[b].arg), ld;
+                if (UNSW_IN(x)) {
+                    UNSW_SLOT(x);
+                    UNSW_LOAD(x, ld);
+                    ir_append(f, b, ld);
+                    f->blk[b].arg = ld;
+                }
+            }
+        }
+        free(sl);
+    }
+    n0 = f->nins;
+    vmap = (u32 *)xmalloc((size_t)n0 * sizeof(u32));
+    memset(vmap, 0, (size_t)n0 * sizeof(u32));
+#define UNSW_MAP(x) ((x) < n0 && vmap[x] ? vmap[x] : (x))
+    /* the block between: where the value is tested */
+    N = ir_new_block(f);
+    f->blk[N].freq = f->blk[pre].freq < f->blk[h].freq || !f->blk[h].freq ? f->blk[pre].freq : f->blk[h].freq;
+    ir_add_pred(f, N, pre);
+    for (q = 0; q < 2; q++)
+        if (f->blk[pre].succ[q] == h && (q == 0 || f->blk[pre].term == TERM_BR))
+            f->blk[pre].succ[q] = N;
+    for (p = 0; p < f->blk[h].npreds; p++)
+        if (f->blk[h].preds[p] == pre)
+            f->blk[h].preds[p] = N;
+    for (k = 0; k < nb0; k++)
+        bmap[k] = k;
+    for (k = 0; k < nl; k++) {
+        u32 nb = ir_new_block(f);
+        bmap[lblk[k]] = nb;
+        f->blk[nb].freq = f->blk[lblk[k]].freq;
+        f->blk[nb].lhdr = f->blk[lblk[k]].lhdr;
+        f->blk[nb].nounroll = f->blk[lblk[k]].nounroll;
+    }
+    for (k = 0; k < nl; k++) {
+        u32 ob = lblk[k], nb = bmap[ob];
+        for (p = 0; p < f->blk[ob].npreds; p++)
+            ir_add_pred(f, nb, f->blk[ob].preds[p] < nb0 ? bmap[f->blk[ob].preds[p]] : f->blk[ob].preds[p]); /* (N is its own) */
+        for (v = f->blk[ob].phis; v; v = f->ins[v].next) {
+            u32 np = ir_phi(f, nb, f->ins[v].ty);
+            f->ins[np].mem = f->ins[v].mem;
+            f->ins[np].flags = f->ins[v].flags;
+            f->ins[np].var = f->ins[v].var;
+            vmap[v] = np;
+            done++;
+        }
+        for (v = f->blk[ob].first; v; v = f->ins[v].next) {
+            u32 nv;
+            if (f->ins[v].op == OP_CALL) {
+                u32 na = f->ins[v].b, *tmp = (u32 *)xmalloc((size_t)(na + 1) * sizeof(u32)), cur = f->cur;
+                memcpy(tmp, f->xargs + f->ins[v].a, (size_t)na * sizeof(u32));
+                f->cur = 0;
+                nv = ir_call(f, f->ins[v].ty, f->ins[v].c, tmp, na, f->xargs[f->ins[v].a - 1], f->ins[v].flags);
+                f->cur = cur;
+                free(tmp);
+            } else if (f->ins[v].op == OP_XI) {
+                u32 na = f->ins[v].b, *tmp = (u32 *)xmalloc((size_t)(na + 1) * sizeof(u32)), cur = f->cur;
+                memcpy(tmp, f->xargs + f->ins[v].a, (size_t)na * sizeof(u32));
+                f->cur = 0;
+                nv = ir_xi(f, f->ins[v].ty, f->ins[v].c, tmp, na);
+                f->cur = cur;
+                free(tmp);
+            } else {
+                nv = ir_raw(f, f->ins[v].op, f->ins[v].ty, f->ins[v].a, f->ins[v].b);
+                f->ins[nv].c = f->ins[v].c;
+            }
+            f->ins[nv].mem = f->ins[v].mem;
+            f->ins[nv].flags = f->ins[v].flags;
+            f->ins[nv].loc = f->ins[v].loc;
+            f->ins[nv].var = f->ins[v].var;
+            ir_append(f, nb, nv);
+            vmap[v] = nv;
+            done++;
+        }
+    }
+    for (k = 0; k < nl; k++) {
+        u32 ob = lblk[k], nb = bmap[ob], n, j;
+        for (v = f->blk[ob].phis; v; v = f->ins[v].next)
+            for (j = 0; j < f->ins[v].b; j++) {
+                u32 x = ir_resolve(f, f->xargs[f->ins[v].a + j]);
+                f->xargs[f->ins[vmap[v]].a + j] = UNSW_MAP(x);
+            }
+        for (v = f->blk[nb].first; v; v = f->ins[v].next) {
+            n = ir_opcount(f, v);
+            for (j = 0; j < n; j++) {
+                u32 x = ir_resolve(f, *ir_opref(f, v, j));
+                *ir_opref(f, v, j) = UNSW_MAP(x);
+            }
+            if (f->ins[v].op == OP_CALL) {
+                u32 x = ir_resolve(f, f->ins[v].c);
+                f->ins[v].c = UNSW_MAP(x);
+            }
+        }
+        f->blk[nb].term = f->blk[ob].term;
+        if (f->blk[ob].arg) {
+            u32 x = ir_resolve(f, f->blk[ob].arg);
+            f->blk[nb].arg = UNSW_MAP(x);
+        }
+        n = nsuccs(&f->blk[ob]);
+        for (j = 0; j < n; j++) {
+            u32 s2 = f->blk[ob].succ[j];
+            f->blk[nb].succ[j] = bmap[s2];
+            if (mark[s2] != h && !(j == 1 && f->blk[ob].succ[0] == s2)) {
+                /* a way out: the block there is come to from the copy too */
+                u32 pi = pred_index(s2, ob);
+                ir_add_pred(f, s2, nb);
+                for (v = f->blk[s2].phis; v; v = f->ins[v].next) {
+                    u32 x = ir_resolve(f, f->xargs[f->ins[v].a + pi]);
+                    ir_phi_add_arg(f, v, UNSW_MAP(x));
+                }
+            }
+        }
+    }
+    /* the test, and each loop's own side of the branches */
+    f->blk[N].term = TERM_BR;
+    f->blk[N].arg = c;
+    f->blk[N].succ[0] = h;
+    f->blk[N].succ[1] = bmap[h];
+    for (k = 0; k < nl; k++) {
+        int copy;
+        for (copy = 0; copy < 2; copy++) {
+            u32 b = copy ? bmap[lblk[k]] : lblk[k], keep, drop;
+            Block *bb = &f->blk[b];
+            int inv;
+            if (bb->term != TERM_BR || bb->succ[0] == bb->succ[1] || !bb->arg || unsw_base(bb->arg, &inv) != c)
+                continue;
+            /* (the first loop runs where c is not 0) */
+            keep = ((copy == 0) != (inv != 0)) ? 0 : 1;
+            drop = bb->succ[!keep];
+            keep = bb->succ[keep];
+            bb->term = TERM_JMP;
+            bb->arg = 0;
+            bb->succ[0] = keep;
+            bb->succ[1] = 0;
+            remove_edge(b, drop);
+        }
+    }
+    if (getenv("MCC_UNSWLOG"))
+        fprintf(stderr, "unswitch %s: loop at b%lu, %lu instructions, %lu branches on v%lu\n", f->name ? f->name : "?",
+                (unsigned long)h, (unsigned long)best_size, (unsigned long)best_n, (unsigned long)c);
+    free(vmap);
+    free(mark);
+    return done ? done : 1;
+}
+#undef UNSW_IN
+#undef UNSW_SLOT
+#undef UNSW_LOAD
+#undef UNSW_MAP
+
+static void unswitch(Func *fn)
+{
+    static int off = -1, minbr = 2, per = UNSW_PER;
+    u32 room = UNSW_TOTAL, n;
+    int slots = 0, any = 0, rounds = 0;
+    if (off < 0) {
+        off = getenv("MCC_NOUNSWITCH") != 0;
+        if (getenv("MCC_UNSWMIN"))
+            minbr = atoi(getenv("MCC_UNSWMIN"));
+        if (getenv("MCC_UNSWPER"))
+            per = atoi(getenv("MCC_UNSWPER"));
+    }
+    if (off)
+        return;
+    f = fn;
+    ir_resolve_all(f);
+    while (rounds++ < 6 && (n = unswitch_one(room, (u32)minbr, (u32)per, &slots)) != 0) {
+        any = 1;
+        room = n < room ? room - n : 0;
+        if (getenv("MCC_UNSWLOG") && atoi(getenv("MCC_UNSWLOG")) > 3)
+            ir_dump(f);
+        f->copies = 1;
+        ir_resolve_all(f);
+        simplify_cfg();
+        ir_resolve_all(f);
+        opt_dce(f);
+        f = fn;
+    }
+    if (!any)
+        return;
+    if (slots) {
+        opt_promote(f);
+        f->copies = 1;
+        ir_resolve_all(f);
+        f = fn;
+    }
+    gvn();
+    ir_resolve_all(f);
+    if (simplify_cfg()) {
+        ir_resolve_all(f);
+        gvn();
+        ir_resolve_all(f);
+    }
     opt_dce(f);
 }
 
@@ -3951,6 +4378,11 @@ static void run_passes(Func *fn)
     if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2 && !opt_size && opt_glibc && opt_obj && !getenv("MCC_NOSINCOS") &&
         fuse_sincos())
         ir_resolve_all(f);
+    /* (before the vectoriser: the scalar passes that tidy up after it do not know vector code) */
+    if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2 && !opt_size) {
+        unswitch(fn);
+        f = fn;
+    }
     if (opt_level >= 3 && !opt_size && !opt_novec && (opt_dce(f), opt_vectorise(f))) { /* dead code would only be in the way */
         opt_dce(f);
         return; /* vector code stays out of the inliner: the scalar passes do not know it */

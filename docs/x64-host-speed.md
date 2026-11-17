@@ -177,6 +177,7 @@ test_zcache (+-2 G).
 | + a condition of several compares as a branch for each, also one kept as a flag through a chain of ifs | 1840 | 1.19 |
 | + statics no pointer reaches not read again after a store; a spilled value in a register over blocks without a call | 1836 | 1.19 |
 | + a second test of a flag decided by the first (jump threading by what a branch above says) | 1832 | 1.18 |
+| + loops unswitched on a value they do not change | 1813 | 1.17 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -238,6 +239,12 @@ What went in (each with its switch):
 - Jump threading by what a branch above says (opt.c `jt_implied`, `MCC_NOJTI`): a block whose branch is on a value
   that each way into it has already tested (`if (!inside) ...; if (inside) { ... }`) is passed by; the flag, with
   one use left, then becomes branches (`br_bools`). test_spatial_augment 718.8 -> 714.8 G.
+- Loop unswitching (opt.c `unswitch`, before the vectoriser; `MCC_NOUNSWITCH`, `MCC_UNSWMIN`, `MCC_UNSWPER`,
+  `MCC_UNSWLOG`): a loop with two or more branches on a value it does not change, and one such branch for every
+  300 of its instructions, is made twice, the value tested once before. write_spatial_ref / write_spatial_tm
+  tested `ap` and `hard` at each of eight corners of every voxel: test_spatial_augment 714.8 -> 689.0 G. (Without
+  the size rule two decoder loops of 1900 instructions with two branches cost test_volcomp_fast 1 G; test_reg
+  is 1.5 G worse with it, not yet looked at.)
 - Statics no pointer reaches (parse.c at the end of the unit, opt.c `root_static`, `MCC_NOSTATICPRIV`,
   `MCC_STATICPRIVLOG`): a static object whose address the unit uses only to read or write it at a fixed place (no
   function hands it on, no data holds it, kept-back data included, and the unit has no assembly) is not what a

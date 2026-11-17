@@ -3207,6 +3207,8 @@ void opt_run(Func *fn)
 
 static void finish_passes(Func *fn);
 static int fuse_sincos(void);
+static int sink_calls(void);
+static int unselect_calls(void);
 
 static void addr_shape(Func *fn);
 static void iv_widen(Func *fn);
@@ -3739,6 +3741,8 @@ static void run_passes(Func *fn)
     }
     if (opt_dev_fn && ptx_single_trip(f))
         ir_resolve_all(f);
+    if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2)
+        sink_calls();
     if (simplify_cfg()) {
         int rounds = opt_level >= 3 ? 6 : 1;
         do {
@@ -3747,6 +3751,8 @@ static void run_passes(Func *fn)
         } while (simplify_cfg() && --rounds);
         ir_resolve_all(f);
     }
+    if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2)
+        unselect_calls();
     /* device code: the GPU's assembler moves what it finds worth moving; values moved out of a kernel's loops here
        stay in registers through all of it, and it runs out of them */
     if (opt_dev_fn && opt_dolicm >= 3 && dev_reassoc()) {
@@ -3775,6 +3781,282 @@ static void run_passes(Func *fn)
     if (opt_slotcheck)
         slot_check(fn, "end");
     inline_save(f);
+}
+
+/* x86-64 host: what is computed before a branch and read only on one side of it is computed on that side, where
+   a call of a pure function (IF_PURE: atan2, hypot ...) is part of it: `w = f (x); ... a[i] = in ? g (w) : 255`
+   called f also where in is 0 (clang sinks the same). The side: a successor of the block with that block as its
+   only predecessor, dominating every read. Only pure values with no read left in their block move, the calls and
+   what leads to them or from them; loads stay. MCC_NOSINK: off; MCC_SINKLOG: the count per function. */
+static int sink_ok(const Ins *i)
+{
+    if (i->op == OP_CALL)
+        return (i->flags & IF_PURE) && !(i->flags & (IF_ASM | IF_ATOMIC | IF_SRET | IF_ALLOCA));
+    return (is_pure(i->op) && i->op != OP_ASMOUT && i->op != OP_TLS && i->op != OP_ISCONST) || i->op == OP_SDIV ||
+           i->op == OP_UDIV || i->op == OP_SREM || i->op == OP_UREM || i->op == OP_SELECT;
+}
+
+static int sink_calls(void)
+{
+    u32 *total, *out, *lca, *cnt, *tt, *dest, B, v, j, n, *ops, nmoved = 0;
+    if (getenv("MCC_NOSINK"))
+        return 0;
+    for (B = 1, n = 0; B < f->nblk && !n; B++)
+        for (v = f->blk[B].first; v && !n; v = f->ins[v].next)
+            n = f->ins[v].op == OP_CALL && sink_ok(&f->ins[v]);
+    if (!n)
+        return 0;
+    ir_resolve_all(f);
+    compute_dom();
+    total = (u32 *)xmalloc(f->nins * 6 * sizeof(u32));
+    out = total + f->nins;
+    lca = out + f->nins;
+    cnt = lca + f->nins;
+    tt = cnt + f->nins;
+    dest = tt + f->nins;
+    memset(total, 0, f->nins * 6 * sizeof(u32));
+#define SINK_USE(x, ub) \
+    do { \
+        u32 x_ = (x), d_ = f->ins[x_].blk, u_ = (ub); \
+        if (d_) { \
+            total[x_]++; \
+            if (u_ != d_) { \
+                if (!out[x_]++) { \
+                    lca[x_] = u_; \
+                } else { \
+                    u32 l_ = lca[x_]; \
+                    while (!dominates(l_, u_) && l_ != idom[l_]) \
+                        l_ = idom[l_]; \
+                    lca[x_] = l_; \
+                } \
+            } \
+        } \
+    } while (0)
+    for (B = 1; B < f->nblk; B++) {
+        Block *ub = &f->blk[B];
+        if (ub->term == TERM_NONE)
+            continue;
+        for (v = ub->phis; v; v = f->ins[v].next)
+            for (j = 0; j < f->ins[v].b && j < ub->npreds; j++)
+                SINK_USE(f->xargs[f->ins[v].a + j], ub->preds[j]);
+        for (v = ub->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            IR_OPS(f, i, ops, n);
+            for (j = 0; j < n; j++)
+                SINK_USE(ops[j], B);
+            if (i->op == OP_CALL)
+                SINK_USE(i->c, B);
+        }
+        if (ub->arg)
+            SINK_USE(ub->arg, B);
+    }
+#undef SINK_USE
+    for (B = 1; B < f->nblk; B++) {
+        Block *bb = &f->blk[B];
+        u32 T[2], ncall[2], q, nx;
+        if (bb->term != TERM_BR || bb->succ[0] == bb->succ[1])
+            continue;
+        for (q = 0; q < 2; q++) {
+            u32 t = bb->succ[q];
+            T[q] = f->blk[t].npreds == 1 && t != B && f->blk[t].term != TERM_NONE && dominates(B, t) ? t : 0;
+            ncall[q] = 0;
+        }
+        if (!T[0] && !T[1])
+            continue;
+        for (v = bb->last; v; v = f->ins[v].prev) {
+            Ins *i = &f->ins[v];
+            u32 t = 0;
+            if (!sink_ok(i) || !total[v])
+                continue;
+            if (out[v]) {
+                for (q = 0; q < 2; q++)
+                    if (T[q] && dominates(T[q], lca[v]))
+                        t = T[q];
+                if (!t)
+                    continue;
+            }
+            if (cnt[v]) {
+                if (t && tt[v] != t)
+                    continue;
+                t = tt[v];
+            }
+            if (!t || t == 0xffffffffU || total[v] != out[v] + cnt[v])
+                continue;
+            dest[v] = t;
+            if (i->op == OP_CALL)
+                ncall[t == T[1]]++;
+            IR_OPS(f, i, ops, n);
+            for (j = 0; j <= n; j++) {
+                u32 x;
+                if (j == n && i->op != OP_CALL)
+                    break;
+                x = j < n ? ops[j] : i->c;
+                if (f->ins[x].blk != B)
+                    continue;
+                if (!cnt[x])
+                    tt[x] = t;
+                else if (tt[x] != t)
+                    tt[x] = 0xffffffffU;
+                cnt[x]++;
+            }
+        }
+        for (q = 0; q < 2; q++) {
+            u32 pos;
+            if (!T[q] || !ncall[q] || (q == 1 && T[1] == T[0]))
+                continue;
+            pos = f->blk[T[q]].first;
+            for (v = bb->first; v; v = nx) {
+                nx = f->ins[v].next;
+                if (dest[v] != T[q])
+                    continue;
+                ir_remove(f, v);
+                if (pos)
+                    ir_insert_before(f, pos, v);
+                else
+                    ir_append(f, T[q], v);
+                nmoved++;
+            }
+        }
+    }
+    free(total);
+    if (nmoved && getenv("MCC_SINKLOG"))
+        fprintf(stderr, "sink %s: %lu\n", f->name, (unsigned long)nmoved);
+    return nmoved != 0;
+}
+
+/* ... and where the choice is a select: `c ? g (f (x)) : k`, f pure and its value read by nothing else, runs f
+   whatever c is. The select becomes a branch on c round the side's values (those of its block that only the
+   select reads, directly or through each other, a pure call among them), and a phi where the two ways meet; what
+   came after the select goes on from there. One select at a time, the uses counted again after each. */
+static int unselect_calls(void)
+{
+    u32 *total = 0, *cnt = 0, *tt, *dest, B, v, j, n, *ops, nuses, nx, nmade = 0;
+    int again;
+    if (getenv("MCC_NOSINK"))
+        return 0;
+    do {
+        again = 0;
+        for (B = 1; B < f->nblk && !again; B++) {
+            Block *bb = &f->blk[B];
+            u32 s, hascall = 0;
+            if (bb->term == TERM_NONE)
+                continue;
+            for (v = bb->first; v && !hascall; v = f->ins[v].next)
+                hascall = f->ins[v].op == OP_CALL && sink_ok(&f->ins[v]);
+            if (!hascall)
+                continue;
+            for (s = bb->last; s && !again; s = f->ins[s].prev) {
+                Ins *i = &f->ins[s];
+                u32 x[2], ncall[2], q;
+                if (i->op != OP_SELECT || i->ty > IT_F64 || i->b == i->c)
+                    continue;
+                if (!total) {
+                    ir_resolve_all(f);
+                    i = &f->ins[s];
+                    total = count_uses(&nuses);
+                    cnt = (u32 *)xmalloc(nuses * 3 * sizeof(u32));
+                    tt = cnt + nuses;
+                    dest = tt + nuses;
+                    memset(cnt, 0, nuses * 3 * sizeof(u32));
+                }
+                x[0] = i->b;
+                x[1] = i->c;
+                ncall[0] = ncall[1] = 0;
+                for (q = 0; q < 2; q++)
+                    if (f->ins[x[q]].blk == B) {
+                        cnt[x[q]]++;
+                        tt[x[q]] = q + 1;
+                    }
+                for (v = i->prev; v; v = f->ins[v].prev) {
+                    Ins *u = &f->ins[v];
+                    u32 t = tt[v];
+                    if (!cnt[v] || !sink_ok(u) || t == 0xffffffffU || total[v] != cnt[v])
+                        continue;
+                    dest[v] = t;
+                    if (u->op == OP_CALL)
+                        ncall[t - 1]++;
+                    IR_OPS(f, u, ops, n);
+                    for (j = 0; j <= n; j++) {
+                        u32 y;
+                        if (j == n && u->op != OP_CALL)
+                            break;
+                        y = j < n ? ops[j] : u->c;
+                        if (f->ins[y].blk != B)
+                            continue;
+                        if (!cnt[y])
+                            tt[y] = t;
+                        else if (tt[y] != t)
+                            tt[y] = 0xffffffffU;
+                        cnt[y]++;
+                    }
+                }
+                if (ncall[0] || ncall[1]) {
+                    u32 J = ir_new_block(f), S[2], ph, cond = i->a, ty = i->ty, k;
+                    S[0] = ncall[0] ? ir_new_block(f) : 0;
+                    S[1] = ncall[1] ? ir_new_block(f) : 0;
+                    bb = &f->blk[B];
+                    f->blk[J].term = bb->term;
+                    f->blk[J].arg = bb->arg;
+                    f->blk[J].succ[0] = bb->succ[0];
+                    f->blk[J].succ[1] = bb->succ[1];
+                    f->blk[J].freq = bb->freq;
+                    for (q = 0; q < (bb->term == TERM_BR ? 2u : bb->term == TERM_JMP ? 1u : 0u); q++) {
+                        Block *sb = &f->blk[bb->succ[q]];
+                        for (k = 0; k < sb->npreds; k++)
+                            if (sb->preds[k] == B)
+                                sb->preds[k] = J;
+                    }
+                    for (v = f->ins[s].next; v; v = nx) {
+                        nx = f->ins[v].next;
+                        ir_remove(f, v);
+                        ir_append(f, J, v);
+                    }
+                    for (v = f->blk[B].first; v; v = nx) {
+                        nx = f->ins[v].next;
+                        if (v != s && dest[v] && dest[v] != 0xffffffffU && S[dest[v] - 1]) {
+                            ir_remove(f, v);
+                            ir_append(f, S[dest[v] - 1], v);
+                        }
+                    }
+                    bb = &f->blk[B];
+                    bb->term = TERM_BR;
+                    bb->arg = cond;
+                    for (q = 0; q < 2; q++) {
+                        bb->succ[q] = S[q] ? S[q] : J;
+                        if (S[q]) {
+                            f->blk[S[q]].term = TERM_JMP;
+                            f->blk[S[q]].succ[0] = J;
+                            f->blk[S[q]].freq = bb->freq;
+                            ir_add_pred(f, S[q], B);
+                        }
+                        ir_add_pred(f, J, S[q] ? S[q] : B);
+                    }
+                    ph = ir_phi(f, J, (int)ty);
+                    f->xargs[f->ins[ph].a] = x[0];
+                    f->xargs[f->ins[ph].a + 1] = x[1];
+                    f->ins[ph].loc = f->ins[s].loc;
+                    ir_replace(f, s, ph);
+                    nmade++;
+                    again = 1;
+                } else {
+                    for (v = f->ins[s].prev; v; v = f->ins[v].prev)
+                        cnt[v] = tt[v] = dest[v] = 0;
+                }
+            }
+        }
+        if (total) {
+            free(total);
+            free(cnt);
+            total = 0;
+        }
+    } while (again && nmade < 64);
+    if (nmade) {
+        ir_resolve_all(f);
+        compute_dom();
+        if (getenv("MCC_SINKLOG"))
+            fprintf(stderr, "unselect %s: %lu\n", f->name, (unsigned long)nmade);
+    }
+    return nmade != 0;
 }
 
 /* x86-64 host, the GNU C library: sin (x) and cos (x) of one x are one call of sincos (x, &s, &c), which computes the

@@ -171,6 +171,7 @@ test_zcache (+-2 G).
 | + vectors chosen by ?: as values, unasked unrolling up to 3000 instructions | 1958 | 1.27 |
 | + 32-bit loop counters widened (iv_widen) | 1941 | 1.25 |
 | + int sums widened at conversion, test after and/or/xor dropped | 1932 | 1.25 |
+| + pure calls computed only on the side of a choice that reads them | 1886 | 1.22 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -211,6 +212,12 @@ What went in (each with its switch):
   and the table of such sums is per function.
 - Flag reuse (x64.c, `MCC_NOZFREUSE`): a `test r, r` right after the `and` / `or` / `xor` that wrote `r` is not
   emitted; a zero made between the two is `mov $0` instead of `xor`.
+- Sinking of pure calls (opt.c `sink_calls`, `unselect_calls`; `MCC_NOSINK`, `MCC_SINKLOG`): a pure library call
+  (`IF_PURE`: atan2, hypot, exp ... under `-fno-math-errno`) and the pure values round it that only one side of a
+  branch reads move to that side; where the choice is a select (`c ? g(f(x)) : k`), the select becomes a branch
+  round them and a phi. ufsm's fixture loops (`w = fx_wind(z, y, x); ... ph[i] = z < 128 ? code(w) : 255`) called
+  atan2 and hypot for every voxel where clang calls them for the ones kept: test_wind_sampler 180 -> 137 G
+  (clang 130).
 - `iv_widen` (opt.c, last before selection, `MCC_NOIVWIDEN`, `MCC_IVWLOG`): a 32-bit counter read widened becomes a
   64-bit counter where i + step cannot wrap (the way back is taken only while next < n and the first value is a
   constant, known small or was compared before the loop; or the header leaves unless i < n); `(long)(i - k)` of a

@@ -868,6 +868,52 @@ static void narrow_loops(void)
     }
 }
 
+/* ---- a count that is a whole number of vectors: no scalar iterations at all ----
+   The vector loop used always to leave the original loop at least one iteration, which then produced whatever the
+   code after the loop reads of the loop's values. A loop over 4096 bytes at 64 a round did 63 rounds and then 64
+   scalar iterations, a third of all its instructions; one over 16 floats at 16 a round was not entered at all. Where
+   the code after the loop reads nothing of the loop but its counters and finished sums (maxima, minima), those have
+   values the vector loop's end can state, and the original loop is skipped when nothing is left for it: its exit
+   edge goes through a new block where each such value is chosen between the scalar loop's and the vectors'.
+   MCC_NOVECEXACT: as before. */
+static int vec_exact;
+#define MAX_LIVE 8
+static u32 live_of[MAX_LIVE], nlive;
+
+/* The loop l's values that the rest of the function uses: 0 if there is one that is neither a counter (its value in
+   or after the last iteration) nor a finished reduction (red_next). */
+static int exact_liveouts(u32 l, const u32 *red_next, u32 nred)
+{
+    u32 b, x, k, j, n, m;
+    nlive = 0;
+    for (b = 1; b < f->nblk; b++) {
+        u32 arg = f->blk[b].term == TERM_BR || f->blk[b].term == TERM_RET ? f->blk[b].arg : 0;
+        if (b == l || f->blk[b].term == TERM_NONE)
+            continue;
+        for (k = 0; k < 3; k++)
+            for (x = k == 2 ? arg : k ? f->blk[b].first : f->blk[b].phis; x; x = k == 2 ? 0 : f->ins[x].next) {
+                n = k == 2 ? 1 : f->ins[x].op == OP_BYVAL ? 1 : ir_opcount(f, x); /* (OP_BYVAL's b is a number) */
+                for (j = 0; j < n; j++) {
+                    u32 o = k == 2 ? x : *ir_opref(f, x, j);
+                    if (f->ins[o].blk != l || f->ins[o].op == OP_CONST || f->ins[o].op == OP_FCONST)
+                        continue;
+                    for (m = 0; m < nred && red_next[m] != o; m++)
+                        ;
+                    if (iv_index(o) < 0 && m == nred)
+                        return 0;
+                    for (m = 0; m < nlive && live_of[m] != o; m++)
+                        ;
+                    if (m == nlive) {
+                        if (nlive == MAX_LIVE)
+                            return 0;
+                        live_of[nlive++] = o;
+                    }
+                }
+            }
+    }
+    return 1;
+}
+
 static u32 missv; /* the instruction being looked at, for the report */
 #define MISS(why) \
     do { \
@@ -894,7 +940,8 @@ static int try_loop(u32 l, u32 n0)
     u32 pa[MAX_PAIRS], pb[MAX_PAIRS], np = 0;
     u8 pka[MAX_PAIRS], pkb[MAX_PAIRS];
     u32 nvec = 0, maxsh = 0, full_only = 0, vf, init64, n64, count, ok, vcnt, ivv, ivv2, sh, offend;
-    int uns, le, c, cty, tnext, lsh, wide = 0;
+    int uns, le, c, cty, tnext, lsh, wide = 0, exact = 0;
+    u32 iv_fin[MAX_IV], red_fin[MAX_RED];
     i64 st;
     Ins *ci;
 
@@ -1493,6 +1540,8 @@ static int try_loop(u32 l, u32 n0)
     if (iv && iv != iv_phi[c] && ext == OP_ZEXT32)
         MISS("the index may wrap around");
 
+    exact = vec_exact && exact_liveouts(l, red_next, nred);
+
     /* ---- build ---- */
 #define C64(x) ir_const(f, IT_I64, (u64)(x))
     for (k = 0; k < nlinv; k++) {
@@ -1509,6 +1558,8 @@ static int try_loop(u32 l, u32 n0)
     /* sums run four vectors side by side, so that the additions do not wait
        for each other; other loops two, to halve what the counting costs */
     un = wide ? 1 : nred ? 4 : 2;
+    if (getenv("MCC_VECUN") && (u32)atoi(getenv("MCC_VECUN")) < un && atoi(getenv("MCC_VECUN")) > 0)
+        un = (u32)atoi(getenv("MCC_VECUN")); /* (measuring: fewer vectors a round) */
     vf = vw / lanesz * un;
     for (lsh = 0; ((u32)1 << lsh) < lanesz; lsh++)
         ;
@@ -1536,7 +1587,7 @@ static int try_loop(u32 l, u32 n0)
             d = mk(P, OP_ADD, IT_I64, d, C64(st - 1));
         count = mk(P, OP_SHR, IT_I64, d, C64(sl));
     }
-    v = mk(P, OP_SGT, IT_I32, count, C64(vf));
+    v = mk(P, exact ? OP_SGE : OP_SGT, IT_I32, count, C64(vf));
     ok = ok ? mk(P, OP_AND, IT_I32, ok, v) : v;
     /* where each array starts */
     for (k = 0; k < nkeys; k++) {
@@ -1649,7 +1700,7 @@ static int try_loop(u32 l, u32 n0)
                     mk(P, OP_OR, IT_I32, mk(P, OP_ULE, IT_I32, ghi, start[j]), mk(P, OP_UGE, IT_I32, glo, send)));
         }
     }
-    vcnt = mk(P, OP_SUB, IT_I64, count, C64(1));
+    vcnt = exact ? count : mk(P, OP_SUB, IT_I64, count, C64(1)); /* (not exact: at least one iteration is left over) */
     vcnt = mk(P, OP_AND, IT_I64, vcnt, C64(~(u64)(vf - 1)));
     offend = lsh ? mk(P, OP_SHL, IT_I64, vcnt, C64(lsh)) : vcnt;
     V = ir_new_block(f);
@@ -1878,6 +1929,7 @@ static int try_loop(u32 l, u32 n0)
             if (iv_step[q] != 1)
                 val = mk(M, OP_MUL, ty, val, ir_const(f, ty, (u64)iv_step[q]));
             val = mk(M, OP_ADD, ty, iv_init[q], val);
+            iv_fin[q] = val;
         } else {
             int lk = lane_kind(f->ins[ph].ty), comb;
             for (k = 0; red_phi[k] != ph; k++)
@@ -1885,6 +1937,7 @@ static int try_loop(u32 l, u32 n0)
             comb = red_op[k];
             if (comb == OP_VSUM) {
                 ir_phi_add_arg(f, ph, acc[k][0]);
+                red_fin[k] = acc[k][0];
                 continue;
             }
             val = acc[k][0];
@@ -1897,8 +1950,63 @@ static int try_loop(u32 l, u32 n0)
             f->ins[val].flags = (u8)(comb == OP_VSMAX ? 1 : comb == OP_VSMIN ? 2 : comb == OP_VUMAX ? 3 : comb == OP_VUMIN ? 4 : 0);
             if (comb == OP_ADD || comb == OP_FADD)
                 val = mk(M, comb, f->ins[ph].ty, f->xargs[f->ins[ph].a + pp], val);
+            red_fin[k] = val;
         }
         ir_phi_add_arg(f, ph, val);
+    }
+    if (exact) {
+        /* nothing left over: past the original loop, through the block J its exit edge now goes through too, where
+           each of its values that is used later is the scalar loop's or what the vectors ended with */
+        u32 E = f->blk[l].succ[1], J = ir_new_block(f), b2, x, nops2, jph[MAX_LIVE], fin[MAX_LIVE];
+        for (k = 0; k < nlive; k++) {
+            u32 o = live_of[k];
+            int q = iv_index(o), ty = f->ins[o].ty;
+            if (q >= 0) {
+                /* the counter after the last iteration, or in it */
+                fin[k] = o == iv_next[q] ? iv_fin[q] : mk(M, OP_SUB, ty, iv_fin[q], ir_const(f, ty, (u64)iv_step[q]));
+            } else {
+                for (j = 0; red_next[j] != o; j++)
+                    ;
+                fin[k] = red_fin[j];
+            }
+        }
+        f->blk[J].freq = f->blk[E].freq;
+        f->blk[M].term = TERM_BR;
+        f->blk[M].arg = mk(M, OP_EQ, IT_I32, vcnt, count);
+        f->blk[M].succ[0] = J;
+        f->blk[M].succ[1] = l;
+        f->blk[l].succ[1] = J;
+        ir_add_pred(f, J, l);
+        ir_add_pred(f, J, M);
+        f->blk[J].term = TERM_JMP;
+        f->blk[J].succ[0] = E;
+        for (k = 0; f->blk[E].preds[k] != l; k++)
+            ;
+        f->blk[E].preds[k] = J;
+        for (k = 0; k < nlive; k++) {
+            jph[k] = ir_phi(f, J, f->ins[live_of[k]].ty);
+            f->xargs[f->ins[jph[k]].a] = live_of[k];
+            f->xargs[f->ins[jph[k]].a + 1] = fin[k];
+        }
+        for (b2 = 1; b2 < f->nblk && nlive; b2++) {
+            Block *bb = &f->blk[b2];
+            if (b2 == l || b2 == J || bb->term == TERM_NONE)
+                continue;
+            if ((bb->term == TERM_BR || bb->term == TERM_RET) && bb->arg)
+                for (k = 0; k < nlive; k++)
+                    if (bb->arg == live_of[k])
+                        bb->arg = jph[k];
+            for (j = 0; j < 2; j++)
+                for (x = j ? bb->first : bb->phis; x; x = f->ins[x].next) {
+                    nops2 = f->ins[x].op == OP_BYVAL ? 1 : ir_opcount(f, x);
+                    for (u = 0; u < nops2; u++) {
+                        u32 *o = ir_opref(f, x, u);
+                        for (k = 0; k < nlive; k++)
+                            if (*o == live_of[k])
+                                *o = jph[k];
+                    }
+                }
+        }
     }
     if (opt_vec_report)
         fprintf(stderr, "%s: loop vectorised (%u elements at a time)\n", f->name, vf);
@@ -2360,6 +2468,7 @@ int opt_vectorise(Func *fn)
     mmk = shift + n0;
     lext = mmk + n0;
     ext_lanes = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXT");
+    vec_exact = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXACT");
     base = (u32 *)xmalloc((size_t)n0 * 5 * sizeof(u32));
     cnt = base + n0;
     map = cnt + n0;

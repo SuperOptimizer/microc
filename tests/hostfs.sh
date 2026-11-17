@@ -12,9 +12,9 @@
 #   X64_DIR=dir               a directory there that this may use (default /root/x64); it works in DIR/hostfs
 #   UFSM=dir                  a clone of ufsm: its tests that need no GPU are built and run in the image too
 #                             (tests/hostfs/ufsm.sh; UFSM_TESTS="test_x ..." names others)
-#   GPU=1                     the machine has NVIDIA's driver: its libcuda.so.1 and libnvidia-ptxjitcompiler.so.1
-#                             (read-only) and the /dev/nvidia* nodes are bound into the image, where NVIDIA's
-#                             container run time puts them, and tests/hostfs/gpu.sh runs too
+#   GPU=1                     the machine has NVIDIA's driver: its libcuda and libnvidia-ptxjitcompiler
+#                             (read-only) and the /dev/nvidia* nodes are bound into the image, where and under
+#                             the names NVIDIA's container run time puts them, and tests/hostfs/gpu.sh runs too
 #                             (UFSM_GPU_TESTS="test_nn ...": tests of ufsm to run on the GPU, timed)
 O=$1
 R=${X64_DIR:-/root/x64}/hostfs
@@ -62,7 +62,9 @@ if [ -f work/gpu.sh ]; then
         for d in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib; do
             if [ -z "$p" ] && [ -e $d/$l ]; then p=$(readlink -f $d/$l); fi
         done
-        if [ -n "$p" ]; then gpu="$gpu --ro-bind $p /usr/lib/x86_64-linux-gnu/$l"; else echo "FAIL this machine has no $l"; fi
+        # under its full name alone (libcuda.so.615.71.10), as the run time's CDI specification mounts it: the
+        # short name is a link its ldconfig hook makes, which the image must not need
+        if [ -n "$p" ]; then gpu="$gpu --ro-bind $p /usr/lib/x86_64-linux-gnu/$(basename $p)"; else echo "FAIL this machine has no $l"; fi
     done
     for d in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia[0-9]*; do
         if [ -e $d ]; then gpu="$gpu --dev-bind $d $d"; fi

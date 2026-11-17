@@ -733,7 +733,10 @@ brings the driver's libraries and device nodes, as it does for any image.
   do not load, and are not needed), symbol versions are ignored, nothing is unloaded. A missing name shows in
   `dlerror` (and with `MCC_DLDEBUG=1`, which traces every request) and is a line to add to the table.
   Objects are looked for in `LD_LIBRARY_PATH`, then `/usr/lib/x86_64-linux-gnu`, `/usr/lib64`, `/lib64`,
-  `/usr/lib`, `/usr/local/nvidia/lib64` ... (there is no `ld.so.cache`).
+  `/usr/lib`, `/usr/local/nvidia/lib64` ... (there is no `ld.so.cache`); when `libcuda.so.1` is nowhere, a
+  `libcuda.so.<version>` in those directories is taken: NVIDIA's container run time mounts the driver's
+  libraries under their full names (`libcuda.so.615.71.10`) and leaves the short ones to a hook that runs
+  `ldconfig`, which the image neither has nor needs. The test binds them under the full names alone.
   `malloc` now returns blocks aligned to 16 bytes, which the driver's code (like any compiled for the ABI)
   takes for granted.
 - **mcudahw on our C library** (`cuda/hw`, the run time on the driver's API that was built with glibc before):

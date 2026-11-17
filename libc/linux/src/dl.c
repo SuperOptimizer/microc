@@ -11,6 +11,7 @@
    MCC_DLDEBUG=1 in the environment reports every request, where an object was found and what it lacked. */
 #ifdef __x86_64__
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -251,39 +252,72 @@ static int relocate(Lib *l, Rela *r, size_t n)
 
 static Lib *open_lib(const char *name, int depth);
 
-static int try_path(const char *dir, size_t dn, const char *name, char *out, size_t cap)
+/* NAME in the directory DIR (DN characters of it). With VER, NAME is "libx.so.1" and any "libx.so.*" there
+   will do, the last in order of name: a container run time mounts a driver's library under its full version
+   (libcuda.so.615.71.10) and leaves the short name to a link that ldconfig makes, which may not have run. */
+static int try_path(const char *dir, size_t dn, const char *name, int ver, char *out, size_t cap)
 {
+    DIR *d;
+    struct dirent *de;
+    const char *so;
+    size_t pn;
+    int found = 0;
     if (dn + strlen(name) + 2 > cap)
         return 0;
     memcpy(out, dir, dn);
     out[dn] = '/';
-    strcpy(out + dn + 1, name);
-    return access(out, R_OK) == 0;
+    if (!ver) {
+        strcpy(out + dn + 1, name);
+        return access(out, R_OK) == 0;
+    }
+    so = strstr(name, ".so.");
+    if (!so)
+        return 0;
+    pn = (size_t)(so - name) + 4;
+    out[dn] = 0;
+    d = opendir(out);
+    if (!d)
+        return 0;
+    out[dn] = '/';
+    out[dn + 1] = 0;
+    while ((de = readdir(d)) != 0) {
+        if (strncmp(de->d_name, name, pn) != 0 || dn + strlen(de->d_name) + 2 > cap)
+            continue;
+        if (found && strcmp(de->d_name, out + dn + 1) <= 0)
+            continue;
+        strcpy(out + dn + 1, de->d_name);
+        found = 1;
+    }
+    closedir(d);
+    return found && access(out, R_OK) == 0;
 }
 
 /* where NAME is: as given when it has a slash; else LD_LIBRARY_PATH, then the directories where distributions
-   and NVIDIA's container run time put libraries (there is no ld.so.cache to ask) */
+   and NVIDIA's container run time put libraries (there is no ld.so.cache to ask); first under its own name
+   everywhere, then under a longer version of it */
 static int find_lib(const char *name, char *out, size_t cap)
 {
     static const char *const dirs[] = {"/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/lib/x86_64-linux-gnu", "/lib64",
                                        "/usr/lib", "/lib", "/usr/local/lib", "/usr/local/nvidia/lib64",
                                        "/usr/local/nvidia/lib", 0};
-    const char *p = getenv("LD_LIBRARY_PATH"), *e;
-    int i;
+    const char *p, *e;
+    int i, ver;
     if (strchr(name, '/')) {
         if (strlen(name) + 1 > cap || access(name, R_OK) != 0)
             return 0;
         strcpy(out, name);
         return 1;
     }
-    for (; p && *p; p = *e ? e + 1 : e) {
-        e = p + strcspn(p, ":");
-        if (e > p && try_path(p, (size_t)(e - p), name, out, cap))
-            return 1;
+    for (ver = 0; ver < 2; ver++) {
+        for (p = getenv("LD_LIBRARY_PATH"); p && *p; p = *e ? e + 1 : e) {
+            e = p + strcspn(p, ":");
+            if (e > p && try_path(p, (size_t)(e - p), name, ver, out, cap))
+                return 1;
+        }
+        for (i = 0; dirs[i]; i++)
+            if (try_path(dirs[i], strlen(dirs[i]), name, ver, out, cap))
+                return 1;
     }
-    for (i = 0; dirs[i]; i++)
-        if (try_path(dirs[i], strlen(dirs[i]), name, out, cap))
-            return 1;
     return 0;
 }
 

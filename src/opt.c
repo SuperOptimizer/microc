@@ -458,6 +458,8 @@ static void pure_add(u32 v)
     pure_tab[npure++] = v;
 }
 
+static int opt_noselcse = -1;
+
 static void gvn(void)
 {
     u32 k, v, nx, n, j, mask;
@@ -654,6 +656,14 @@ static void gvn(void)
                     }
                     goto number;
                 }
+                /* x86-64 host: a choice made twice from the same test and values is one (the argument of a min / max
+                   macro, itself a ?:, is written out in both the comparison and the result: fit_vox2's
+                   FIT_IMIN (x, n - 2 < 0 ? 0 : n - 2) computed its clamp twice). MCC_NOSELCSE: off. */
+                if (opt_noselcse < 0)
+                    opt_noselcse = getenv("MCC_NOSELCSE") != 0;
+                if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && !opt_noselcse && f->ins[v].op == OP_SELECT &&
+                    f->ins[v].ty != IT_V128)
+                    goto number;
                 continue;
             }
             }
@@ -1060,6 +1070,37 @@ static int jt_eval(int op, int ty, u64 a, u64 b, u64 *r)
     return 1;
 }
 
+/* A comparison of an I32 value known to lie in 0..hi (hi below 2^31: a byte loaded unsigned, a masked value)
+   with the constant k, when every such value compares the same way: a predecessor that brings such a value
+   decides the branch as one that brings a constant does. The case is a decoder's symbol function that
+   returns a table's byte or -1 for failure, tested with "< 0" after inlining (vf_rdec_get in ufsm's volcomp:
+   the symbol went through test / jl once per token). MCC_NOJTR: constants only. */
+static int opt_nojtr = -1;
+
+static int jt_range(int op, u64 hi, u64 k, u64 *r)
+{
+    i64 sk = (i64)(i32)(u32)k, shi = (i64)hi;
+    u64 uk = (u32)k;
+    int v = -1;
+    switch (op) {
+    case OP_SLT: v = sk <= 0 ? 0 : sk > shi ? 1 : -1; break;
+    case OP_SGE: v = sk <= 0 ? 1 : sk > shi ? 0 : -1; break;
+    case OP_SLE: v = sk < 0 ? 0 : sk >= shi ? 1 : -1; break;
+    case OP_SGT: v = sk < 0 ? 1 : sk >= shi ? 0 : -1; break;
+    case OP_ULT: v = uk == 0 ? 0 : uk > hi ? 1 : -1; break;
+    case OP_UGE: v = uk == 0 ? 1 : uk > hi ? 0 : -1; break;
+    case OP_ULE: v = uk >= hi ? 1 : -1; break;
+    case OP_UGT: v = uk >= hi ? 0 : -1; break;
+    case OP_EQ: v = uk > hi ? 0 : -1; break;
+    case OP_NE: v = uk > hi ? 1 : -1; break;
+    default: break;
+    }
+    if (v < 0)
+        return 0;
+    *r = (u64)v;
+    return 1;
+}
+
 /* the block a use is in: a phi's argument k is used at the end of predecessor k */
 static int jt_used_ok(u32 x, u32 B, u32 S1, u32 S2, int s1d, int s2d, u32 *nin)
 {
@@ -1143,6 +1184,8 @@ static int jump_thread(void)
     int changed = 0;
     if (opt_nojt < 0)
         opt_nojt = getenv("MCC_NOJT") != 0;
+    if (opt_nojtr < 0)
+        opt_nojtr = getenv("MCC_NOJTR") != 0;
     if (opt_nojt || opt_dev_fn || opt_cuda)
         return 0;
     compute_dom();
@@ -1186,11 +1229,15 @@ static int jump_thread(void)
                 Ins *i = &f->ins[body[m]];
                 u32 *ops, n, q;
                 u64 a[3] = {0, 0, 0};
+                int ar[3] = {0, 0, 0}, ety = i->ty; /* ar[q]: operand q is not a constant but an I32 in 0..a[q] */
                 IR_OPS(f, i, ops, n);
                 if (n > 2) {
                     ok = 0;
                     break;
                 }
+                /* (a comparison is of its operands' width, not its result's) */
+                if (i->op >= OP_EQ && i->op <= OP_UGE)
+                    ety = f->ins[ir_resolve(f, ops[0])].ty;
                 for (q = 0; q < n && ok; q++) {
                     u32 o = ir_resolve(f, ops[q]), t;
                     int found = 0;
@@ -1201,10 +1248,19 @@ static int jump_thread(void)
                             a[q] = val[t];
                             found = 1;
                         }
-                    if (!found && !ir_is_const(f, o, &a[q]))
-                        ok = 0;
+                    if (!found && !ir_is_const(f, o, &a[q])) {
+                        if (!opt_nojtr && f->ins[o].ty == IT_I32 && ety == IT_I32 && ir_umax32(f, o) < 0x80000000UL) {
+                            a[q] = ir_umax32(f, o);
+                            ar[q] = 1;
+                        } else {
+                            ok = 0;
+                        }
+                    }
                 }
-                if (ok && !jt_eval(i->op, i->ty, a[0], a[1], &val[m]))
+                if (ok && (ar[0] || ar[1])) {
+                    if (ar[1] || !jt_range(i->op, a[0], a[1], &val[m]))
+                        ok = 0;
+                } else if (ok && !jt_eval(i->op, ety, a[0], a[1], &val[m]))
                     ok = 0;
             }
             if (!ok)

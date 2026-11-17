@@ -52,6 +52,8 @@ int opt_vec_gather;
 static u32 *base, *cnt, *map, *lpos;
 static u32 *ioff; /* an index or address (K_IDX, K_ADDR): the value from outside the loop added to the counter before it
                      was widened (bit 31: taken away), as in a[i + k]; 0 if none */
+#define IOFF_ZX 0x20000000U /* in ioff: the value is added 32 bits wide and the sum zero-extended (guarded against wrapping) */
+static int zext_guard; /* such indexes are taken (MCC_NOVECZX: not) */
 static u32 idx_off, walk_off;
 static u32 gth[MAX_GATH], ngth; /* the gathering loads */ /* that of the index is_idx and the access walks found */
 static u32 L;
@@ -608,6 +610,122 @@ static void grange(u32 x, u32 P, u32 count, u32 *lo, u32 *hi)
     }
 }
 
+/* ---- 64-bit arithmetic that only its low 32 bits are taken of ----
+   `chunk[i] = (uint8_t) (key * 31 + i * 5 + (i >> 7))` with a 64-bit key is computed 64 bits wide in C, each int
+   term widened first, and then cut down again. Sums, differences, products, and / or / xor and left shifts give the
+   same low 32 bits whether they are worked out 64 or 32 bits wide, so a tree of them that only a truncation to
+   32 bits uses is done 32 bits wide, its widened terms taken as they were before widening and its terms from outside
+   the loop cut down once in front of it. This is exact, and what lets such a loop have lanes of four bytes (there
+   is no 64-bit vector multiplication, and elements of eight bytes do not mix with narrower ones).
+   MCC_NOVECNARROW: off. */
+static u32 *nuses; /* how often each value is used in the function (while narrow_loops runs) */
+static u32 nw_of[8], nw_to[8], nnw;
+
+static int nw_can(u32 x, u32 l, int depth)
+{
+    Ins *i = &f->ins[x];
+    u64 c;
+    if (i->ty != IT_I64)
+        return 0;
+    if (i->blk != l)
+        return i->blk != 0 || i->op == OP_CONST; /* fixed for the loop (constants are in no block) */
+    if (i->op == OP_ZEXT32 || i->op == OP_SEXT32)
+        return f->ins[i->a].ty == IT_I32; /* (whatever else uses the widened value keeps it) */
+    if (depth > 16 || nuses[x] != 1 || i->var) /* (-g: a variable's value keeps its width) */
+        return 0;
+    switch (i->op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_AND: case OP_OR: case OP_XOR:
+        return nw_can(i->a, l, depth + 1) && nw_can(i->b, l, depth + 1);
+    case OP_SHL:
+        return ir_is_const(f, i->b, &c) && c < 32 && nw_can(i->a, l, depth + 1);
+    default:
+        return 0;
+    }
+}
+
+static u32 nw_do(u32 x, u32 l, u32 P)
+{
+    Ins *i = &f->ins[x];
+    u64 c;
+    u32 k, a, b;
+    if (i->blk != l) {
+        if (ir_is_const(f, x, &c))
+            return ir_const(f, IT_I32, c & 0xffffffffU);
+        for (k = 0; k < nnw; k++)
+            if (nw_of[k] == x)
+                return nw_to[k];
+        a = mk(P, OP_TRUNC, IT_I32, x, 0);
+        if (nnw < 8) {
+            nw_of[nnw] = x;
+            nw_to[nnw++] = a;
+        }
+        return a;
+    }
+    if (i->op == OP_ZEXT32 || i->op == OP_SEXT32)
+        return i->a;
+    a = nw_do(i->a, l, P);
+    b = i->op == OP_SHL ? ir_const(f, IT_I32, f->ins[i->b].a) : nw_do(f->ins[x].b, l, P);
+    i = &f->ins[x];
+    i->a = a;
+    i->b = b;
+    i->ty = IT_I32;
+    return x;
+}
+
+static void narrow_loops(void)
+{
+    u32 b, v, k, nx, *ops, nops, n = f->nins, any = 0;
+    nuses = 0;
+    for (b = 1; b < f->nblk; b++) {
+        Block *bl = &f->blk[b];
+        u32 P;
+        if (bl->term != TERM_BR || bl->succ[0] != b || bl->succ[1] == b || bl->npreds != 2)
+            continue;
+        P = bl->preds[bl->preds[0] == b ? 1 : 0];
+        if (P == b || f->blk[P].term != TERM_JMP)
+            continue;
+        nnw = 0;
+        for (v = bl->first; v; v = nx) {
+            Ins *i = &f->ins[v];
+            nx = i->next;
+            if (i->op != OP_TRUNC || i->ty != IT_I32 || f->ins[i->a].blk != b || f->ins[i->a].op == OP_PHI ||
+                f->ins[i->a].op == OP_ZEXT32 || f->ins[i->a].op == OP_SEXT32)
+                continue;
+            if (!nuses) {
+                /* counted when first needed; a value this pass makes or changes is never asked about again */
+                u32 bb, x, j;
+                nuses = (u32 *)xmalloc((size_t)n * sizeof(u32));
+                memset(nuses, 0, (size_t)n * sizeof(u32));
+                for (bb = 1; bb < f->nblk; bb++) {
+                    if (f->blk[bb].arg && (f->blk[bb].term == TERM_BR || f->blk[bb].term == TERM_RET) && f->blk[bb].arg < n)
+                        nuses[f->blk[bb].arg] += 2; /* (a use that is no instruction: never narrowed) */
+                    for (k = 0; k < 2; k++)
+                        for (x = k ? f->blk[bb].first : f->blk[bb].phis; x; x = f->ins[x].next) {
+                            Ins *xi = &f->ins[x];
+                            IR_OPS(f, xi, ops, nops);
+                            for (j = 0; j < nops; j++)
+                                if (ops[j] < n)
+                                    nuses[ops[j]]++;
+                            /* (what else may name a value: counted too, which only ever keeps a tree as it is) */
+                            if ((xi->op == OP_CALL || xi->op == OP_MEMCPY || xi->op == OP_MEMZERO) && xi->c < n)
+                                nuses[xi->c]++;
+                        }
+                }
+            }
+            if (i->a >= n || v >= n || !nw_can(i->a, b, 0))
+                continue;
+            ir_replace(f, v, nw_do(i->a, b, P));
+            any = 1;
+        }
+    }
+    if (nuses)
+        free(nuses);
+    if (any) {
+        ir_resolve_all(f);
+        opt_dce(f); /* the widenings nothing uses any more */
+    }
+}
+
 static u32 missv; /* the instruction being looked at, for the report */
 #define MISS(why) \
     do { \
@@ -791,6 +909,19 @@ static int try_loop(u32 l, u32 n0)
             ioff[v] = a->b;
             continue;
         }
+        if (i->op == OP_ZEXT32 && !zok && zext_guard && !INV(i->a) && a->op == OP_ADD && a->ty == IT_I32 && cnt[i->a] == 1 &&
+            a->a != a->b) {
+            /* (unsigned) (k + i) widened, k any value fixed for the loop: the sum may wrap round 2^32, and then the
+               elements are not next to each other. The guard in front of the vector loop checks that it does not
+               within the loop's count (IOFF_ZX; below, where the arrays' starts are made). */
+            u32 x = !INV(a->a) && kind[a->a] == K_IVPHI ? a->a : a->b, y = x == a->a ? a->b : a->a;
+            if (!INV(x) && kind[x] == K_IVPHI && INV(y) && f->ins[y].ty == IT_I32 && y < IOFF_ZX && iv_step[iv_index(x)] == 1) {
+                base[v] = x;
+                ioff[v] = y | IOFF_ZX;
+                kind[i->a] = K_SKIP;
+            }
+            continue;
+        }
         if ((i->op != OP_SEXT32 && !zok) || INV(i->a) || (a->op != OP_ADD && a->op != OP_SUB) || a->ty != IT_I32 || cnt[i->a] != 1)
             continue;
         if (!INV(a->a) && kind[a->a] == K_IVPHI && INV(a->b) && f->ins[a->b].ty == IT_I32) {
@@ -837,6 +968,14 @@ static int try_loop(u32 l, u32 n0)
         switch (i->op) {
         case OP_SEXT32:
         case OP_ZEXT32:
+            if (ioff[v] & IOFF_ZX) {
+                /* (the guard makes these consecutive however the counter itself is compared and widened) */
+                if (!index_iv(base[v], IT_I32))
+                    MISS("an index of an unsupported kind");
+                kind[v] = K_IDX;
+                shift[v] = 0;
+                break;
+            }
             if (ioff[v]) {
                 /* a[i + k]: signed, so i + k does not wrap, and widened it is i widened plus k widened */
                 if (!index_iv(base[v], IT_I32) || (ext && ext != i->op))
@@ -1088,6 +1227,9 @@ static int try_loop(u32 l, u32 n0)
         for (k = 0; k < nred && narrow_ok; k++)
             if (!(red_op[k] == OP_ADD && f->ins[red_x[k]].op == OP_LOAD))
                 narrow_ok = 0;
+        for (k = 0; k < niv; k++)
+            if (iv_val[k] && f->ins[iv_phi[k]].ty == IT_I32)
+                narrow_ok = 0; /* the counter as a value has a lane of four bytes */
         mixed = !narrow_ok;
     }
     if (mixed) {
@@ -1237,8 +1379,13 @@ static int try_loop(u32 l, u32 n0)
         int q;
         if (INV(keys[k])) {
             q = iv_index(iv);
-            v = f->ins[iv].ty == IT_I32 ? mk(P, ext, IT_I64, iv_init[q], 0) : iv_init[q];
-            if (koff[k] & 0x40000000U)
+            v = koff[k] & IOFF_ZX ? 0 : f->ins[iv].ty == IT_I32 ? mk(P, ext, IT_I64, iv_init[q], 0) : iv_init[q];
+            if (koff[k] & IOFF_ZX) {
+                /* (unsigned) (k + i): the first index is the sum made 32 bits wide; the rest follow it one by one
+                   as long as first + count does not pass 2^32 */
+                v = mk(P, OP_ZEXT32, IT_I64, mk(P, OP_ADD, IT_I32, iv_init[q], outside(koff[k] & (IOFF_ZX - 1))), 0);
+                ok = mk(P, OP_AND, IT_I32, ok, mk(P, OP_ULE, IT_I32, mk(P, OP_ADD, IT_I64, v, count), C64((u64)1 << 32)));
+            } else if (koff[k] & 0x40000000U)
                 v = mk(P, OP_ADD, IT_I64, v, outside(koff[k] & 0x3fffffffU)); /* already 64 bits wide */
             else if (koff[k])
                 v = mk(P, koff[k] >> 31 ? OP_SUB : OP_ADD, IT_I64, v, mk(P, OP_SEXT32, IT_I64, outside(koff[k] & 0x7fffffffU), 0));
@@ -2026,6 +2173,11 @@ int opt_vectorise(Func *fn)
     vw = opt_arch == ARCH_X64 && f->avx && opt_x64_avx2 ? 32 : 16;
     vty = vw == 32 ? IT_V256 : IT_V128;
     ir_resolve_all(f);
+    zext_guard = opt_arch == ARCH_X64 && !getenv("MCC_NOVECZX");
+    if (opt_arch == ARCH_X64 && !getenv("MCC_NOVECNARROW")) {
+        narrow_loops();
+        n0 = fn->nins;
+    }
     kind = (u8 *)xmalloc((size_t)n0 * 3);
     shift = kind + n0;
     mmk = shift + n0;

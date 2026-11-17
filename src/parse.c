@@ -421,7 +421,8 @@ static int grabbing;
 /* host code at -O3: loops of a few trips (for d < 3 over coordinates), so the loop around them is one block the
    vectoriser takes, and the counter is a constant in each copy */
 #define UNROLL_HOST_N 16      /* (a loop over the 8 corners of a cell, 13 neighbours) */
-#define UNROLL_HOST_INS 1200  /* (8 corners x a short row loop: ufsm write_spatial_tm 1.11x, phase_blend_row 1.5x) */
+#define UNROLL_HOST_INS 3000  /* (8 corners x a short row loop: ufsm write_spatial_tm 1.11x, phase_blend_row 1.5x; 3000 from
+                                 1200: the ten ufsm tests 1976 G -> 1960 G of instructions, 4% more code) */
 #define UNROLL_HOST_LINE 1800 /* a body of straight-line code run at least 4 times: ufsm fit_vox2's 8 corners (8 x 212) */
 #define UNROLL_HOST_SIZE 4800 /* tokens (a cheap first test: UNROLL_HOST_INS decides) */
 static u32 au_n;
@@ -6700,6 +6701,16 @@ static int is_assign_op(int k)
    object that is wanted. Only the outermost conditional (and those that are its arms) sees it set. */
 static int ref_bind;
 
+/* x86-64 host: a vector chosen by ?: is copied into one temporary in each arm (which becomes a value), not chosen by
+   its address: the address left both arms in memory and the result a load through a pointer (MCC_NOCONDVEC) */
+static int condvec_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MCC_NOCONDVEC") == 0;
+    return on;
+}
+
 static void cond_expr(Expr *e)
 {
     Expr a, b, la, lb;
@@ -6801,7 +6812,8 @@ static void cond_expr(Expr *e)
         e->konst = (u8)(kc && a.konst && b.konst);
         return;
     }
-    if (cur_fn_dev && !opt_nocondrec && type_is_record(t) && !VK(t) && !type_is_128(t) && type_size(t) <= 64) {
+    if ((cur_fn_dev && !opt_nocondrec && type_is_record(t) && !VK(t) && !type_is_128(t) && type_size(t) <= 64) ||
+        (!cur_fn_dev && opt_arch == ARCH_X64 && VK(t) == 1 && condvec_on())) {
         /* device code: a record chosen by ?: is copied into a temporary in each arm, not chosen by its address. The
            address of one (a load from shared memory, a local made for make_float2(...)) left the local in memory and
            every read a generic load through the chosen pointer; a copy is split into values (lp_s2.cu:166, the GroupNorm

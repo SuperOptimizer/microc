@@ -1612,6 +1612,58 @@ static void jt_rewrite(u32 x, u32 S, u32 r)
 
 #define JT_MAXP 16
 #define JT_MAXI 8
+/* What a branch passed on the way says of o, in predecessor p of block B: p's own branch on o (or on o == 0), when
+   only one of its ways is B, or that of a block above p whose one way, to a block nothing else comes to, all of p's
+   paths took. A flag set in a few ifs and tested twice (ufsm's write_spatial_ref: if (!inside) ...; if (inside)
+   { ... }) is the case: the second test is decided by the first, so its block goes (and the flag, with one use left,
+   becomes branches: br_bools). exact: the value is wanted, not only whether it is zero. MCC_NOJTI: off. */
+static int opt_nojti = -1;
+static int jt_implied(u32 o, u32 p, u32 B, int exact, u64 *val)
+{
+    u32 x = p, d, steps = 0;
+    u64 z;
+    int oinv = 0;
+    if (opt_nojti < 0)
+        opt_nojti = getenv("MCC_NOJTI") != 0;
+    if (opt_nojti || (f->ins[o].ty != IT_I32 && f->ins[o].ty != IT_I64))
+        return 0;
+    if (exact && !ir_is_bool(f, o, 3))
+        exact = 2; /* only "is zero" is a value */
+    /* (x != 0 and x == 0 are what x says, the second the other way round) */
+    while ((f->ins[o].op == OP_EQ || f->ins[o].op == OP_NE) && ir_is_const(f, f->ins[o].b, &z) && z == 0) {
+        oinv ^= f->ins[o].op == OP_EQ;
+        o = ir_resolve(f, f->ins[o].a);
+    }
+    for (d = p; steps < 48; steps++) {
+        Block *db = &f->blk[d];
+        if (db->term == TERM_BR && db->succ[0] != db->succ[1] && db->arg) {
+            u32 c = ir_resolve(f, db->arg), way = 2;
+            int inv = 0, hit = 0;
+            if (steps == 0)
+                way = db->succ[0] == B ? 0 : db->succ[1] == B ? 1 : 2;
+            else if (f->blk[x].npreds == 1)
+                way = db->succ[0] == x ? 0 : db->succ[1] == x ? 1 : 2;
+            while ((f->ins[c].op == OP_EQ || f->ins[c].op == OP_NE) && ir_is_const(f, f->ins[c].b, &z) && z == 0) {
+                inv ^= f->ins[c].op == OP_EQ;
+                c = ir_resolve(f, f->ins[c].a);
+            }
+            hit = c == o;
+            if (hit && way < 2) {
+                int nz = ((way == 0) != inv) != oinv;
+                if (nz && exact == 2)
+                    return 0;
+                *val = nz ? 1 : 0;
+                return 1;
+            }
+        }
+        if (d == 1 || rpo_num[d] == 0xffffffffU || !idom[d] || idom[d] == d)
+            return 0;
+        x = d;
+        d = idom[d];
+    }
+    return 0;
+}
+
 static int jump_thread(void)
 {
     u32 B, v, k, j;
@@ -1628,8 +1680,14 @@ static int jump_thread(void)
         u32 S[2], np = bb->npreds, to[JT_MAXP], body[JT_MAXI], nb = 0, phis[JT_MAXI * 2], nphi = 0, cnt[2] = {0, 0};
         u64 val[JT_MAXI];
         int ok = 1, sd[2];
-        if (bb->term != TERM_BR || rpo_num[B] == 0xffffffffU || np < 2 || np > JT_MAXP || !bb->phis)
+        if (bb->term != TERM_BR || rpo_num[B] == 0xffffffffU || np < 2 || np > JT_MAXP)
             continue;
+        if (!bb->phis) {
+            /* (no phi: only what a branch above says of the condition can decide) */
+            u32 c0 = ir_resolve(f, bb->arg);
+            if (!jt_implied(c0, bb->preds[0], B, 0, &val[0]))
+                continue;
+        }
         S[0] = bb->succ[0];
         S[1] = bb->succ[1];
         if (S[0] == S[1] || S[0] == B || S[1] == B || S[0] == 1 || S[1] == 1)
@@ -1682,7 +1740,7 @@ static int jump_thread(void)
                             a[q] = val[t];
                             found = 1;
                         }
-                    if (!found && !ir_is_const(f, o, &a[q])) {
+                    if (!found && !ir_is_const(f, o, &a[q]) && !jt_implied(o, p, B, 1, &a[q])) {
                         if (!opt_nojtr && f->ins[o].ty == IT_I32 && ety == IT_I32 && ir_umax32(f, o) < 0x80000000UL) {
                             a[q] = ir_umax32(f, o);
                             ar[q] = 1;
@@ -1707,7 +1765,7 @@ static int jump_thread(void)
             } else if (f->ins[c].op == OP_PHI && f->ins[c].blk == B) {
                 if (!ir_is_const(f, ir_resolve(f, f->xargs[f->ins[c].a + k]), &cv))
                     ok = 0;
-            } else {
+            } else if (!jt_implied(c, p, B, 0, &cv)) {
                 ok = 0;
             }
             to[k] = cv ? 0 : 1;

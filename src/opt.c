@@ -223,6 +223,212 @@ static int mem_class(int mem)
     return 0; /* character access: may touch anything */
 }
 
+/* ---- which object an address is in (x86-64 host; MCC_NOALIASROOT: off) ----
+   The root of an address is what it was computed from by adding and subtracting: a local (OP_SLOT), a global object
+   (OP_ADDR), a pointer parameter (OP_PARAM with PARAM_PTR), or the result of an allocation (OP_CALL with IF_FRESH).
+   Anything else (a pointer read from memory, a phi, a call's result) is its own root, of which nothing is known. Two
+   addresses with different known roots are in different objects, except that a parameter may point into a global
+   object or where another parameter points, unless it is declared restrict. An address of unknown root can be in a
+   local, an allocation or what a restrict parameter points to only if that one's address has escaped: was stored,
+   passed to a call, merged in a phi or a select, returned, or used in arithmetic other than the above. (ufsm fit_vox2:
+   the stores to its local arrays and through its ic / gv parameters no longer make it read f->delta, f->h, f->lx again;
+   LLVM's BasicAA reasons the same way from allocas, globals, noalias arguments and captures.) */
+static u32 *al_root;    /* by value, for those that were there when alias_prepare ran: its root, 0 = not yet worked out */
+static u8 *al_esc;      /* by value: the address this parameter or allocation gives has escaped */
+static u8 *al_slot_esc; /* by slot */
+static u32 al_n, al_nslots, al_cap, al_slotcap;
+static int al_on, al_deep;
+static int opt_noaliasroot = -1;
+
+/* Are roots worked out in this compilation? (parse.c marks the pointer parameters and the allocations for it.
+   MCC_ALIASROOT: on other machines than x86-64 too, for testing.) */
+int opt_alias_roots(void)
+{
+    if (opt_noaliasroot < 0)
+        opt_noaliasroot = getenv("MCC_NOALIASROOT") != 0 || (opt_arch != ARCH_X64 && !getenv("MCC_ALIASROOT"));
+    return !opt_noaliasroot;
+}
+
+static int root_known(u32 r)
+{
+    const Ins *i = &f->ins[r];
+    switch (i->op) {
+    case OP_SLOT: case OP_ADDR:
+        return 1;
+    case OP_PARAM:
+        return (i->flags & PARAM_PTR) != 0;
+    case OP_CALL:
+        return (i->flags & IF_FRESH) != 0;
+    }
+    return 0;
+}
+
+static u32 root_of(u32 v, int depth)
+{
+    const Ins *i;
+    u32 r, ra, rb;
+    int ka, kb;
+    if (v < al_n && al_root[v])
+        return al_root[v];
+    i = &f->ins[v];
+    r = v;
+    if (depth > 1000) {
+        al_deep = 1; /* (a chain this long is not followed: nothing is concluded from roots in this function) */
+    } else if (i->op == OP_COPY || i->op == OP_PIN) {
+        r = root_of(i->a, depth + 1);
+    } else if ((i->op == OP_ADD || i->op == OP_SUB) && i->ty == IT_I64) {
+        /* the pointer is the operand whose root is known (the other is an index, or a pointer of which nothing
+           is known: then so is the sum) */
+        ra = root_of(i->a, depth + 1);
+        rb = root_of(i->b, depth + 1);
+        ka = root_known(ra);
+        kb = root_known(rb);
+        if (ka && !kb)
+            r = ra;
+        else if (kb && !ka && i->op == OP_ADD)
+            r = rb;
+    }
+    if (v < al_n)
+        al_root[v] = r;
+    return r;
+}
+
+static void root_escapes(u32 v)
+{
+    u32 r = root_of(v, 0);
+    const Ins *i = &f->ins[r];
+    if (i->op == OP_SLOT) {
+        if (i->a < al_nslots)
+            al_slot_esc[i->a] = 1;
+    } else if (r < al_n) {
+        al_esc[r] = 1;
+    }
+}
+
+/* Before a pass that asks may_alias: the roots, and which of them escape. */
+static void alias_prepare(void)
+{
+    u32 b, v, k, n;
+    al_on = 0;
+    al_n = 0;
+    if (!opt_alias_roots() || opt_dev_fn || opt_cuda || opt_level < 2)
+        return;
+    if (al_cap < f->nins) {
+        al_cap = f->nins * 2;
+        al_root = (u32 *)xrealloc(al_root, al_cap * sizeof(u32));
+        al_esc = (u8 *)xrealloc(al_esc, al_cap);
+    }
+    if (al_slotcap < f->nslots + 1) {
+        al_slotcap = f->nslots * 2 + 16;
+        al_slot_esc = (u8 *)xrealloc(al_slot_esc, al_slotcap);
+    }
+    memset(al_root, 0, f->nins * sizeof(u32));
+    memset(al_esc, 0, f->nins);
+    memset(al_slot_esc, 0, f->nslots + 1);
+    al_n = f->nins;
+    al_nslots = f->nslots;
+    al_deep = 0;
+    for (b = 1; b < f->nblk; b++) {
+        Block *bb = &f->blk[b];
+        for (v = bb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                root_escapes(f->xargs[f->ins[v].a + k]);
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            switch (i->op) {
+            case OP_LOAD: case OP_MEMCPY: case OP_MEMZERO: case OP_VLOAD:
+            case OP_EQ: case OP_NE: case OP_SLT: case OP_SLE: case OP_SGT: case OP_SGE:
+            case OP_ULT: case OP_ULE: case OP_UGT: case OP_UGE:
+                continue; /* addresses read through, written through or compared */
+            case OP_STORE:
+                root_escapes(i->b);
+                continue;
+            case OP_VSTORE:
+                root_escapes(i->b);
+                continue;
+            case OP_COPY: case OP_PIN:
+                continue;
+            case OP_ADD: case OP_SUB:
+                if (i->ty == IT_I64) {
+                    u32 ra = root_of(i->a, 0), rb = root_of(i->b, 0);
+                    if (root_of(v, 0) != v)
+                        continue; /* an address in the same object */
+                    if (i->op == OP_SUB && root_known(ra) && root_known(rb))
+                        continue; /* the distance between two addresses is not an address */
+                }
+                break;
+            }
+            n = ir_opcount(f, v);
+            for (k = 0; k < n; k++)
+                root_escapes(*ir_opref(f, v, k));
+        }
+        if (bb->term == TERM_RET && bb->arg)
+            root_escapes(bb->arg);
+    }
+    al_on = !al_deep;
+}
+
+static int opt_norestrict = -1;
+
+/* 1: the address of root r is in an object that only addresses with this root reach. */
+static int root_private(u32 r)
+{
+    const Ins *i = &f->ins[r];
+    switch (i->op) {
+    case OP_SLOT:
+        return i->a < al_nslots && !al_slot_esc[i->a];
+    case OP_PARAM:
+        if (opt_norestrict < 0)
+            opt_norestrict = getenv("MCC_NORESTRICT") != 0; /* restrict (and a record passed by value) says nothing */
+        return (i->flags & PARAM_RESTRICT) && !opt_norestrict && r < al_n && !al_esc[r];
+    case OP_CALL:
+        return (i->flags & IF_FRESH) && r < al_n && !al_esc[r];
+    }
+    return 0;
+}
+
+/* 1: addresses a and b are known to be in different objects. */
+static int roots_apart(u32 a, u32 b)
+{
+    u32 ra, rb;
+    const Ins *ia, *ib;
+    int ka, kb;
+    if (!al_on)
+        return 0;
+    ra = root_of(a, 0);
+    rb = root_of(b, 0);
+    if (al_deep) {
+        al_on = 0;
+        return 0;
+    }
+    if (ra == rb)
+        return 0;
+    ka = root_known(ra);
+    kb = root_known(rb);
+    if (!ka && !kb)
+        return 0;
+    if (!ka || !kb)
+        return root_private(ka ? ra : rb);
+    ia = &f->ins[ra];
+    ib = &f->ins[rb];
+    if (ia->op == ib->op && (ia->op == OP_SLOT || ia->op == OP_ADDR))
+        return ia->a != ib->a; /* (the same local or global at another offset is another value) */
+    if ((ia->op == OP_PARAM && (ib->op == OP_PARAM || ib->op == OP_ADDR)) || (ib->op == OP_PARAM && ia->op == OP_ADDR))
+        return root_private(ra) || root_private(rb); /* (root_private of a global is 0) */
+    return 1; /* a local, a global, what a parameter points to, an allocation: no two of different kinds share
+                 memory, nor do two allocations */
+}
+
+/* A call that is not known to leave memory alone may have written wherever an address that escaped points. */
+static int call_spares(u32 addr)
+{
+    u32 r;
+    if (!al_on)
+        return 0;
+    r = root_of(addr, 0);
+    return !al_deep && root_private(r);
+}
+
 /* May an access of kind ma at address a overlap one of kind mb at b? */
 static int may_alias(u32 a, int ma, u32 b, int mb)
 {
@@ -241,6 +447,8 @@ static int may_alias(u32 a, int ma, u32 b, int mb)
     }
     if (!fa && !fb && addr_base(a, &oa) == addr_base(b, &ob))
         return oa < ob + (i64)sb && ob < oa + (i64)sa;
+    if (roots_apart(a, b))
+        return 0;
     /* unrelated addresses: the language says objects are accessed through
        their own type (or as characters) */
     if (opt_strict_aliasing && mem_class(ma) != mem_class(mb) && mem_class(ma) && mem_class(mb))
@@ -253,6 +461,27 @@ static void mem_kill(u32 addr, int mem)
     u32 k, n = 0;
     for (k = 0; k < nmem; k++)
         if (!may_alias(mem_tab[k].addr, mem_tab[k].mem, addr, mem))
+            mem_tab[n++] = mem_tab[k];
+    nmem = n;
+}
+
+/* After a call: what is known of memory the callee cannot reach stays known. */
+static void mem_kill_call(void)
+{
+    u32 k, n = 0;
+    for (k = 0; k < nmem; k++)
+        if (call_spares(mem_tab[k].addr))
+            mem_tab[n++] = mem_tab[k];
+    nmem = n;
+}
+
+/* After a write of some length at addr (a block copied or cleared, a vector stored): what is in other objects stays
+   known. */
+static void mem_kill_object(u32 addr)
+{
+    u32 k, n = 0;
+    for (k = 0; k < nmem; k++)
+        if (roots_apart(mem_tab[k].addr, addr))
             mem_tab[n++] = mem_tab[k];
     nmem = n;
 }
@@ -297,6 +526,115 @@ static MemEntry *out_find(u32 blk, u32 addr, int mem)
     return 0;
 }
 
+/* x86-64 host (with roots; MCC_NOMEMLOOP: off): the state of memory on entry to the head b of a loop, the k-th block in
+   rpo. What the ways in from outside agree on is still so at every trip unless the loop writes there: its stores are
+   looked at one by one, its calls spare what they cannot reach (call_spares). So a load inside a loop, or after it,
+   of what was read or written before it is that value, even where licm may not move the load (one that not every
+   trip runs). Without this a loop head started from nothing. */
+static int opt_nomemloop = -1;
+static u32 *lp_mark, *lp_stack, lp_cap, lp_stamp;
+
+static void mem_enter_loop(u32 b, u32 k)
+{
+    Block *bb = &f->blk[b];
+    u32 p, j, q = 0, sp = 0, nin = 0, v;
+    if (opt_nomemloop < 0)
+        opt_nomemloop = getenv("MCC_NOMEMLOOP") != 0;
+    if (opt_nomemloop || !al_on)
+        return;
+    for (p = 0; p < bb->npreds; p++) {
+        u32 r = rpo_num[bb->preds[p]];
+        if (r == 0xffffffffU)
+            return;
+        if (r >= k) {
+            if (!dominates(b, bb->preds[p]))
+                return; /* (entered in the middle: not a loop with one head) */
+        } else if (!nin++) {
+            q = r;
+        }
+    }
+    if (!nin || !out_n[q])
+        return;
+    /* what all the ways in agree on (no phi is made here: the ways back have no state yet) */
+    for (j = 0; j < out_n[q]; j++) {
+        MemEntry e = out_tab[(size_t)q * MEM_CAP + j];
+        for (p = 0; p < bb->npreds; p++) {
+            MemEntry *o;
+            if (rpo_num[bb->preds[p]] >= k || rpo_num[bb->preds[p]] == q)
+                continue;
+            o = out_find(bb->preds[p], e.addr, e.mem);
+            if (!o || o->val != e.val || o->join != e.join || o->from_store != e.from_store)
+                break;
+        }
+        if (p == bb->npreds)
+            mem_tab[nmem++] = e;
+    }
+    if (!nmem)
+        return;
+    /* the blocks of the loop: those from which a way back is reached without passing b */
+    if (lp_cap < f->nblk + 1) {
+        lp_cap = f->nblk * 2 + 16;
+        lp_mark = (u32 *)xrealloc(lp_mark, lp_cap * sizeof(u32));
+        lp_stack = (u32 *)xrealloc(lp_stack, lp_cap * sizeof(u32));
+        memset(lp_mark, 0, lp_cap * sizeof(u32));
+        lp_stamp = 0;
+    }
+    if (++lp_stamp == 0) {
+        memset(lp_mark, 0, lp_cap * sizeof(u32));
+        lp_stamp = 1;
+    }
+    lp_mark[b] = lp_stamp;
+    for (p = 0; p < bb->npreds; p++)
+        if (rpo_num[bb->preds[p]] >= k && lp_mark[bb->preds[p]] != lp_stamp) {
+            lp_mark[bb->preds[p]] = lp_stamp;
+            lp_stack[sp++] = bb->preds[p];
+        }
+    while (sp) {
+        Block *xb = &f->blk[lp_stack[--sp]];
+        for (p = 0; p < xb->npreds; p++) {
+            u32 x = xb->preds[p];
+            if (x >= lp_cap || rpo_num[x] == 0xffffffffU) {
+                nmem = 0; /* (not expected: a way into the loop that no path reaches) */
+                return;
+            }
+            if (lp_mark[x] != lp_stamp) {
+                lp_mark[x] = lp_stamp;
+                lp_stack[sp++] = x;
+            }
+        }
+    }
+    for (j = k; j < nrpo && nmem; j++) {
+        u32 x = rpo[j];
+        if (lp_mark[x] != lp_stamp)
+            continue;
+        for (v = f->blk[x].first; v && nmem; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            switch (i->op) {
+            case OP_STORE:
+                mem_kill(ir_resolve(f, i->a), i->mem); /* (gvn has not been here yet: the operand may be a copy) */
+                break;
+            case OP_CALL:
+                if (!(i->flags & IF_PURE))
+                    mem_kill_call();
+                break;
+            case OP_XI:
+                if (i->flags & XI_EFFECT)
+                    mem_kill_call();
+                break;
+            case OP_VSTORE:
+                if (i->c && root_known(root_of(i->c, 0)))
+                    nmem = 0;
+                else
+                    mem_kill_object(ir_resolve(f, i->a));
+                break;
+            case OP_MEMCPY: case OP_MEMZERO:
+                mem_kill_object(ir_resolve(f, i->a));
+                break;
+            }
+        }
+    }
+}
+
 /* The state of memory on entry to block b, the k-th in rpo. */
 static void mem_enter(u32 b, u32 k)
 {
@@ -307,8 +645,10 @@ static void mem_enter(u32 b, u32 k)
     if (!bb->npreds)
         return;
     for (p = 0; p < bb->npreds; p++)
-        if (rpo_num[bb->preds[p]] >= k)
-            return; /* a way in not yet visited (a loop), or one that cannot be reached */
+        if (rpo_num[bb->preds[p]] >= k) {
+            mem_enter_loop(b, k); /* a way in not yet visited (a loop), or one that cannot be reached */
+            return;
+        }
     q = rpo_num[bb->preds[0]];
     t = out_tab + (size_t)q * MEM_CAP;
     if (bb->npreds == 1) {
@@ -462,6 +802,7 @@ static void gvn(void)
 {
     u32 k, v, nx, n, j, mask;
     compute_dom();
+    alias_prepare();
     hdr = 0;
     if (getenv("MCC_HOISTD"))
         hoist_depth = (u32)atoi(getenv("MCC_HOISTD"));
@@ -591,16 +932,22 @@ static void gvn(void)
                         pure_add(v);
                     continue;
                 }
-                nmem = 0;
+                mem_kill_call();
+                continue;
+            case OP_VSTORE:
+                if (i->c && (!al_on || root_known(root_of(i->c, 0)))) { /* (the address is a + c: a is taken for the pointer) */
+                    nmem = 0;
+                    continue;
+                }
+                mem_kill_object(i->a);
                 continue;
             case OP_MEMCPY:
             case OP_MEMZERO:
-            case OP_VSTORE:
-                nmem = 0;
+                mem_kill_object(i->a);
                 continue;
             case OP_XI:
                 if (i->flags & XI_EFFECT)
-                    nmem = 0;
+                    mem_kill_call();
                 continue;
             case OP_SELECT: {
                 u64 cv;
@@ -2310,13 +2657,20 @@ static int bool_regroup(void)
    arguments that every trip makes goes before the loop (clang: readnone calls). MCC_NOPURELICM: off */
 static int opt_nopurelicm = -1;
 
+static int opt_licmcalls = -1;
+#define LICM_STORES 48 /* the stores of a loop that are remembered (16 without roots) */
+#define LICM_WHOLE 0xff /* store_mem: a write of unknown length */
+
 static int licm(void)
 {
     u32 *mark, *stack, k, j, p, v, nx, sp, nblk0 = f->nblk;
     int any_replaced = 0;
     if (opt_nopurelicm < 0)
         opt_nopurelicm = getenv("MCC_NOPURELICM") != 0;
+    if (opt_licmcalls < 0)
+        opt_licmcalls = getenv("MCC_LICMCALLS") != 0;
     compute_dom();
+    alias_prepare();
     mark = (u32 *)xmalloc(cap_blocks * 2 * sizeof(u32));
     stack = mark + cap_blocks;
     memset(mark, 0, cap_blocks * sizeof(u32));
@@ -2324,10 +2678,10 @@ static int licm(void)
     /* inner loops first: their headers come later in reverse postorder */
     for (k = nrpo; k-- > 0;) {
         u32 h = rpo[k], pre = 0, noutside = 0;
-        u32 store_addr[16], nstores = 0, deref[24], nderef = 0, exiting[8], nexiting = 0;
-        u8 store_mem[16], deref_size[24];
+        u32 store_addr[LICM_STORES], nstores = 0, deref[24], nderef = 0, exiting[8], nexiting = 0;
+        u8 store_mem[LICM_STORES], deref_size[24];
         u32 hoisted[32], nhoisted = 0;
-        int clobbers_all = 0, replaced = 0;
+        int clobbers_all = 0, replaced = 0, has_call = 0;
         Block *hb = &f->blk[h];
 
         sp = 0;
@@ -2461,11 +2815,26 @@ static int licm(void)
             }
             for (v = f->blk[b].first; v; v = f->ins[v].next) {
                 Ins *i = &f->ins[v];
-                if ((i->op == OP_CALL && !(i->flags & IF_PURE && !opt_nopurelicm)) || i->op == OP_MEMCPY || i->op == OP_MEMZERO ||
-                    i->op == OP_VSTORE || (i->op == OP_XI && (i->flags & XI_EFFECT))) {
-                    clobbers_all = 1;
+                if ((i->op == OP_CALL && !(i->flags & IF_PURE && !opt_nopurelicm)) || (i->op == OP_XI && (i->flags & XI_EFFECT))) {
+                    /* A call writes only where an escaped address points (call_spares), but a load taken out of a
+                       loop with calls has its value in a callee-saved register or, more often, in a stack slot read
+                       after every call: no fewer loads, and a test of memory becomes a load and a test (ufsm
+                       warp_w4_ref: +2 G instructions in test_spatial_augment). So such loops keep their loads,
+                       unless MCC_LICMCALLS asks (for measuring). */
+                    if (al_on && opt_licmcalls)
+                        has_call = 1;
+                    else
+                        clobbers_all = 1;
+                } else if (i->op == OP_MEMCPY || i->op == OP_MEMZERO || i->op == OP_VSTORE) {
+                    /* a write of some length: with roots, into the object i->a is in */
+                    if (!al_on || nstores == LICM_STORES || (i->op == OP_VSTORE && i->c && root_known(root_of(i->c, 0)))) {
+                        clobbers_all = 1;
+                    } else {
+                        store_addr[nstores] = i->a;
+                        store_mem[nstores++] = LICM_WHOLE;
+                    }
                 } else if (i->op == OP_STORE) {
-                    if (nstores == 16) {
+                    if (nstores == (al_on ? LICM_STORES : 16)) {
                         clobbers_all = 1;
                     } else {
                         store_addr[nstores] = i->a;
@@ -2542,8 +2911,10 @@ static int licm(void)
                         ok = deref[p] == i->a && mem_size(i->mem) <= deref_size[p];
                     if (ok)
                         ok = defined_outside(i->a, mark, h);
+                    if (ok && has_call && !call_spares(i->a))
+                        ok = 0;
                     for (p = 0; ok && p < nstores; p++)
-                        if (may_alias(store_addr[p], store_mem[p], i->a, i->mem))
+                        if (store_mem[p] == LICM_WHOLE ? !roots_apart(store_addr[p], i->a) : may_alias(store_addr[p], store_mem[p], i->a, i->mem))
                             ok = 0;
                 } else {
                     ok = 0;
@@ -2573,7 +2944,7 @@ static int licm(void)
         /* addresses and constants that take more than one instruction to
            produce are put in registers before the loop */
         {
-            u32 pin_of[6], pin_v[6], npins = 0, maxpins = clobbers_all ? 2 : 6;
+            u32 pin_of[6], pin_v[6], npins = 0, maxpins = clobbers_all || has_call ? 2 : 6;
             for (v = f->blk[pre].first; v; v = f->ins[v].next) {
                 if (f->ins[v].op == OP_PIN && npins < maxpins) {
                     pin_of[npins] = f->ins[v].a;

@@ -1,0 +1,17 @@
+local_vs_param 25.125
+local_escaped 24
+local_vs_loaded 507.5
+local_through_struct 98
+global_vs_global 1.5 6
+param_vs_global 8
+param_vs_param 4 4
+restrict_param 15
+restrict_escaped 15
+long_vs_pointer 10.5
+fresh 82.5
+calls 659
+through_integer 930
+chosen 183 233
+blocks 2.5
+self_store 15 5.25
+exit 0

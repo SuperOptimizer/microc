@@ -33,6 +33,10 @@ enum { K_NONE, K_IDX, K_ADDR, K_VEC, K_MASK, K_RED, K_SKIP, K_IVPHI, K_IVNEXT, K
 #define MAX_VECS 12 /* few enough that none is ever spilled */
 
 static u8 *kind, *shift;
+static u8 *lext; /* narrow lanes (narrow_exts): how each value of the loop stands to its lane, as lane_ext says */
+static int ext_lanes; /* x86-64: comparisons, right shifts and byte / short conversions in lanes of one or two bytes
+                         where the values are known to be what their lanes hold (MCC_NOVECEXT: lanes of four bytes) */
+static int nar; /* this loop is done that way */
 static u8 *mmk; /* a select that is a lane-by-lane maximum or minimum: MM_* bits, else 0; a comparison: 1 if also used as a number */
 static int mixed;  /* x86-64: elements of different sizes, all in lanes of four bytes (narrower ones widened as they are
                       read and narrowed as they are written) */
@@ -373,6 +377,8 @@ static int lane_ext(u32 x)
         return i->mem == M_8U || i->mem == M_16U ? 1 : i->mem == M_8S || i->mem == M_16S ? 2 : 0;
     if (kind[x] == K_VEC && mmk[x])
         return shift[x]; /* worked out for it below */
+    if (nar)
+        return kind[x] == K_MASK ? 3 : kind[x] == K_VEC ? lext[x] : 0; /* (a comparison as a number is 0 or 1) */
     return 0;
 }
 
@@ -428,9 +434,9 @@ static int x64_has(u32 v)
     case OP_MUL:
         return lanesz == 2 || (lanesz == 4 && sse41);
     case OP_SHL: case OP_SHR:
-        return lanesz > 1;
+        return lanesz > 1 || ext_lanes; /* (bytes: the shift of 16-bit lanes, and a mask) */
     case OP_SAR:
-        return lanesz == 2 || lanesz == 4;
+        return lanesz == 2 || lanesz == 4 || (nar && lanesz == 1); /* (of a zero-extended byte: a logical shift) */
     case OP_EQ: case OP_NE: case OP_SLT: case OP_SLE: case OP_SGT: case OP_SGE:
     case OP_ULT: case OP_ULE: case OP_UGT: case OP_UGE:
         return lanesz <= 4;
@@ -444,6 +450,142 @@ static int x64_has(u32 v)
     default:
         return 1;
     }
+}
+
+/* ---- narrow lanes that know what they hold ----
+   A lane of one or two bytes holds the low bits of the int the C program computes. That is all a sum, a product, a
+   left shift or a store needs, but a comparison, a right shift or a conversion to a wider type needs the whole
+   value. Where the value is known to be its lane zero-extended (a byte read as unsigned char, x & 15, x >> 1 of
+   such, a comparison's 0 or 1) or sign-extended (a signed char read), those work on the lanes too: bytes compare as
+   the ints do, the logical shift of a zero-extended lane shifts in the zeros the int has, and (uint8_t) x is the
+   lane itself. So `u[i] = (uint8_t) ((u[i] >> 1) ^ (uint8_t) (0u - (u[i] & 1u)))` (volcomp's zigzag) or
+   `m[i] = a[i] != 0 && b[i] == t` runs 32 bytes to a vector instead of 8 widened ones.
+   ext_of: 1 = the value is its lane zero-extended, 2 = sign-extended, 3 = both, 0 = only the low bits are right. */
+static int ext_of(u32 x)
+{
+    Ins *i = &f->ins[x];
+    u64 c;
+    u32 bits = lanesz * 8;
+    if (ir_is_const(f, x, &c)) {
+        i64 sc = (i64)(i32)(u32)c, hi = ((i64)1 << bits) - 1, lo = -((i64)1 << (bits - 1));
+        return i->ty != IT_I32 ? 0 : (sc >= 0 && sc <= hi ? 1 : 0) | (sc >= lo && sc <= hi / 2 ? 2 : 0);
+    }
+    if (i->ty != IT_I32)
+        return 0;
+    if (INV(x)) {
+        if (i->op == OP_LOAD && (u32)mem_size(i->mem) <= lanesz)
+            return i->mem == M_8U || i->mem == M_16U ? ((u32)mem_size(i->mem) < lanesz ? 3 : 1) : 2;
+        return ir_umax32(f, x) < ((u32)1 << bits) ? 1 : 0;
+    }
+    if (kind[x] == K_MASK)
+        return 3; /* as a number: 0 or 1 */
+    return kind[x] == K_VEC ? lext[x] : 0;
+}
+
+static int minmax_op(u32 v);
+static int x64_has(u32 v);
+
+/* Can every instruction of the loop l work in lanes of lanesz (1 or 2) bytes? Fills lext, puts in shift[] of a
+   comparison the comparison of the lanes that decides as the ints' does, and notes the masks byte shifts need. */
+static int narrow_exts(u32 l, u32 cond)
+{
+    u32 v, bits = lanesz * 8;
+    for (v = f->blk[l].first; v; v = f->ins[v].next) {
+        Ins *i = &f->ins[v];
+        int ea, eb, e;
+        u64 c;
+        lext[v] = 0;
+        if (v == cond || (kind[v] != K_VEC && kind[v] != K_MASK))
+            continue;
+        if (i->op == OP_LOAD) {
+            lext[v] = i->mem == M_8U || i->mem == M_16U ? 1 : 2;
+            continue;
+        }
+        if (i->op == OP_SELECT) {
+            if (mmk[v]) {
+                if ((mmk[v] & MM_FL) || !minmax_op(v))
+                    return 0;
+                lext[v] = shift[v];
+            } else {
+                if (i->ty != IT_I32)
+                    return 0;
+                lext[v] = (u8)(ext_of(i->b) & ext_of(i->c));
+            }
+            continue;
+        }
+        if (i->op == OP_CALL || (kind[v] == K_VEC && i->ty != IT_I32) || (kind[v] == K_MASK && f->ins[i->a].ty != IT_I32))
+            return 0;
+        ea = ext_of(i->a);
+        eb = ir_opcount_tab[i->op] >= 2 ? ext_of(i->b) : 0;
+        switch (i->op) {
+        case OP_ZEXT8:
+            lext[v] = lanesz == 1 ? 1 : 3;
+            break;
+        case OP_ZEXT16:
+            if (lanesz != 2)
+                return 0;
+            lext[v] = 1;
+            break;
+        case OP_SEXT8:
+            lext[v] = 2;
+            break;
+        case OP_SEXT16:
+            if (lanesz != 2)
+                return 0;
+            lext[v] = 2;
+            break;
+        case OP_AND:
+            e = ((ea | eb) & 1) | (ea & eb & 2);
+            lext[v] = (u8)(ea == 3 || eb == 3 ? 3 : e);
+            break;
+        case OP_OR: case OP_XOR:
+            lext[v] = (u8)(ea & eb);
+            break;
+        case OP_ADD: case OP_SUB: case OP_NEG:
+            break;
+        case OP_MUL:
+            if (lanesz != 2)
+                return 0;
+            break;
+        case OP_SAR:
+            /* (unsigned char) x >> 1 is an int's arithmetic shift of a value that is not negative: the logical one */
+            if (!(ea & 1)) {
+                if (!ir_is_const(f, i->b, &c) || c >= bits || !(ea & 2) || lanesz != 2)
+                    return 0;
+                lext[v] = 2;
+                break;
+            }
+            /* fall through */
+        case OP_SHL: case OP_SHR:
+            if (!ir_is_const(f, i->b, &c) || c >= bits || (i->op != OP_SHL && !(ea & 1)))
+                return 0;
+            if (lanesz == 1 && !note_splat(ir_const(f, IT_I32, i->op != OP_SHL ? 0xffu >> c : (0xffu << c) & 0xff)))
+                return 0;
+            if (i->op != OP_SHL)
+                lext[v] = (u8)(c ? 3 : 1);
+            break;
+        case OP_EQ: case OP_NE:
+            if (!(ea & eb))
+                return 0;
+            shift[v] = 0;
+            break;
+        case OP_SLT: case OP_SLE: case OP_SGT: case OP_SGE:
+            /* sign-extended lanes compare with sign as the ints do; zero-extended ones without */
+            if (!(ea & eb))
+                return 0;
+            shift[v] = (u8)(ea & eb & 2 ? 0 : i->op + (OP_ULT - OP_SLT));
+            break;
+        case OP_ULT: case OP_ULE: case OP_UGT: case OP_UGE:
+            /* (without sign the order of sign-extended values is their lanes' too) */
+            if (!(ea & eb))
+                return 0;
+            shift[v] = 0;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* x86-64 has 14 vector registers to give out, and a vector value is never spilled: the most vector values
@@ -938,6 +1080,7 @@ static int try_loop(u32 l, u32 n0)
 
     lanesz = 0;
     mixed = 0;
+    nar = 0;
     ngth = 0;
     nsplat = 0;
     ninvc = 0;
@@ -1123,6 +1266,7 @@ static int try_loop(u32 l, u32 n0)
             if ((!va || !vb) && !note_splat(va ? i->b : i->a))
                 MISS("too many values from outside the loop");
             kind[v] = K_MASK; /* full width only, unless a select below makes a maximum or minimum of it */
+            shift[v] = 0;       /* (narrow lanes: the comparison to build instead, narrow_exts) */
             nvec++;
             break;
         }
@@ -1220,6 +1364,16 @@ static int try_loop(u32 l, u32 n0)
     if (opt_arch == ARCH_X64 && lanesz && lanesz < 4 && !mixed) {
         /* narrow lanes cannot do it: lanes of four bytes, the elements widened, can (they do what C does) */
         int narrow_ok = maxsh < lanesz * 8 && !full_only;
+        u32 nsplat0 = nsplat;
+        u64 c0, c1;
+        if (ext_lanes) {
+            nar = 1;
+            narrow_ok = narrow_exts(l, cond);
+            /* a count known to be too small for two vectors of narrow lanes: lanes of four bytes still do some of it */
+            if (narrow_ok && iv_step[c] == 1 && ir_is_const(f, n, &c1) && ir_is_const(f, iv_init[c], &c0) &&
+                (i64)(i32)(u32)c1 - (i64)(i32)(u32)c0 <= (i64)(vw / lanesz * 2))
+                narrow_ok = 0;
+        }
         for (v = f->blk[l].first; v && narrow_ok; v = f->ins[v].next)
             if ((kind[v] == K_VEC && mmk[v] && !minmax_op(v)) || ((kind[v] == K_VEC || kind[v] == K_MASK) && !x64_has(v)) ||
                 (kind[v] == K_VEC && (f->ins[v].ty == IT_F32 || f->ins[v].ty == IT_F64)))
@@ -1231,6 +1385,16 @@ static int try_loop(u32 l, u32 n0)
             if (iv_val[k] && f->ins[iv_phi[k]].ty == IT_I32)
                 narrow_ok = 0; /* the counter as a value has a lane of four bytes */
         mixed = !narrow_ok;
+        if (nar && narrow_ok) {
+            full_only = 0; /* each use was looked at */
+            maxsh = 0;
+        } else if (nar) {
+            nar = 0;
+            nsplat = nsplat0;
+            for (v = f->blk[l].first; v; v = f->ins[v].next)
+                if (kind[v] == K_MASK)
+                    shift[v] = 0;
+        }
     }
     if (mixed) {
         if (maxmem > 4)
@@ -1648,10 +1812,23 @@ static int try_loop(u32 l, u32 n0)
                     nv = mk(V, OP_VMATH, vty, x, 0);
                     f->ins[nv].b = (u32)shift[v] - 1;
                 }
+            } else if (nar && (in.op == OP_ZEXT8 || in.op == OP_SEXT8 || in.op == OP_ZEXT16 || in.op == OP_SEXT16) &&
+                       lanesz == (in.op == OP_ZEXT8 || in.op == OP_SEXT8 ? 1u : 2u)) {
+                map[v] = vec_operand(in.a, P); /* the lane is the byte (the short) already */
+                continue;
+            } else if (nar && lanesz == 1 && (in.op == OP_SHL || in.op == OP_SHR || in.op == OP_SAR)) {
+                /* bytes: shifted as halves of 16-bit lanes, then the bits that came over from the neighbour cleared
+                   (an arithmetic shift here is of a zero-extended lane, narrow_exts: the logical one) */
+                u32 sc = f->ins[in.b].a;
+                x = mk(V, in.op == OP_SHL ? OP_SHL : OP_SHR, vty, vec_operand(in.a, P), in.b);
+                f->ins[x].mem = M_16U;
+                nv = mk(V, OP_AND, vty, x, vec_operand(ir_const(f, IT_I32, in.op != OP_SHL ? 0xffu >> sc : (0xffu << sc) & 0xff), P));
+            } else if (nar && in.op == OP_SAR && (ext_of(in.a) & 1)) {
+                nv = mk(V, OP_SHR, vty, vec_operand(in.a, P), in.b);
             } else if (in.op == OP_ZEXT8 || in.op == OP_ZEXT16) {
                 nv = mk(V, OP_AND, vty, vec_operand(in.a, P), vec_operand(ir_const(f, IT_I32, in.op == OP_ZEXT8 ? 0xff : 0xffff), P));
             } else if (in.op == OP_SEXT8 || in.op == OP_SEXT16) {
-                u32 cn = ir_const(f, IT_I32, in.op == OP_SEXT8 ? 24 : 16);
+                u32 cn = ir_const(f, IT_I32, lanesz * 8 - (in.op == OP_SEXT8 ? 8 : 16));
                 x = mk(V, OP_SHL, vty, vec_operand(in.a, P), cn);
                 f->ins[x].mem = (u8)lk;
                 nv = mk(V, OP_SAR, vty, x, cn);
@@ -1676,7 +1853,7 @@ static int try_loop(u32 l, u32 n0)
                     lk = lane_kind(f->ins[in.a].ty);
                 x = vec_operand(in.a, P);
                 y = vec_operand(in.b, P);
-                nv = mk(V, in.op, vty, x, y);
+                nv = mk(V, kind[v] == K_MASK && shift[v] ? shift[v] : in.op, vty, x, y);
             }
             f->ins[nv].mem = (u8)lk;
             map[v] = nv;
@@ -2178,9 +2355,11 @@ int opt_vectorise(Func *fn)
         narrow_loops();
         n0 = fn->nins;
     }
-    kind = (u8 *)xmalloc((size_t)n0 * 3);
+    kind = (u8 *)xmalloc((size_t)n0 * 4);
     shift = kind + n0;
     mmk = shift + n0;
+    lext = mmk + n0;
+    ext_lanes = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXT");
     base = (u32 *)xmalloc((size_t)n0 * 5 * sizeof(u32));
     cnt = base + n0;
     map = cnt + n0;

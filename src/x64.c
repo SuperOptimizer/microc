@@ -1529,7 +1529,7 @@ static void sel_avx_more(u32 v)
             emit_vex(VE(0x39, 3, 1, 0) | VE_L, XF_MR, hi, x, NOREG, NOREG, 1); /* vextracti128 */
             lo = new_vreg(1 | VC_V128);
             emit(X_YMOVLO, 0, lo, x, NOREG);
-            if ((fl == 0 && !fsum) || fl >= 5) {
+            if ((fl == 0 && !fsum) || fl == 5 || fl == 6) {
                 /* each half summed (in its wider total), then the two added */
                 u32 s1 = new_vreg(cls_of(i->ty)), s2 = new_vreg(cls_of(i->ty));
                 m = emit(X_VSUM, 0, s1, lo, NOREG);
@@ -1545,6 +1545,7 @@ static void sel_avx_more(u32 v)
                 static const u8 across[5] = {0, 0x3d, 0x39, 0x3f, 0x3b}; /* vpmaxsd vpminsd vpmaxud vpminud */
                 u32 c = new_vreg(1 | VC_V128);
                 u32 enc = !fl ? VE(0x58, 1, ak == M_F64, 0)                          /* vaddps / pd */
+                          : fl >= 7 ? VE(fl == 7 ? 0xeb : fl == 8 ? 0xdb : 0xef, 1, 1, 0) /* vpor / vpand / vpxor */
                           : fsum ? VE(fl == 1 ? 0x5f : 0x5d, 1, ak == M_F64, 0) /* vmaxps / vminps (pd) */
                                  : VE(across[fl], 2, 1, 0);
                 emit_vex(enc, XF_RVM, c, lo, hi, NOREG, -1);
@@ -4392,13 +4393,15 @@ static void encode_vec(MIns *i)
         u32 v = vloc(i->s0), T = FSCR0, U = FSCR1;
         int k = i->cc, fl = (int)i->imm;
         u32 add = k == M_F32 ? O_0F | 0x58 : k == M_F64 ? O_66 | O_0F | 0x58 : k == M_64 ? O_66 | O_0F | 0xd4 : O_66 | O_0F | 0xfe;
-        if (fl >= 1 && fl <= 4 && (k == M_F32 || k == M_F64)) {
+        if (fl >= 7) {
+            add = O_66 | O_0F | (fl == 7 ? 0xeb : fl == 8 ? 0xdb : 0xef); /* por pand pxor: the lanes' bits combined */
+        } else if (fl >= 1 && fl <= 4 && (k == M_F32 || k == M_F64)) {
             add = (k == M_F64 ? O_66 : 0) | O_0F | (fl == 1 ? 0x5f : 0x5d); /* maxps minps (pd) */
         } else if (fl >= 1 && fl <= 4) {
             static const u32 across[5] = { 0, O_38 | 0x3d, O_38 | 0x39, O_38 | 0x3f, O_38 | 0x3b }; /* pmaxsd pminsd pmaxud pminud */
             add = O_66 | O_0F | across[fl];
         }
-        if (fl >= 5) {
+        if (fl == 5 || fl == 6) {
             if (mem_bytes[k] == 1 && fl == 5) {
                 op_rr(O_66 | O_0F | 0xef, 0, T, T);      /* pxor */
                 op_rr(O_66 | O_0F | 0xf6, 0, T, v);      /* psadbw: two sums of eight */

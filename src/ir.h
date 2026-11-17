@@ -64,7 +64,7 @@ enum {
     OP_VLOAD,  /* address a + b */
     OP_VSTORE, /* b = vector, address a + c */
     OP_VSPLAT, /* the scalar a in every lane */
-    OP_VSUM,   /* the lanes of a combined into a scalar; flags: 0 sum, 1-4 as the next four, 5/6 sum of unsigned/signed lanes into a wider total */
+    OP_VSUM,   /* the lanes of a combined into a scalar; flags: 0 sum, 1-4 as the next four, 5/6 sum of unsigned/signed lanes into a wider total, 7/8/9 or / and / xor (x86-64) */
     OP_VSMAX, OP_VSMIN, OP_VUMAX, OP_VUMIN, /* lane by lane */
     OP_VIOTA, /* 0, a, 2a, ... in the lanes; a is a number, not a value */
     OP_VGATHER, /* lanes of four bytes: lane k = the element (kind in flags) at a + (b's lane k, sign-extended) << c (a number);

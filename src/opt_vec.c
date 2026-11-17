@@ -877,6 +877,7 @@ static void narrow_loops(void)
    edge goes through a new block where each such value is chosen between the scalar loop's and the vectors'.
    MCC_NOVECEXACT: as before. */
 static int vec_exact;
+static int vec_bitred; /* x86-64: or / and / xor carried round a loop are reductions */
 #define MAX_LIVE 8
 static u32 live_of[MAX_LIVE], nlive;
 
@@ -1068,8 +1069,10 @@ static int try_loop(u32 l, u32 n0)
             red_x[nred] = x;
             kind[ri->a] = K_SKIP;
         } else {
-            /* floating-point sums come out differently when added in another order: only on request */
-            if (!(ri->op == OP_ADD || (ri->op == OP_FADD && opt_fast_math)) || (ri->a != ph && ri->b != ph) || ri->a == ri->b ||
+            /* floating-point sums come out differently when added in another order: only on request.
+               x86-64: any |= s[k], all &= m[i], parity ^= b[i] likewise, in any order (MCC_NOVECBITRED: not) */
+            int bitred = (ri->op == OP_OR || ri->op == OP_AND || ri->op == OP_XOR) && vec_bitred && (ri->ty == IT_I32 || ri->ty == IT_I64);
+            if (!(ri->op == OP_ADD || (ri->op == OP_FADD && opt_fast_math) || bitred) || (ri->a != ph && ri->b != ph) || ri->a == ri->b ||
                 cnt[ph] != 1)
                 MISS("a value carried from one iteration to the next that is not a sum (floating-point sums need -ffast-math)");
             red_op[nred] = ri->op;
@@ -1736,7 +1739,9 @@ static int try_loop(u32 l, u32 n0)
             f->xargs[f->ins[acc[k][0]].a] = f->xargs[f->ins[red_phi[k]].a + pp];
             continue;
         }
-        z = red_op[k] == OP_ADD ? ir_const(f, ty, 0) : red_op[k] == OP_FADD ? ir_fconst(f, ty, 0.0) : f->xargs[f->ins[red_phi[k]].a + pp];
+        z = red_op[k] == OP_ADD || red_op[k] == OP_OR || red_op[k] == OP_XOR ? ir_const(f, ty, 0)
+            : red_op[k] == OP_AND ? ir_const(f, ty, ty == IT_I32 ? 0xffffffffU : ~(u64)0)
+            : red_op[k] == OP_FADD ? ir_fconst(f, ty, 0.0) : f->xargs[f->ins[red_phi[k]].a + pp];
         z = mk(P, OP_VSPLAT, vty, z, 0);
         f->ins[z].mem = (u8)lane_kind(ty);
         for (u = 0; u < un; u++) {
@@ -1947,8 +1952,9 @@ static int try_loop(u32 l, u32 n0)
             }
             val = mk(M, OP_VSUM, f->ins[ph].ty, val, 0);
             f->ins[val].mem = (u8)lk;
-            f->ins[val].flags = (u8)(comb == OP_VSMAX ? 1 : comb == OP_VSMIN ? 2 : comb == OP_VUMAX ? 3 : comb == OP_VUMIN ? 4 : 0);
-            if (comb == OP_ADD || comb == OP_FADD)
+            f->ins[val].flags = (u8)(comb == OP_VSMAX ? 1 : comb == OP_VSMIN ? 2 : comb == OP_VUMAX ? 3 : comb == OP_VUMIN ? 4 :
+                                     comb == OP_OR ? 7 : comb == OP_AND ? 8 : comb == OP_XOR ? 9 : 0);
+            if (comb == OP_ADD || comb == OP_FADD || comb == OP_OR || comb == OP_AND || comb == OP_XOR)
                 val = mk(M, comb, f->ins[ph].ty, f->xargs[f->ins[ph].a + pp], val);
             red_fin[k] = val;
         }
@@ -2469,6 +2475,7 @@ int opt_vectorise(Func *fn)
     lext = mmk + n0;
     ext_lanes = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXT");
     vec_exact = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXACT");
+    vec_bitred = opt_arch == ARCH_X64 && !getenv("MCC_NOVECBITRED");
     base = (u32 *)xmalloc((size_t)n0 * 5 * sizeof(u32));
     cnt = base + n0;
     map = cnt + n0;

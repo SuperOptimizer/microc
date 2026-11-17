@@ -11,9 +11,12 @@
 #include <stdio.h>
 #include <string.h>
 
-/* physical register ids: 0..15 as the processor numbers them, 32..47 = xmm0..xmm15 */
+/* physical register ids: 0..15 as the processor numbers them, 32..63 = xmm0..xmm31 */
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
 #define XMM0 32
+#define XMM16 (XMM0 + 16) /* xmm16-xmm31: named by EVEX encodings only (AVX-512), allocated where opt_x64_xmm16 says */
+#define XHI(r) ((r) != NOREG && (r) >= XMM16 && (r) < VREG0)
+#define XHI_MASK ((u64)0xffff << XMM16)
 #define SCR0 R10 /* never allocated: for spilled operands and long sequences */
 #define SCR1 R11
 #define FSCR0 (XMM0 + 14)
@@ -118,8 +121,9 @@ enum { CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A, CC_S, CC_NS, CC_P, CC
 static const MTarget target = {
     { 0xf3cfUL,               /* rax rcx rdx rbx rsi rdi r8 r9 r12-r15 */
       0x1fffUL << 32 },       /* xmm0-xmm12 */
-    0x3c7UL | (0xffffUL << 32), /* rax rcx rdx rsi rdi r8 r9; every xmm */
-    X_MOV
+    0x3c7UL | (0xffffffffUL << 32), /* rax rcx rdx rsi rdi r8 r9; every xmm */
+    X_MOV,
+    XHI_MASK, 0
 };
 
 static int vex3; /* scalar float arithmetic as AVX's three-operand instructions (-mavx; MCC_NOVEX3: the SSE ones) */
@@ -855,6 +859,9 @@ static void sel_atomic(u32 v)
 }
 
 int opt_x64_fma;
+int opt_x64_xmm16; /* AVX-512 F, VL, BW and DQ (-march=native / x86-64-v4): xmm16-xmm31 hold the floating and vector values
+                      that xmm0-xmm12 have no room for, where every instruction on them has an EVEX form (MCC_NOXMM16: off;
+                      MCC_XMM16=2: such values go there first in every function, to test the encodings) */
 int opt_x64_bmi2; /* BMI2 (-mbmi2, -march=native / x86-64-v3): shifts by a register count as shlx / shrx / sarx (MCC_NOSHLX: shl %cl) */
 int opt_math_errno = 1; /* sqrt of a negative number sets errno (as the C library's does): not done in line; -fno-math-errno */
 
@@ -3722,6 +3729,201 @@ static void b4(u32 v)
     buf_u32(text, v);
 }
 
+/* ---- EVEX: the encodings that name xmm16-xmm31 ----
+   An SSE or AVX instruction on one of those registers is written as its AVX-512 twin: the same opcode, map and
+   prefix under an EVEX prefix. evex_form says whether there is such a twin that does the same thing (0: none; then
+   x16_mark keeps the instruction's registers below xmm16), which W it wants, where the legacy two-operand form's
+   destination goes as a source, and what an 8-bit displacement counts in. The twins of vandps and the like are
+   AVX-512DQ, those of the byte and word instructions AVX-512BW, and all at 128 and 256 bits are AVX-512VL: the
+   three opt_x64_xmm16 asks for. Not here: the comparisons that make a vector mask and the blends by one, the
+   horizontal adds, sign, test and movmsk instructions, vperm2f128 (EVEX has other instructions, or none), and the
+   VEX gathers. */
+#define EV_OK 1
+#define EV_W1 2    /* EVEX.W set (else clear) */
+#define EV_WG 4    /* W as the instruction has it (the operand size: vmovd / vmovq, vcvtsi2ss, vpsrlvd / q, FMA) */
+#define EV_NDS 8   /* the legacy form's destination is also its first source: vvvv */
+#define EV_NDSR 16 /* ... between registers only (movss, movsd) */
+#define EV_NDD 32  /* a legacy shift by an immediate: the register shifted is r/m and vvvv */
+#define EV_FV 64   /* disp8 counts vectors (16 or 32 bytes) */
+#define EV_T1 128  /* disp8 counts scalars: 4 bytes, 8 with W */
+
+static u32 evex_form(u32 map, u32 pp, u32 opc)
+{
+    u32 pd = pp == 1 ? EV_W1 : 0;  /* packed: ps | pd by the 66 prefix */
+    u32 sd = pp == 3 ? EV_W1 : 0;  /* scalar: ss (f3) | sd (f2) */
+    if (map == 1) {
+        switch (opc) {
+        case 0x10: case 0x11: /* movups movupd movss movsd */
+            return pp < 2 ? EV_OK | pd | EV_FV : EV_OK | sd | EV_T1 | EV_NDSR;
+        case 0x12: /* movhlps / movlps; movsldup; movddup */
+            return pp == 0 ? EV_OK | EV_NDS : pp == 2 ? EV_OK : pp == 3 ? EV_OK | EV_W1 : 0;
+        case 0x16: /* movlhps / movhps; movshdup */
+            return pp == 0 ? EV_OK | EV_NDS : pp == 2 ? EV_OK : 0;
+        case 0x14: case 0x15: case 0xc6: /* unpcklps unpckhps shufps (pd) */
+        case 0x54: case 0x55: case 0x56: case 0x57: /* andps andnps orps xorps (pd) */
+            return pp < 2 ? EV_OK | pd | EV_NDS | EV_FV : 0;
+        case 0x28: case 0x29: /* movaps movapd */
+            return pp < 2 ? EV_OK | pd | EV_FV : 0;
+        case 0x2a: /* cvtsi2ss cvtsi2sd */
+            return pp >= 2 ? EV_OK | EV_WG | EV_NDS | EV_T1 : 0;
+        case 0x2c: case 0x2d: /* cvttss2si cvtss2si (sd) */
+            return pp >= 2 ? EV_OK | EV_WG : 0;
+        case 0x2e: case 0x2f: /* ucomiss comiss (sd) */
+            return pp < 2 ? EV_OK | pd | EV_T1 : 0;
+        case 0x51: /* sqrt */
+            return pp < 2 ? EV_OK | pd | EV_FV : EV_OK | sd | EV_NDS | EV_T1;
+        case 0x58: case 0x59: case 0x5c: case 0x5d: case 0x5e: case 0x5f: /* add mul sub min div max */
+            return pp < 2 ? EV_OK | pd | EV_NDS | EV_FV : EV_OK | sd | EV_NDS | EV_T1;
+        case 0x5a: /* cvtps2pd cvtpd2ps cvtss2sd cvtsd2ss */
+            return pp == 0 ? EV_OK : pp == 1 ? EV_OK | EV_W1 | EV_FV : EV_OK | sd | EV_NDS | EV_T1;
+        case 0x5b: /* cvtdq2ps cvtps2dq cvttps2dq */
+            return pp < 3 ? EV_OK | EV_FV : 0;
+        case 0xe6: /* cvttpd2dq cvtdq2pd cvtpd2dq */
+            return pp == 1 ? EV_OK | EV_W1 | EV_FV : pp == 2 ? EV_OK : pp == 3 ? EV_OK | EV_W1 | EV_FV : 0;
+        case 0x6f: case 0x7f: /* movdqa movdqu (vmovdqa32, vmovdqu32) */
+            return pp == 1 || pp == 2 ? EV_OK | EV_FV : 0;
+        case 0x70: /* pshufd pshufhw pshuflw */
+            return pp ? EV_OK | EV_FV : 0;
+        case 0x7e: /* movd / movq to a general register or memory; movq xmm, xmm / m64 */
+            return pp == 1 ? EV_OK | EV_WG | EV_T1 : pp == 2 ? EV_OK | EV_W1 | EV_T1 : 0;
+        }
+        if (pp != 1)
+            return 0;
+        switch (opc) {
+        case 0x60: case 0x61: case 0x62: case 0x63: case 0x67: case 0x68: case 0x69: case 0x6a: case 0x6b:
+            return EV_OK | EV_NDS | EV_FV; /* punpckl bw wd dq, packsswb, packuswb, punpckh bw wd dq, packssdw */
+        case 0x6c: case 0x6d: /* punpcklqdq punpckhqdq */
+            return EV_OK | EV_W1 | EV_NDS | EV_FV;
+        case 0x6e: /* movd / movq from a general register or memory */
+            return EV_OK | EV_WG | EV_T1;
+        case 0x71: case 0x72: /* shifts of words and doublewords by an immediate */
+            return EV_OK | EV_NDD;
+        case 0x73: /* ... of quadwords, and of the register by bytes */
+            return EV_OK | EV_W1 | EV_NDD;
+        case 0xc4: /* pinsrw */
+            return EV_OK | EV_NDS;
+        case 0xc5: /* pextrw */
+            return EV_OK;
+        case 0xd1: case 0xd2: case 0xe1: case 0xe2: case 0xf1: case 0xf2: /* psrlw psrld psraw psrad psllw pslld by a register */
+            return EV_OK | EV_NDS;
+        case 0xd3: case 0xf3: /* psrlq psllq */
+            return EV_OK | EV_W1 | EV_NDS;
+        case 0xd4: case 0xf4: case 0xfb: /* paddq pmuludq psubq */
+            return EV_OK | EV_W1 | EV_NDS | EV_FV;
+        case 0xd6: /* movq to memory */
+            return EV_OK | EV_W1 | EV_T1;
+        case 0xdb: case 0xdf: case 0xeb: case 0xef: /* pand pandn por pxor (vpandd ...; with W the q forms: the same bits) */
+            return EV_OK | EV_WG | EV_NDS | EV_FV;
+        case 0xd5: case 0xd8: case 0xd9: case 0xda: case 0xdc: case 0xdd: case 0xde: /* pmullw psubus pminub paddus pmaxub */
+        case 0xe0: case 0xe3: case 0xe4: case 0xe5: case 0xe8: case 0xe9: case 0xea: /* pavg pmulhuw pmulhw psubs pminsw */
+        case 0xec: case 0xed: case 0xee: case 0xf5: case 0xf6:                       /* padds pmaxsw pmaddwd psadbw */
+        case 0xf8: case 0xf9: case 0xfa: case 0xfc: case 0xfd: case 0xfe:            /* psub b w d, padd b w d */
+            return EV_OK | EV_NDS | EV_FV;
+        }
+        return 0;
+    }
+    if (pp != 1)
+        return 0;
+    if (map == 2) {
+        if ((opc >= 0x98 && opc <= 0x9f) || (opc >= 0xa8 && opc <= 0xaf) || (opc >= 0xb8 && opc <= 0xbf))
+            return EV_OK | EV_WG | EV_NDS | (opc & 1 ? EV_T1 : EV_FV); /* FMA: packed, scalar */
+        switch (opc) {
+        case 0x00: case 0x04: case 0x0b: case 0x0c: case 0x16: case 0x2b: case 0x36: /* pshufb pmaddubsw pmulhrsw vpermilps */
+        case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c: case 0x3d: case 0x3e: /* vpermps packusdw vpermd, pmin / pmax */
+        case 0x3f: case 0x40: case 0x46:                                             /* pmulld vpsravd */
+            return EV_OK | EV_NDS | EV_FV;
+        case 0x0d: case 0x28: /* vpermilpd pmuldq */
+            return EV_OK | EV_W1 | EV_NDS | EV_FV;
+        case 0x45: case 0x47: /* vpsrlvd / q, vpsllvd / q */
+            return EV_OK | EV_WG | EV_NDS | EV_FV;
+        case 0x1c: case 0x1d: case 0x1e: /* pabs b w d */
+            return EV_OK | EV_FV;
+        case 0x13: /* vcvtph2ps */
+        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: /* pmovsx */
+        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: /* pmovzx */
+        case 0x78: case 0x79: /* vpbroadcastb / w */
+            return EV_OK;
+        case 0x18: case 0x58: /* vbroadcastss vpbroadcastd */
+            return EV_OK | EV_T1;
+        case 0x19: case 0x59: /* vbroadcastsd vpbroadcastq */
+            return EV_OK | EV_W1 | EV_T1;
+        }
+        return 0;
+    }
+    if (map == 3) {
+        switch (opc) {
+        case 0x00: case 0x01: case 0x05: case 0x09: /* vpermq vpermpd vpermilpd, roundpd (vrndscalepd) */
+            return EV_OK | EV_W1 | EV_FV;
+        case 0x04: case 0x08: /* vpermilps, roundps (vrndscaleps) */
+            return EV_OK | EV_FV;
+        case 0x0a: /* roundss (vrndscaless) */
+            return EV_OK | EV_NDS | EV_T1;
+        case 0x0b: /* roundsd */
+            return EV_OK | EV_W1 | EV_NDS | EV_T1;
+        case 0x0f: /* palignr */
+            return EV_OK | EV_NDS | EV_FV;
+        case 0x14: case 0x17: case 0x19: case 0x1d: case 0x39: /* pextrb extractps vextractf128 vcvtps2ph vextracti128 */
+            return EV_OK;                                      /* (the extracts as vextractf32x4, vextracti32x4) */
+        case 0x16: /* pextrd / q */
+            return EV_OK | EV_WG;
+        case 0x18: case 0x20: case 0x38: /* vinsertf128 pinsrb vinserti128 (vinsertf32x4, vinserti32x4) */
+            return EV_OK | EV_NDS;
+        case 0x22: /* pinsrd / q */
+            return EV_OK | EV_WG | EV_NDS;
+        case 0x25: /* vpternlogd / q: EVEX only */
+            return EV_OK | EV_WG | EV_NDS | EV_FV;
+        }
+    }
+    return 0;
+}
+
+static u32 disp8n; /* mem_tail: what an 8-bit displacement counts in (EVEX); 0: bytes */
+
+/* The EVEX prefix and the opcode. reg and vvvv are registers or NOREG (reg may be a /digit); base is the r/m register
+   when idx is NOREG and it is an xmm register, else the memory operand's base, idx its index. */
+static void evex_put(u32 map, u32 pp, u32 w, u32 ll, u32 opc, u32 reg, u32 vvvv, u32 idx, u32 base, u32 aaa)
+{
+    u32 r = reg == NOREG ? 0 : reg & 31, v = vvvv == NOREG ? 0 : vvvv & 31, b = base == NOREG ? 0 : base & 31;
+    u32 x = idx == NOREG ? b >> 4 : idx >> 3 & 1;
+    if (XHI(idx))
+        die("internal: x86-64: xmm16-xmm31 as an index in %s", f->name);
+    b1(0x62);
+    b1(((r >> 3 & 1) ^ 1) << 7 | (x ^ 1) << 6 | ((b >> 3 & 1) ^ 1) << 5 | ((r >> 4) ^ 1) << 4 | map);
+    b1(w << 7 | (~v & 15) << 3 | 4 | pp);
+    b1(ll << 5 | ((v >> 4) ^ 1) << 3 | aaa);
+    b1(opc);
+}
+
+/* An instruction written with legacy prefixes, on xmm16-xmm31: its EVEX twin. Returns the unit of disp8. */
+static u32 legacy_evex(u32 op, int w, u32 reg, u32 idx, u32 base, int mem)
+{
+    u32 map = op & O_3A ? 3 : op & O_38 ? 2 : 1, pre = op >> 16 & 0xff;
+    u32 pp = pre == 0x66 ? 1 : pre == 0xf3 ? 2 : pre == 0xf2 ? 3 : 0;
+    u32 fm = (op & O_0F) && !(op & (O_B8R | O_B8M)) ? evex_form(map, pp, op & 0xff) : 0, ew, vv = NOREG;
+    if (!fm || ((fm & EV_NDD) && mem))
+        die("internal: x86-64: xmm16-xmm31 in an instruction with no EVEX form (%lx) in %s", (unsigned long)op, f->name);
+    ew = fm & EV_WG ? (u32)(w != 0) : fm & EV_W1 ? 1 : 0;
+    if ((fm & EV_NDS) || ((fm & EV_NDSR) && !mem))
+        vv = reg;
+    if (fm & EV_NDD)
+        vv = base;
+    evex_put(map, pp, ew, 0, op & 0xff, reg, vv, idx, base, 0);
+    return fm & EV_T1 ? (ew ? 8 : 4) : fm & EV_FV ? 16 : 0;
+}
+
+/* A memory operand after an EVEX prefix: disp8 in units of n bytes, or (n 0: not known) no disp8 at all. */
+static void mem_tail(u32 reg, const EA *ea, u32 immbytes);
+
+static void evex_tail(u32 n, u32 reg, const EA *ea, u32 immbytes)
+{
+    EA e = *ea;
+    if (!n && e.sym == NOSLOT && e.base != NOREG && (e.disp != 0 || (e.base & 7) == 5))
+        e.force32 = 1;
+    disp8n = n;
+    mem_tail(reg, &e, immbytes);
+    disp8n = 0;
+}
+
 static void op_prefix(u32 op, int w, u32 reg, u32 idx, u32 base)
 {
     u32 rex = 0;
@@ -3753,17 +3955,23 @@ static void op_prefix(u32 op, int w, u32 reg, u32 idx, u32 base)
 /* register direct; for a /digit instruction reg is the digit */
 static void op_rr(u32 op, int w, u32 reg, u32 rm)
 {
-    op_prefix(op, w, reg, NOREG, rm);
+    if (XHI(reg) || XHI(rm))
+        legacy_evex(op, w, reg, NOREG, rm, 0);
+    else
+        op_prefix(op, w, reg, NOREG, rm);
     b1(0xc0 | (reg & 7) << 3 | (rm & 7));
 }
-
-static void mem_tail(u32 reg, const EA *ea, u32 immbytes);
 
 /* immbytes: how many bytes of immediate follow the operand */
 static void op_mem(u32 op, int w, u32 reg, const EA *ea, u32 immbytes)
 {
     if (ea->fs)
         b1(0x64);
+    if (XHI(reg)) {
+        u32 n = ea->sym != NOSLOT ? legacy_evex(op, w, reg, NOREG, NOREG, 1) : legacy_evex(op, w, reg, ea->idx, ea->base, 1);
+        evex_tail(n, reg, ea, immbytes);
+        return;
+    }
     if (ea->sym != NOSLOT)
         op_prefix(op, w, reg, NOREG, NOREG);
     else
@@ -3787,26 +3995,32 @@ static void vex_prefix(u32 enc, u32 reg, u32 vvvv, u32 idx, u32 base)
     b1(XE_OPC(enc));
 }
 
-/* EVEX (enc with Z): 512 bits, no masking; registers below 16 only (R', V', the X of a register r/m stay clear) */
-static void evex_prefix(u32 enc, u32 reg, u32 vvvv, u32 idx, u32 base, u32 aaa)
+/* The EVEX prefix and opcode of enc: one with Z (512 bits, W as it says, k1 if it says), or the twin of a VEX
+   instruction that has xmm16-xmm31 among its registers. Returns the unit of disp8 (0: not known). */
+static u32 evex_prefix(u32 enc, u32 reg, u32 vvvv, u32 idx, u32 base)
 {
-    u32 R = reg != NOREG && (reg & 8), X = idx != NOREG && (idx & 8), B = base != NOREG && (base & 8);
-    u32 vv = vvvv == NOREG ? 0 : vvvv & 15;
-    b1(0x62);
-    b1((R ? 0 : 0x80) | (X ? 0 : 0x40) | (B ? 0 : 0x20) | 0x10 | (u32)XE_MAP(enc));
-    b1((u32)XE_W(enc) << 7 | (~vv & 15) << 3 | 4 | (u32)XE_PP(enc));
-    b1(2 << 5 | 8 | aaa);
-    b1(XE_OPC(enc));
+    u32 w = XE_W(enc), ll = 2, n = 0, aaa = 0;
+    if (XE_Z(enc)) {
+        aaa = (u32)XE_K1(enc);
+    } else {
+        u32 fm = evex_form(XE_MAP(enc), XE_PP(enc), XE_OPC(enc));
+        if (!fm)
+            die("internal: x86-64: xmm16-xmm31 in a VEX instruction with no EVEX form (%lx) in %s", (unsigned long)enc, f->name);
+        if (!(fm & EV_WG))
+            w = fm & EV_W1 ? 1 : 0;
+        ll = (u32)XE_L(enc);
+        n = fm & EV_FV ? (u32)16 << ll : fm & EV_T1 ? (w ? 8 : 4) : 0;
+    }
+    evex_put(XE_MAP(enc), XE_PP(enc), w, ll, XE_OPC(enc), reg, vvvv, idx, base, aaa);
+    return n;
 }
 
 static void vex_rr(u32 enc, u32 reg, u32 vvvv, u32 rm)
 {
-    if (XE_Z(enc)) {
-        evex_prefix(enc, reg, vvvv, NOREG, rm, (u32)XE_K1(enc));
-        b1(0xc0 | (reg & 7) << 3 | (rm & 7));
-        return;
-    }
-    vex_prefix(enc, reg, vvvv, NOREG, rm);
+    if (XE_Z(enc) || XHI(reg) || XHI(vvvv) || XHI(rm))
+        evex_prefix(enc, reg, vvvv, NOREG, rm);
+    else
+        vex_prefix(enc, reg, vvvv, NOREG, rm);
     b1(0xc0 | (reg & 7) << 3 | (rm & 7));
 }
 
@@ -3814,18 +4028,13 @@ static void vex_mem(u32 enc, u32 reg, u32 vvvv, const EA *ea, u32 immbytes)
 {
     if (ea->fs)
         b1(0x64);
-    if (XE_Z(enc)) {
-        /* EVEX scales an 8-bit displacement by the operand size: always 32 bits here */
-        EA e = *ea;
-        if (e.sym == NOSLOT && e.base != NOREG && (e.disp != 0 || (e.base & 7) == 5))
-            e.force32 = 1;
-        if (e.sym != NOSLOT)
-            evex_prefix(enc, reg, vvvv, NOREG, NOREG, (u32)XE_K1(enc));
-        else
-            evex_prefix(enc, reg, vvvv, e.idx, e.base, (u32)XE_K1(enc));
-        mem_tail(reg, &e, immbytes);
+    if (XE_Z(enc) || XHI(reg) || XHI(vvvv)) {
+        u32 n = ea->sym != NOSLOT ? evex_prefix(enc, reg, vvvv, NOREG, NOREG) : evex_prefix(enc, reg, vvvv, ea->idx, ea->base);
+        evex_tail(n, reg, ea, immbytes);
         return;
     }
+    if (ea->sym == NOSLOT && XHI(ea->idx))
+        die("internal: x86-64: xmm16-xmm31 as an index in %s", f->name);
     if (ea->sym != NOSLOT)
         vex_prefix(enc, reg, vvvv, NOREG, NOREG);
     else
@@ -3850,6 +4059,21 @@ static void mem_tail(u32 reg, const EA *ea, u32 immbytes)
         return;
     }
     mod = ea->force32 ? 2 : ea->disp == 0 && (ea->base & 7) != 5 ? 0 : ea->disp >= -128 && ea->disp <= 127 ? 1 : 2;
+    if (disp8n && !ea->force32 && mod) {
+        /* EVEX: the byte is multiplied by the operand's size */
+        i64 q = ea->disp / (i64)disp8n;
+        mod = q * (i64)disp8n == ea->disp && q >= -128 && q <= 127 ? 1 : 2;
+        if (mod == 1) {
+            if (ea->idx != NOREG || (ea->base & 7) == 4) {
+                b1(1 << 6 | r | 4);
+                b1(ea->scale << 6 | (ea->idx == NOREG ? 4 : ea->idx & 7) << 3 | (ea->base & 7));
+            } else {
+                b1(1 << 6 | r | (ea->base & 7));
+            }
+            b1((u32)q);
+            return;
+        }
+    }
     if (ea->idx != NOREG || (ea->base & 7) == 4) {
         b1(mod << 6 | r | 4);
         b1(ea->scale << 6 | (ea->idx == NOREG ? 4 : ea->idx & 7) << 3 | (ea->base & 7));
@@ -4679,6 +4903,8 @@ static void enc_vex(MIns *i)
         rm = xuse(i->s1, 1);
         ra = xuse(i->s2, 2);
         dr = xdst(i->d);
+        if (XHI(ra))
+            die("internal: x86-64: xmm16-xmm31 as a blend's mask in %s", f->name);
         vex_rr(enc, dr, rv, rm);
         imm8 = (int)((ra & 15) << 4);
         break;
@@ -4791,6 +5017,9 @@ static void encode(MIns *i)
         else
             if (i->w == 2) {
                 vex_rr(VE(0x25, 3, 1, 0) | VE_Z, dr, dr, dr); /* vpternlogd 0xff */
+                b1(0xff);
+            } else if (XHI(dr)) {
+                vex_rr(VE(0x25, 3, 1, 0) | (i->w ? VE_L : 0), dr, dr, dr); /* (no EVEX vpcmpeqd into a vector) */
                 b1(0xff);
             } else {
                 vex_rr(0x576 | (i->w ? 0x2000u : 0), dr, dr, dr); /* vpcmpeqd */
@@ -5935,12 +6164,19 @@ static u32 place_expr(u8 *e, u32 l, int byref)
     if (l < 16) {
         static const u8 dwreg[16] = {0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15};
         dw = dwreg[l];
-    } else if (l >= XMM0 && l < XMM0 + 16) {
+    } else if (l >= XMM0 && l < XMM16) {
         dw = 17 + l - XMM0;
+    } else if (XHI(l)) {
+        dw = 67 + l - XMM16;
     } else {
         return 0;
     }
-    if (byref) {
+    if (dw >= 32) {
+        e[n++] = byref ? 0x92 : 0x90; /* DW_OP_bregx N 0, DW_OP_regx N */
+        e[n++] = (u8)dw;
+        if (byref)
+            e[n++] = 0;
+    } else if (byref) {
         e[n++] = (u8)(0x70 + dw); /* DW_OP_bregN 0 */
         e[n++] = 0;
     } else {
@@ -6091,7 +6327,11 @@ typedef struct SplitCp {
     u32 kind; /* SC_TAIL: at the end of block at; SC_HEAD: at its head; SC_EDGE: in the new block at; | SC_SAME */
     u32 at, d, s;
 } SplitCp;
-enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100 };
+enum { SC_TAIL, SC_HEAD, SC_EDGE, SC_SAME = 0x100, SC_DEF = 0x200 };
+
+/* With xmm16-xmm31 to hand (set per function by x64_gen): the splitting below also looks at spilled vectors, and
+   at spilled xmm registers from where they are written (MCC_NOVSPLIT, MCC_NODSPLIT: not) */
+static int split_vec, split_def;
 
 /* The spilled scalar registers (cidx: each one's number among them, else NOREG) and which of them are live into
    each block: a bit set per block, *pwords words each. */
@@ -6102,7 +6342,7 @@ static u64 *spill_live(u32 nv0, u32 *cidx, u32 *pnc, u32 *pwords)
     int ch;
     for (i = 0; i < nv0; i++) {
         u32 l = mf.loc[i];
-        cidx[i] = l != NOREG && l >= SPILL0 && !(mf.vclass[i] & ~0x11) ? nc++ : NOREG;
+        cidx[i] = l != NOREG && l >= SPILL0 && (split_vec || !(mf.vclass[i] & ~(0x11 | VC_LOW))) ? nc++ : NOREG;
     }
     words = (nc + 63) / 64;
     lin = (u64 *)xmalloc(((size_t)nb * words * 3 + 1) * sizeof(u64));
@@ -6155,11 +6395,16 @@ static u64 *spill_live(u32 nv0, u32 *cidx, u32 *pnc, u32 *pwords)
    for the stretch, loaded once before the first read; allocation then runs again, and if that one is spilled too
    it is the old slot under another name. Straight-line float code that keeps more than 13 values alive (ufsm's
    fit_vox2: 8 corners' weights and gradients across the calls of its terms) read each of them back again and
-   again. MCC_NORSPLIT: off. */
+   again. MCC_NORSPLIT: off.
+   split_def: the same from where a spilled xmm register is written, if it is read before the next call or the
+   block's end: a register of its own from the write to the last such read, and a copy to the old one after the
+   write if that is still wanted later (the store it was anyway). A value computed, used, and then kept across a
+   call was stored and at once loaded again. If the new one is spilled too, it is the old one's slot and nothing
+   changed. */
 static int split_reloads(void)
 {
     u32 nb = mf.nblk, nv0 = mf.nvreg, b, i, k, nc = 0, words, nsp = 0, nn, at;
-    u32 *cidx, *first, *cnt, *nonf, *last, *open, nopen, *ihead, *cnext, cap = 64, ncp = 0;
+    u32 *cidx, *first, *cnt, *nonf, *last, *open, *defat, nopen, *ihead, *cnext, cap = 64, ncp = 0;
     SplitCp *cp;
     u64 *lin;
     MIns *ni;
@@ -6174,14 +6419,17 @@ static int split_reloads(void)
         free(lin);
         return 0;
     }
-    first = (u32 *)xmalloc((size_t)nc * 5 * sizeof(u32));
+    first = (u32 *)xmalloc((size_t)nc * 6 * sizeof(u32));
     cnt = first + nc;
     nonf = cnt + nc;
     last = nonf + nc;
     open = last + nc;
+    defat = open + nc; /* the instruction that wrote the register, if the stretch begins there (else NOREG) */
     cp = (SplitCp *)xmalloc(cap * sizeof(SplitCp));
-    for (k = 0; k < nc; k++)
+    for (k = 0; k < nc; k++) {
         cnt[k] = 0;
+        defat[k] = NOREG;
+    }
     for (b = 0; b < nb; b++) {
         MBlock *mb = &mf.blk[b];
         u32 end = mb->first + mb->n;
@@ -6202,7 +6450,8 @@ static int split_reloads(void)
                     if (!cnt[c]) {
                         first[c] = i;
                         nonf[c] = 0;
-                        open[nopen++] = r[q] - VREG0;
+                        if (defat[c] == NOREG)
+                            open[nopen++] = r[q] - VREG0;
                     }
                     cnt[c]++;
                     last[c] = i;
@@ -6211,7 +6460,9 @@ static int split_reloads(void)
                                       in->op == X_OR || in->op == X_XOR || in->op == X_CMP || in->op == X_FADD ||
                                       in->op == X_FSUB || in->op == X_FMUL || in->op == X_FDIV || in->op == X_FMAX ||
                                       in->op == X_FMIN || in->op == X_FCMP)) ||
-                          (q == 0 && in->op == X_MOV)))
+                          (q == 0 && in->op == X_MOV) ||
+                          (split_vec && in->op == X_VEX && ((q == 1 && in->w == XF_RVM) || (q == 0 && in->w == XF_RM)) &&
+                           rm_mem_ok((u32)in->imm))))
                         nonf[c]++;
                 }
                 if (in->d != NOREG && in->d >= VREG0 && in->d - VREG0 < nv0)
@@ -6227,7 +6478,8 @@ static int split_reloads(void)
                     continue;
                 }
                 open[q] = open[--nopen];
-                if (cnt[c] >= 2 && (mode == 2 || nonf[c] >= 2 || (nonf[c] >= 1 && cnt[c] >= 3 && mode != 3))) {
+                if (defat[c] != NOREG ? cnt[c] >= 1
+                                      : cnt[c] >= 2 && (mode == 2 || nonf[c] >= 2 || (nonf[c] >= 1 && cnt[c] >= 3 && mode != 3))) {
                     u32 nr = new_vreg(mf.vclass[v]);
                     /* is the old one alive after the stretch (then its slot holds the value all through)? */
                     for (x = last[c] + 1; x < end && !known; x++) {
@@ -6252,13 +6504,31 @@ static int split_reloads(void)
                         cap *= 2;
                         cp = (SplitCp *)xrealloc(cp, cap * sizeof(SplitCp));
                     }
-                    cp[ncp].kind = same ? SC_SAME : 0;
-                    cp[ncp].at = first[c];
-                    cp[ncp].d = nr;
-                    cp[ncp++].s = VREG0 + v;
+                    if (defat[c] != NOREG) {
+                        mf.ins[defat[c]].d = nr;
+                        if (same) {
+                            cp[ncp].kind = SC_DEF;
+                            cp[ncp].at = defat[c] + 1;
+                            cp[ncp].d = VREG0 + v;
+                            cp[ncp++].s = nr;
+                        }
+                    } else {
+                        cp[ncp].kind = same ? SC_SAME : 0;
+                        cp[ncp].at = first[c];
+                        cp[ncp].d = nr;
+                        cp[ncp++].s = VREG0 + v;
+                    }
                     nsp++;
                 }
                 cnt[c] = 0;
+                defat[c] = NOREG;
+            }
+            /* a stretch that begins with this instruction's write */
+            if (split_def && !all && dc != NOREG && (mf.vclass[in->d - VREG0] & 1) &&
+                !((in->flags & MF_SPLIT) && in->op == X_MOV && in->imm == 1)) {
+                defat[dc] = i;
+                cnt[dc] = 0;
+                open[nopen++] = in->d - VREG0;
             }
         }
     }
@@ -6289,7 +6559,7 @@ static int split_reloads(void)
                     m2->d = cp[k].d;
                     m2->s0 = cp[k].s;
                     m2->s1 = m2->s2 = NOREG;
-                    m2->imm = cp[k].kind & SC_SAME ? 1 : 0;
+                    m2->imm = cp[k].kind & SC_SAME ? 1 : cp[k].kind & SC_DEF ? 2 : 0;
                     if (nloc)
                         nloc[at] = mloc[i];
                     at++;
@@ -6808,6 +7078,62 @@ static int split_loops(void)
     return any;
 }
 
+/* ---- xmm16-xmm31: who may be there ----
+   A register that any instruction without an EVEX twin reads or writes stays below xmm16 (VC_LOW in its class):
+   everything is so unless it is listed here. The scalar float instructions, the moves, loads and stores, and the
+   conversions all have twins (op_rr, op_mem and vex_rr, vex_mem write them when they meet such a register); a
+   VEX instruction has one if evex_form knows it, and not when a fourth register rides in its immediate byte
+   (vblendvps). The legacy 128-bit vector code, the VEX gathers (three registers that must differ, a vector mask)
+   and inline assembly keep to xmm0-xmm15. */
+static int x16_enc_ok(u32 enc)
+{
+    return XE_Z(enc) || evex_form(XE_MAP(enc), XE_PP(enc), XE_OPC(enc));
+}
+
+static void x16_mark(void)
+{
+    u32 k, q;
+    for (k = 0; k < mf.n; k++) {
+        MIns *i = &mf.ins[k];
+        u32 r[4];
+        int ok = 0;
+        switch (i->op) {
+        case X_MOV: case X_FMOVI: case X_LOAD: case X_STORE:
+        case X_FADD: case X_FSUB: case X_FMUL: case X_FDIV: case X_FMAX: case X_FMIN: case X_FNEG:
+        case X_FADDM: case X_FSUBM: case X_FMULM: case X_FDIVM:
+        case X_FCMP: case X_FSEL: case X_SITOF: case X_UITOF: case X_FTOSI: case X_FTOUI: case X_FCVT: case X_BITCAST:
+        case X_FUN:
+        case X_YZERO: case X_YONES: case X_YSIGN: case X_YSPLAT: case X_YMOVLO: case X_KTEST:
+            ok = 1;
+            break;
+        case X_VEX:
+            ok = i->w != XF_RVMR && x16_enc_ok((u32)i->imm);
+            break;
+        case X_VEXM:
+            ok = x16_enc_ok((u32)((u64)i->imm >> 32));
+            break;
+        }
+        if (ok)
+            continue;
+        r[0] = i->d;
+        r[1] = i->s0;
+        r[2] = i->s1;
+        r[3] = i->s2;
+        for (q = 0; q < 4; q++)
+            if (r[q] != NOREG && r[q] >= VREG0 && (mf.vclass[r[q] - VREG0] & 1))
+                mf.vclass[r[q] - VREG0] |= VC_LOW;
+    }
+}
+
+/* how many xmm-class registers the allocator sent to memory */
+static u32 x16_spilled(void)
+{
+    u32 k, n = 0;
+    for (k = 0; k < mf.nvreg; k++)
+        n += (mf.vclass[k] & 1) && mf.loc[k] != NOREG && mf.loc[k] >= SPILL0;
+    return n;
+}
+
 void x64_gen(Func *fn, Obj *o)
 {
     u32 k, n, off, start, nsaved, first_rel;
@@ -6833,9 +7159,49 @@ void x64_gen(Func *fn, Obj *o)
             fpo = 0;
     {
         MTarget t = target;
+        int x16 = !opt_x64_xmm16 ? 0 : getenv("MCC_XMM16") ? atoi(getenv("MCC_XMM16")) : 1;
+        u32 nsp;
         if (fpo)
             t.allocatable[0] |= BIT(RBP);
+        if (x16)
+            x16_mark();
+        split_vec = x16 && !getenv("MCC_NOVSPLIT");
+        split_def = x16 && !getenv("MCC_NODSPLIT");
+        if (x16 >= 2) {
+            t.allocatable[1] |= XHI_MASK;
+            t.ext_first = 1;
+        }
         ra_run(&mf, &t);
+        if (x16 == 1 && (nsp = x16_spilled()) != 0) {
+            /* xmm0-xmm12 were not enough: again with xmm16-xmm31, which the registers that may be there take first
+               (the others then find room below; an EVEX encoding is two bytes longer, so only functions that spill
+               pay for it). If no fewer went to memory (they live across calls, or may not be up there), once more
+               with xmm16-xmm31 taken last: all as before, but the registers the splitting below makes for the
+               spilled ones' stretches between calls have somewhere to go. */
+            MTarget t2 = t;
+            t2.allocatable[1] |= XHI_MASK;
+            t2.ext_first = 1;
+            ra_rerun(&mf, &t2);
+            if (getenv("MCC_XMM16LOG")) {
+                u32 nx = 0, nl = 0, sl = 0, sv = 0;
+                for (k = 0; k < mf.nvreg; k++) {
+                    int sp = (mf.vclass[k] & 1) && mf.loc[k] != NOREG && mf.loc[k] >= SPILL0;
+                    nx += mf.vclass[k] & 1;
+                    nl += (mf.vclass[k] & 1) && (mf.vclass[k] & VC_LOW);
+                    sl += sp && (mf.vclass[k] & VC_LOW);
+                    sv += sp && (mf.vclass[k] & VC_V128);
+                }
+                fprintf(stderr, "xmm16 %s: %lu xmm registers, %lu below xmm16 only, spilled %lu -> %lu (%lu of them below xmm16 only, %lu vectors)\n",
+                        intern_str(obj->syms[f->sym].name), (unsigned long)nx, (unsigned long)nl, (unsigned long)nsp,
+                        (unsigned long)x16_spilled(), (unsigned long)sl, (unsigned long)sv);
+            }
+            if (x16_spilled() < nsp) {
+                t = t2;
+            } else {
+                t.allocatable[1] |= XHI_MASK;
+                ra_rerun(&mf, &t);
+            }
+        }
         if (opt_level >= 2 && !opt_size && !getenv("MCC_NORASPLIT")) {
             int rounds = getenv("MCC_SPLITROUNDS") ? atoi(getenv("MCC_SPLITROUNDS")) : 1, r, ch = 0;
             for (r = 0; r < rounds && split_loops(); r++) {
@@ -6857,6 +7223,15 @@ void x64_gen(Func *fn, Obj *o)
                         mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
                         mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
                         mf.loc[mi->d - VREG0] = mf.loc[mi->s0 - VREG0];
+                        ch = 1;
+                    }
+                    /* and a register split off where it was written (split_def) that was spilled like the one it
+                       is copied to: that one's slot, which nothing else holds between the write and the copy */
+                    if ((mi->flags & MF_SPLIT) && mi->op == X_MOV && mi->imm == 2 && mi->d >= VREG0 && mi->s0 != NOREG &&
+                        mi->s0 >= VREG0 && mf.loc[mi->d - VREG0] >= SPILL0 && mf.loc[mi->d - VREG0] != NOREG &&
+                        mf.loc[mi->s0 - VREG0] >= SPILL0 && mf.loc[mi->s0 - VREG0] != NOREG &&
+                        mf.loc[mi->d - VREG0] != mf.loc[mi->s0 - VREG0]) {
+                        mf.loc[mi->s0 - VREG0] = mf.loc[mi->d - VREG0];
                         ch = 1;
                     }
                 }

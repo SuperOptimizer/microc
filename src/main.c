@@ -324,7 +324,8 @@ static void sys_lto(const char *out_path, const char *entry)
 
 /* x86-64 instruction set extensions the code may use (-mavx2, -march=...): what <immintrin.h> users test */
 enum { XF_SSE3 = 1, XF_SSSE3 = 2, XF_SSE41 = 4, XF_SSE42 = 8, XF_POPCNT = 16, XF_AVX = 32, XF_AVX2 = 64, XF_FMA = 128,
-       XF_F16C = 256, XF_BMI = 512, XF_BMI2 = 1024, XF_AVX512F = 2048, XF_AVX512BW = 4096 };
+       XF_F16C = 256, XF_BMI = 512, XF_BMI2 = 1024, XF_AVX512F = 2048, XF_AVX512BW = 4096, XF_AVX512VL = 8192,
+       XF_AVX512DQ = 16384 };
 static u32 x86_feat;
 #define XF_V2 (XF_SSE3 | XF_SSSE3 | XF_SSE41 | XF_SSE42 | XF_POPCNT)
 #define XF_V3 (XF_V2 | XF_AVX | XF_AVX2 | XF_FMA | XF_F16C | XF_BMI | XF_BMI2)
@@ -370,10 +371,14 @@ static u32 x86_native(void)
         r |= XF_AVX512F;
     if (b >> 30 & 1)
         r |= XF_AVX512BW;
+    if (b >> 31 & 1)
+        r |= XF_AVX512VL;
+    if (b >> 17 & 1)
+        r |= XF_AVX512DQ;
     if (!os_ymm) /* the processor has AVX but the system does not save ymm registers (some VMs): none of it */
-        r &= ~(u32)(XF_AVX | XF_AVX2 | XF_FMA | XF_F16C | XF_AVX512F | XF_AVX512BW);
+        r &= ~(u32)(XF_AVX | XF_AVX2 | XF_FMA | XF_F16C | XF_AVX512F | XF_AVX512BW | XF_AVX512VL | XF_AVX512DQ);
     if (!os_zmm)
-        r &= ~(u32)(XF_AVX512F | XF_AVX512BW);
+        r &= ~(u32)(XF_AVX512F | XF_AVX512BW | XF_AVX512VL | XF_AVX512DQ);
     (void)a;
     (void)d;
     return r;
@@ -391,7 +396,8 @@ static int x86_option(const char *a)
         {"popcnt", XF_POPCNT}, {"avx", XF_AVX | XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3},
         {"avx2", XF_AVX2 | XF_AVX | XF_SSE42 | XF_SSE41 | XF_SSSE3 | XF_SSE3}, {"fma", XF_FMA | XF_AVX},
         {"f16c", XF_F16C | XF_AVX}, {"bmi", XF_BMI}, {"bmi2", XF_BMI2},
-        {"avx512f", XF_AVX512F | XF_V3}, {"avx512bw", XF_AVX512BW | XF_AVX512F | XF_V3}};
+        {"avx512f", XF_AVX512F | XF_V3}, {"avx512bw", XF_AVX512BW | XF_AVX512F | XF_V3},
+        {"avx512vl", XF_AVX512VL | XF_AVX512F | XF_V3}, {"avx512dq", XF_AVX512DQ | XF_AVX512F | XF_V3}};
     static const char *const v3[] = {"x86-64-v3", "haswell", "broadwell", "skylake", "alderlake", "raptorlake", "meteorlake",
         "znver1", "znver2", "znver3", 0};
     static const char *const v4[] = {"x86-64-v4", "skylake-avx512", "cascadelake", "icelake-client", "icelake-server",
@@ -411,7 +417,7 @@ static int x86_option(const char *a)
                 if (v3[k] && strcmp(a + 7, v3[k]) == 0)
                     x86_feat = XF_V3;
                 if (v4[k] && strcmp(a + 7, v4[k]) == 0)
-                    x86_feat = XF_V3 | XF_AVX512F | XF_AVX512BW;
+                    x86_feat = XF_V3 | XF_AVX512F | XF_AVX512BW | XF_AVX512VL | XF_AVX512DQ;
             }
         return 1;
     }
@@ -512,6 +518,10 @@ static void target_macros(void)
         opt_x64_avx2 = (x86_feat & XF_AVX2) != 0;   /* 32-byte vectors in AVX functions */
         opt_x64_fma = (x86_feat & XF_FMA) != 0;     /* -ffp-contract: a * b + c as vfmadd */
         opt_x64_bmi2 = (x86_feat & XF_BMI2) != 0 && !getenv("MCC_NOSHLX");
+        /* xmm16-xmm31 take EVEX encodings of 128- and 256-bit instructions (VL), the byte and word ones (BW) and
+           the bitwise float ones (DQ) among them */
+        opt_x64_xmm16 = (x86_feat & (XF_AVX512F | XF_AVX512BW | XF_AVX512VL | XF_AVX512DQ)) ==
+                        (XF_AVX512F | XF_AVX512BW | XF_AVX512VL | XF_AVX512DQ) && !getenv("MCC_NOXMM16");
     }
     if (opt_size)
         pp_define("__OPTIMIZE_SIZE__");

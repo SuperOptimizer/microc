@@ -56,7 +56,8 @@ static const MTarget target = {
     { 0x1ff87fffUL,                 /* x0-x14, x19-x28 */
       0x3fffffffUL << 32 },         /* v0-v29 */
     0x7fffUL | (0x3fff00ffUL << 32), /* x0-x14; v0-v7, v16-v29 */
-    A_MOV
+    A_MOV,
+    0, 0
 };
 
 static Func *f;

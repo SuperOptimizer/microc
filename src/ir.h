@@ -276,6 +276,7 @@ extern int opt_vec_report;
 extern int opt_vec_gather; /* opt_vec.c: -fvec-gather */
 extern int opt_glibc;      /* opt.c: x86-64 programs for the GNU C library (-mglibc / --sysroot): its functions beyond C's may be called */
 extern int opt_x64_fma;   /* x64.c: FMA3 may be used (-mfma, -march=native / x86-64-v3) */
+extern int opt_x64_xmm16; /* x64.c: xmm16-xmm31 may be allocated (AVX-512 F, VL, BW, DQ; MCC_NOXMM16: off) */
 extern int opt_x64_bmi2;  /* x64.c: shlx / shrx / sarx for shifts by a register (BMI2; MCC_NOSHLX: off) */
 extern int opt_x64_avx2;  /* opt_vec.c: 32-byte vectors in AVX functions */
 extern int opt_x64_sse41; /* opt_vec.c: x86-64 vector code may use SSE4.1 */

@@ -17,6 +17,8 @@
 #define MF_TIED 0x40  /* two-address: d is written over s0 (x86), so s0's register is the place for d when s0 dies here */
 #define MF_COMMUT 0x08 /* with MF_TIED: s0 and s1 commute, so s1's register will do as well */
 #define MF_SPLIT 0x20 /* a copy x64.c's loop splitting made (the loop's own register for a spilled one) */
+#define VC_LOW 0x40 /* register class bit: the register may not be one of MTarget.ext (an instruction that reads or writes it cannot name them) */
+
 #define MF_NOTS1 0x80 /* two-address, not commutative: d had better not get s1's register (it would take a copy of s1 first) */
 
 typedef struct MIns {
@@ -56,6 +58,8 @@ typedef struct MTarget {
     u64 allocatable[2]; /* per register class */
     u64 caller_saved;
     int move_op; /* register-to-register copy: gives allocation hints */
+    u64 ext;       /* registers that only some instructions can name: never for a register of a VC_LOW class */
+    int ext_first; /* the other registers take those first, and leave the rest to the ones that need them */
 } MTarget;
 
 void ra_run(MFunc *m, const MTarget *t);

@@ -594,9 +594,10 @@ void ra_run(MFunc *m, const MTarget *t)
                 x = same[x] = same[same[x]];
             while (same[y] != y)
                 y = same[y] = same[same[y]];
-            if (x == y || m->vclass[x] != m->vclass[y] || (m->vclass[x] & 2) || !head[x] || !head[y] ||
+            if (x == y || ((m->vclass[x] ^ m->vclass[y]) & ~VC_LOW) || (m->vclass[x] & 2) || !head[x] || !head[y] ||
                 xcall[x] != xcall[y] || intersects(head[x], head[y]))
                 continue;
+            m->vclass[x] |= m->vclass[y] & VC_LOW; /* (what either side cannot be in, the interval cannot) */
             head[x] = ranges_join(head[x], head[y]);
             head[y] = 0;
             same[y] = x;
@@ -681,6 +682,8 @@ void ra_run(MFunc *m, const MTarget *t)
         }
         if (crosses)
             cand &= ~t->caller_saved;
+        if (m->vclass[cur] & VC_LOW)
+            cand &= ~t->ext;
         /* try the hint first, then caller-saved, then callee-saved */
         if (hint[cur] != NOREG) {
             u32 h = hint[cur];
@@ -688,6 +691,16 @@ void ra_run(MFunc *m, const MTarget *t)
                 h = m->loc[h - VREG0];
             if (h < 64 && (cand >> h & 1) && !fixed_conflict(h, head[cur]))
                 reg = (int)h;
+        }
+        if (reg < 0 && t->ext_first && (cand & t->ext)) {
+            /* one of the registers not everything can be in, while there is one */
+            u64 c = cand & t->ext;
+            while (c && reg < 0) {
+                int pr = lowest_bit(c);
+                c &= c - 1;
+                if (!fixed_conflict((u32)pr, head[cur]))
+                    reg = pr;
+            }
         }
         if (reg < 0 && avoid[cur] != NOREG) {
             /* first without the register of the right operand of a two-address subtraction or division */
@@ -742,6 +755,8 @@ void ra_run(MFunc *m, const MTarget *t)
                     continue;
                 if (crosses && (t->caller_saved >> m->loc[a] & 1))
                     continue;
+                if ((m->vclass[cur] & VC_LOW) && (t->ext >> m->loc[a] & 1))
+                    continue;
                 if (fixed_conflict(m->loc[a], head[cur]))
                     continue;
                 for (j = 0; j < ninactive && ok; j++)
@@ -789,7 +804,7 @@ void ra_run(MFunc *m, const MTarget *t)
             if (same[v] == v && head[v] && m->loc[v] != NOREG && m->loc[v] >= SPILL0) {
                 u32 sl = m->loc[v] - SPILL0;
                 shead[sl] = shead[sl] ? ranges_union(shead[sl], head[v]) : head[v];
-                scls[sl] = m->vclass[v];
+                scls[sl] = m->vclass[v] & (u8)~VC_LOW;
             }
         for (dp = 6; dp >= 0; dp--)
             for (b = 0; b < m->nblk; b++) {

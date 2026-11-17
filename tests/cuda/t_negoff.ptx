@@ -1,0 +1,26 @@
+// An offset below the base written as mcc writes it when it folds a constant into an address: [%r+-28].
+//! run negoff 1 1 1 4 1 1 64 4
+.version 8.5
+.target sm_86
+.address_size 64
+
+.shared .align 4 .b32 sh[16];
+
+.visible .entry negoff(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mov.u64 %rd2, sh;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    add.u64 %rd5, %rd4, 28;
+    add.u32 %r2, %r1, 100;
+    st.shared.u32 [%rd5+-28], %r2;      // the thread's own cell
+    ld.shared.u32 %r3, [%rd5 + -28];
+    add.u64 %rd6, %rd1, %rd3;
+    add.u64 %rd6, %rd6, 8;
+    st.global.u32 [%rd6+-8], %r3;
+    ret;
+}

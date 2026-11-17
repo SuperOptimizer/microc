@@ -335,8 +335,15 @@ static void number(P *p, Opd *o)
     if (*s == '-') {
         neg = 1;
         s++;
-    } else if (*s == '+')
+    } else if (*s == '+') {
         s++;
+        while (*s == ' ')
+            s++;
+        if (*s == '-') { /* an offset below its base, as mcc writes it: [%r1+-28] */
+            neg = 1;
+            s++;
+        }
+    }
     while (*s == ' ')
         s++;
     if (*s < '0' || *s > '9') {

@@ -178,6 +178,7 @@ test_zcache (+-2 G).
 | + statics no pointer reaches not read again after a store; a spilled value in a register over blocks without a call | 1836 | 1.19 |
 | + a second test of a flag decided by the first (jump threading by what a branch above says) | 1832 | 1.18 |
 | + loops unswitched on a value they do not change | 1813 | 1.17 |
+| + only on a value tested as it is; a block before a loop left without one for the vectoriser | 1797 | 1.16 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -243,8 +244,12 @@ What went in (each with its switch):
   `MCC_UNSWLOG`): a loop with two or more branches on a value it does not change, and one such branch for every
   300 of its instructions, is made twice, the value tested once before. write_spatial_ref / write_spatial_tm
   tested `ap` and `hard` at each of eight corners of every voxel: test_spatial_augment 714.8 -> 689.0 G. (Without
-  the size rule two decoder loops of 1900 instructions with two branches cost test_volcomp_fast 1 G; test_reg
-  is 1.5 G worse with it, not yet looked at.)
+  the size rule two decoder loops of 1900 instructions with two branches cost test_volcomp_fast 1 G.) The value
+  is one tested as it is (a pointer, a flag), not a comparison (`MCC_UNSWCMP`: those too). Where the test before
+  an inner loop goes, the loop is come to straight from a branch, which the vectoriser does not take (try_loop
+  wants a block that only jumps there): such loops get that block afterwards (filt_axis lost four vector loops
+  without: test_reg 114.0 -> 113.4, still 0.8 over what it was before unswitching; test_spatial_augment 689.0 ->
+  679.3). `MCC_UNSWSKIP=names`: not in those functions (debugging).
 - Statics no pointer reaches (parse.c at the end of the unit, opt.c `root_static`, `MCC_NOSTATICPRIV`,
   `MCC_STATICPRIVLOG`): a static object whose address the unit uses only to read or write it at a fixed place (no
   function hands it on, no data holds it, kept-back data included, and the unit has no assembly) is not what a

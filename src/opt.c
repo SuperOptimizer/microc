@@ -3371,11 +3371,15 @@ static void br_bools(Func *fn)
    slot while there are two loops (opt_promote makes values of the slots again). The copies cost code: a loop of
    at most UNSW_LOOP instructions, UNSW_TOTAL new ones in a function, and only for two branches or more on the
    value (MCC_UNSWMIN) and one for every UNSW_PER instructions of the loop (MCC_UNSWPER: two branches in the 1900
-   instructions of ufsm's vf_decode_sub made test_volcomp_fast 1 G slower). Done before the vectoriser, on the function with its calls inlined. MCC_NOUNSWITCH: off;
+   instructions of ufsm's vf_decode_sub made test_volcomp_fast 1 G slower). The value is one tested as it is (a
+   pointer, a flag), not a comparison (MCC_UNSWCMP: those too; they are mostly the tests before inner loops, and
+   test_spatial_augment was 1 to 2 G better without). Done before the vectoriser, on the function with its calls inlined. MCC_NOUNSWITCH: off;
    MCC_UNSWLOG: what was done. */
 #define UNSW_LOOP 4000
 #define UNSW_TOTAL 12000
 #define UNSW_PER 300 /* instructions of loop for each branch that goes */
+
+static int unsw_nocmp;
 
 /* the value a condition is about: x != 0 and x == 0 say what x says (*inv: the other way round) */
 static u32 unsw_base(u32 c, int *inv)
@@ -3464,7 +3468,8 @@ static u32 unswitch_one(u32 room, u32 minbr, u32 per, int *slots)
                 int inv;
                 u64 z;
                 c = unsw_base(bb->arg, &inv);
-                if (!ir_is_const(f, c, &z) && defined_outside(c, mark, h) && f->ins[c].blk) {
+                if (!ir_is_const(f, c, &z) && defined_outside(c, mark, h) && f->ins[c].blk &&
+                    !(unsw_nocmp && ((f->ins[c].op >= OP_EQ && f->ins[c].op <= OP_UGE) || (f->ins[c].op >= OP_FEQ && f->ins[c].op <= OP_FGE)))) {
                     for (q = 0; q < nc && cand[q] != c; q++)
                         ;
                     if (q < nc)
@@ -3751,12 +3756,15 @@ static void unswitch(Func *fn)
         off = getenv("MCC_NOUNSWITCH") != 0;
         if (getenv("MCC_UNSWMIN"))
             minbr = atoi(getenv("MCC_UNSWMIN"));
+        unsw_nocmp = getenv("MCC_UNSWCMP") == 0;
         if (getenv("MCC_UNSWPER"))
             per = atoi(getenv("MCC_UNSWPER"));
     }
     if (off)
         return;
     f = fn;
+    if (getenv("MCC_UNSWSKIP") && f->name && strstr(getenv("MCC_UNSWSKIP"), f->name))
+        return; /* (debugging: not in the functions named) */
     ir_resolve_all(f);
     while (rounds++ < 6 && (n = unswitch_one(room, (u32)minbr, (u32)per, &slots)) != 0) {
         any = 1;
@@ -3786,6 +3794,30 @@ static void unswitch(Func *fn)
         ir_resolve_all(f);
     }
     opt_dce(f);
+    /* a loop of one block that is now come to straight from a branch (the test before it went: it was on the value)
+       gets a block of its own before it, which the vectoriser wants (opt_vec.c, try_loop) */
+    {
+        u32 l, nb0 = f->nblk;
+        for (l = 2; l < nb0; l++) {
+            Block *lb = &f->blk[l];
+            u32 P, N, q, pi;
+            if (lb->term != TERM_BR || lb->npreds != 2 || (lb->succ[0] != l && lb->succ[1] != l) || lb->succ[0] == lb->succ[1])
+                continue;
+            pi = lb->preds[0] == l ? 1 : 0;
+            P = lb->preds[pi];
+            if (P == l || f->blk[P].term != TERM_BR || f->blk[P].succ[0] == f->blk[P].succ[1])
+                continue;
+            N = ir_new_block(f);
+            f->blk[N].freq = f->blk[P].freq < f->blk[l].freq || !f->blk[l].freq ? f->blk[P].freq : f->blk[l].freq;
+            f->blk[N].term = TERM_JMP;
+            f->blk[N].succ[0] = l;
+            ir_add_pred(f, N, P);
+            for (q = 0; q < 2; q++)
+                if (f->blk[P].succ[q] == l)
+                    f->blk[P].succ[q] = N;
+            f->blk[l].preds[pi] = N;
+        }
+    }
 }
 
 void opt_finish(Func *fn)

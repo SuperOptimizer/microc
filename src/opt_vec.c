@@ -878,6 +878,15 @@ static void narrow_loops(void)
    MCC_NOVECEXACT: as before. */
 static int vec_exact;
 static int vec_bitred; /* x86-64: or / and / xor carried round a loop are reductions */
+/* ---- what the vector loop leaves over ----
+   The vector loop does two (sums: four) vectors a round, and what is left, up to a round's worth less one, went
+   to the original loop one element at a time: 16 bytes of a 100-byte row took as many instructions as the other 84,
+   and a loop over 16 ints summed four vectors a round never started. With vec_epi the original loop is vectorised a
+   second time, one vector a round, behind the first: a block R joins the way round the first vector loop and the way
+   out of it (the counters and sums so far are phis there), and is the preheader the second try_loop builds in.
+   MCC_NOVECEPI: off. */
+static int vec_epi;
+static int epi_pass; /* the second go: one vector a round */
 #define MAX_LIVE 8
 static u32 live_of[MAX_LIVE], nlive;
 
@@ -918,7 +927,7 @@ static int exact_liveouts(u32 l, const u32 *red_next, u32 nred)
 static u32 missv; /* the instruction being looked at, for the report */
 #define MISS(why) \
     do { \
-        if (opt_vec_report) { \
+        if (opt_vec_report && !epi_pass) { \
             fprintf(stderr, "%s: loop not vectorised: %s", f->name, why); \
             if (opt_vec_report > 1 && missv) \
                 fprintf(stderr, " [op %d ty %d; operands' ops %d %d; line %u]", f->ins[missv].op, f->ins[missv].ty, \
@@ -1560,7 +1569,7 @@ static int try_loop(u32 l, u32 n0)
     n = outside(n);
     /* sums run four vectors side by side, so that the additions do not wait
        for each other; other loops two, to halve what the counting costs */
-    un = wide ? 1 : nred ? 4 : 2;
+    un = wide || epi_pass ? 1 : nred ? 4 : 2;
     if (getenv("MCC_VECUN") && (u32)atoi(getenv("MCC_VECUN")) < un && atoi(getenv("MCC_VECUN")) > 0)
         un = (u32)atoi(getenv("MCC_VECUN")); /* (measuring: fewer vectors a round) */
     vf = vw / lanesz * un;
@@ -2015,7 +2024,30 @@ static int try_loop(u32 l, u32 n0)
         }
     }
     if (opt_vec_report)
-        fprintf(stderr, "%s: loop vectorised (%u elements at a time)\n", f->name, vf);
+        fprintf(stderr, "%s: %s vectorised (%u elements at a time)\n", f->name, epi_pass ? "what a vector loop leaves over" : "loop", vf);
+    if (vec_epi && !epi_pass && un > 1) {
+        u32 R = ir_new_block(f), rp;
+        f->blk[R].freq = f->blk[P].freq;
+        f->blk[R].term = TERM_JMP;
+        f->blk[R].succ[0] = l;
+        ir_add_pred(f, R, P);
+        ir_add_pred(f, R, M);
+        f->blk[P].succ[1] = R;
+        f->blk[M].succ[f->blk[M].term == TERM_BR ? 1 : 0] = R;
+        /* l's predecessors were P (at pp), itself and M (the third, as are its phis' values from M) */
+        for (ph = f->blk[l].phis; ph; ph = f->ins[ph].next) {
+            rp = ir_phi(f, R, f->ins[ph].ty);
+            f->xargs[f->ins[rp].a] = f->xargs[f->ins[ph].a + pp];
+            f->xargs[f->ins[rp].a + 1] = f->xargs[f->ins[ph].a + 2];
+            f->xargs[f->ins[ph].a + pp] = rp;
+            f->ins[ph].b = 2;
+        }
+        f->blk[l].preds[pp] = R;
+        f->blk[l].npreds = 2;
+        epi_pass = 1;
+        try_loop(l, n0);
+        epi_pass = 0;
+    }
     return 1;
 }
 
@@ -2476,6 +2508,8 @@ int opt_vectorise(Func *fn)
     ext_lanes = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXT");
     vec_exact = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEXACT");
     vec_bitred = opt_arch == ARCH_X64 && !getenv("MCC_NOVECBITRED");
+    vec_epi = opt_arch == ARCH_X64 && !getenv("MCC_NOVECEPI");
+    epi_pass = 0;
     base = (u32 *)xmalloc((size_t)n0 * 5 * sizeof(u32));
     cnt = base + n0;
     map = cnt + n0;

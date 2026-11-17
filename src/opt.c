@@ -1,6 +1,7 @@
 /* The optimisation pipeline: value numbering with folding and memory
    forwarding, and control-flow simplification. Every pass is near linear. */
 #include "ir.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -3207,15 +3208,267 @@ static void finish_passes(Func *fn);
 static int fuse_sincos(void);
 
 static void addr_shape(Func *fn);
+static void iv_widen(Func *fn);
 
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
     ir_loc = 0;
     finish_passes(fn);
-    if (opt_arch == ARCH_X64 && !opt_dev_fn && !opt_cuda && opt_level >= 2)
+    if (opt_arch == ARCH_X64 && !opt_dev_fn && !opt_cuda && opt_level >= 2) {
+        iv_widen(fn);
         addr_shape(fn);
+    }
     ir_loc = saved;
+}
+
+/* x86-64 host, last before selection (the vectoriser and the inliner know a loop by its 32-bit counter): a 32-bit
+   counter i that the loop reads widened ((long)i: an index) becomes a 64-bit counter, and i its low half, when
+   i + step is known not to wrap: the loop goes round only while i + step < n (so the next i + 1 fits; the first i
+   is a constant, known small, or was compared the same way before the loop), or the header leaves unless i < n.
+   The widening was an instruction every trip (movslq). MCC_NOIVWIDEN: off; MCC_IVWLOG: what was done. */
+#define IVW_MAX 256
+
+/* what holds of x on the edge taken when the condition c is true (taken) or false: 1 x < *o, 2 x <= *o, 3 x > *o,
+   4 x >= *o (32-bit, signed), 0 nothing known */
+static int ivw_rel(u32 c, int taken, u32 x, u32 *o)
+{
+    Ins *i = &f->ins[c];
+    u32 a, b;
+    int r;
+    if (i->op < OP_SLT || i->op > OP_SGE)
+        return 0;
+    a = ir_resolve(f, i->a);
+    b = ir_resolve(f, i->b);
+    if (f->ins[a].ty != IT_I32)
+        return 0;
+    r = i->op - OP_SLT + 1;
+    if (a == x) {
+        *o = b;
+    } else if (b == x) {
+        *o = a;
+        r = r <= 2 ? r + 2 : r - 2;
+    } else {
+        return 0;
+    }
+    if (!taken)
+        r = 5 - r;
+    return r;
+}
+
+/* x + c does not wrap, given what ivw_rel said of x */
+static int ivw_fits(int rel, u32 o, i64 c)
+{
+    u64 k;
+    int konst = ir_is_const(f, o, &k);
+    i64 kv = (i64)(i32)(u32)k;
+    if (c > 0) {
+        if (rel == 1)
+            return konst ? kv - 1 + c <= 0x7fffffffL : c == 1;
+        return rel == 2 && konst && kv + c <= 0x7fffffffL;
+    }
+    if (rel == 3)
+        return konst ? kv + 1 + c >= -0x7fffffffL - 1 : c == -1;
+    return rel == 4 && konst && kv + c >= -0x7fffffffL - 1;
+}
+
+static void iv_widen(Func *fn)
+{
+    static int off = -1, log;
+    struct Cand {
+        u32 h, phi, next, pre, lat, uses, w, wn;
+        i64 c;
+        int nonneg;
+    } cand[IVW_MAX];
+    u32 nc = 0, k, b, v, nx, *role, *hit, *hitk, *hitr, nhit = 0, nins0, done = 0;
+    if (off < 0) {
+        off = getenv("MCC_NOIVWIDEN") != 0;
+        log = getenv("MCC_IVWLOG") != 0;
+    }
+    if (off || fn->nins > 400000)
+        return;
+    f = fn;
+    compute_dom();
+    for (k = 0; k < nrpo && nc < IVW_MAX; k++) {
+        u32 h = rpo[k], pi, li, pre, lat;
+        Block *hb = &f->blk[h];
+        if (hb->npreds != 2)
+            continue;
+        if (rpo_num[hb->preds[0]] == 0xffffffffU || rpo_num[hb->preds[1]] == 0xffffffffU)
+            continue;
+        li = dominates(h, hb->preds[1]) ? 1 : 0;
+        pi = 1 - li;
+        pre = hb->preds[pi];
+        lat = hb->preds[li];
+        if (!dominates(h, lat) || dominates(h, pre))
+            continue;
+        for (v = hb->phis; v && nc < IVW_MAX; v = f->ins[v].next) {
+            Ins *i = &f->ins[v], *ni;
+            u32 init, next, o = 0, x, g, steps;
+            u64 cv, iv;
+            i64 c;
+            int ok = 0, rel, nonneg;
+            if (i->ty != IT_I32 || i->b != 2)
+                continue;
+            init = ir_resolve(f, f->xargs[i->a + pi]);
+            next = ir_resolve(f, f->xargs[i->a + li]);
+            ni = &f->ins[next];
+            if (ni->op != OP_ADD || ni->ty != IT_I32 || !ni->blk)
+                continue;
+            x = ir_resolve(f, ni->a) == v ? ir_resolve(f, ni->b) : ir_resolve(f, ni->b) == v ? ir_resolve(f, ni->a) : 0;
+            if (!x || !ir_is_const(f, x, &cv) || !(u32)cv)
+                continue;
+            c = (i64)(i32)(u32)cv;
+            /* the way back taken only while next is bounded, and the first value bounded too */
+            if (f->blk[lat].term == TERM_BR && f->blk[lat].succ[0] != f->blk[lat].succ[1]) {
+                rel = ivw_rel(ir_resolve(f, f->blk[lat].arg), f->blk[lat].succ[0] == h, next, &o);
+                if (rel && ivw_fits(rel, o, c)) {
+                    if (ir_is_const(f, init, &iv)) {
+                        i64 s = (i64)(i32)(u32)iv + c;
+                        ok = s <= 0x7fffffffL && s >= -0x7fffffffL - 1;
+                    } else if (ir_umax32(f, init) < 0x80000000UL) {
+                        ok = c < 0 || ir_umax32(f, init) + (u64)c <= 0x7fffffffUL;
+                    }
+                    for (g = pre, steps = 0; !ok && steps < 6 && f->blk[g].npreds == 1; steps++) {
+                        u32 q = f->blk[g].preds[0];
+                        Block *qb = &f->blk[q];
+                        if (qb->term == TERM_BR && qb->succ[0] != qb->succ[1]) {
+                            rel = ivw_rel(ir_resolve(f, qb->arg), qb->succ[0] == g, init, &o);
+                            if (rel && ivw_fits(rel, o, c))
+                                ok = 1;
+                        }
+                        g = q;
+                    }
+                }
+            }
+            /* or the header leaves unless the counter is bounded, and next is made past that test */
+            if (!ok && hb->term == TERM_BR && hb->succ[0] != hb->succ[1]) {
+                u32 sk;
+                for (sk = 0; sk < 2 && !ok; sk++) {
+                    u32 sb = hb->succ[sk];
+                    if (f->blk[sb].npreds != 1 || rpo_num[sb] == 0xffffffffU || !dominates(sb, ni->blk))
+                        continue;
+                    rel = ivw_rel(ir_resolve(f, hb->arg), sk == 0, v, &o);
+                    ok = rel && ivw_fits(rel, o, c);
+                }
+            }
+            if (!ok)
+                continue;
+            nonneg = c > 0 && (ir_is_const(f, init, &iv) ? !((u32)iv >> 31) : ir_umax32(f, init) < 0x80000000UL);
+            cand[nc].h = h;
+            cand[nc].phi = v;
+            cand[nc].next = next;
+            cand[nc].pre = pre;
+            cand[nc].lat = pi; /* (the index of the entry among the header's predecessors) */
+            cand[nc].uses = 0;
+            cand[nc].c = c;
+            cand[nc].nonneg = nonneg;
+            nc++;
+        }
+    }
+    if (!nc)
+        return;
+    nins0 = f->nins;
+    role = (u32 *)xmalloc(nins0 * 4 * sizeof(u32));
+    hit = role + nins0;
+    hitk = hit + nins0;
+    hitr = hitk + nins0;
+    memset(role, 0, nins0 * sizeof(u32));
+    for (k = 0; k < nc; k++) {
+        if (role[cand[k].phi] || role[cand[k].next])
+            cand[k].h = 0; /* (a value that is the next of two counters: left alone) */
+        else
+            role[cand[k].phi] = 2 * k + 2, role[cand[k].next] = 2 * k + 3;
+    }
+    for (b = 1; b < f->nblk; b++) {
+        if (f->blk[b].term == TERM_NONE)
+            continue;
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 a;
+            if (i->op != OP_SEXT32 && i->op != OP_ZEXT32)
+                continue;
+            a = ir_resolve(f, i->a);
+            hitk[nhit] = 0;
+            if (a < nins0 && !role[a] && i->op == OP_SEXT32 && f->ins[a].op == OP_ADD && f->ins[a].ty == IT_I32) {
+                /* (long)(i - k): a counter that goes up from a first value not below k - INT_MIN stays above it */
+                u32 x = ir_resolve(f, f->ins[a].a);
+                u64 kv, iv;
+                struct Cand *cd;
+                if (x >= nins0 || !role[x] || !ir_is_const(f, ir_resolve(f, f->ins[a].b), &kv) || !((u32)kv >> 31))
+                    continue;
+                cd = &cand[role[x] / 2 - 1];
+                if (!cd->h || cd->c < 0)
+                    continue;
+                if (!cd->nonneg && !(ir_is_const(f, ir_resolve(f, f->xargs[f->ins[cd->phi].a + cd->lat]), &iv) &&
+                                     (i64)(i32)(u32)iv + (i64)(i32)(u32)kv >= -0x7fffffffL - 1))
+                    continue;
+                hitk[nhit] = (u32)kv;
+                a = x;
+            }
+            if (a >= nins0 || !role[a] || !cand[role[a] / 2 - 1].h || (i->op == OP_ZEXT32 && !cand[role[a] / 2 - 1].nonneg))
+                continue;
+            hitr[nhit] = role[a];
+            cand[role[a] / 2 - 1].uses++;
+            hit[nhit++] = v;
+        }
+    }
+    for (k = 0; k < nc; k++) {
+        u32 h = cand[k].h, w, wn, s, t, tn, init;
+        u64 iv;
+        if (!h || !cand[k].uses)
+            continue;
+        init = ir_resolve(f, f->xargs[f->ins[cand[k].phi].a + cand[k].lat]);
+        if (ir_is_const(f, init, &iv)) {
+            s = ir_const(f, IT_I64, (u64)(i64)(i32)(u32)iv);
+        } else {
+            s = ir_raw(f, OP_SEXT32, IT_I64, init, 0);
+            ir_append(f, cand[k].pre, s);
+        }
+        w = ir_phi(f, h, IT_I64);
+        wn = ir_raw(f, OP_ADD, IT_I64, w, ir_const(f, IT_I64, (u64)cand[k].c));
+        ir_insert_before(f, cand[k].next, wn);
+        f->xargs[f->ins[w].a + cand[k].lat] = s;
+        f->xargs[f->ins[w].a + 1 - cand[k].lat] = wn;
+        tn = ir_raw(f, OP_TRUNC, IT_I32, wn, 0);
+        ir_insert_before(f, cand[k].next, tn);
+        t = ir_raw(f, OP_TRUNC, IT_I32, w, 0);
+        if (f->blk[h].first)
+            ir_insert_before(f, f->blk[h].first, t);
+        else
+            ir_append(f, h, t);
+        cand[k].w = w;
+        cand[k].wn = wn;
+        cand[k].pre = t;  /* (from here on: the two low halves) */
+        cand[k].lat = tn;
+        done++;
+        if (log)
+            fprintf(stderr, "ivwiden: %s block %u step %ld, %u widenings\n", f->name ? f->name : "?", h, (long)cand[k].c,
+                    cand[k].uses);
+    }
+    for (k = 0; k < nhit; k++) {
+        u32 r = hitr[k], with;
+        if (!cand[r / 2 - 1].uses)
+            continue;
+        with = r & 1 ? cand[r / 2 - 1].wn : cand[r / 2 - 1].w;
+        if (hitk[k]) {
+            with = ir_raw(f, OP_ADD, IT_I64, with, ir_const(f, IT_I64, (u64)(i64)(i32)hitk[k]));
+            ir_insert_before(f, hit[k], with);
+        }
+        ir_replace(f, hit[k], with);
+    }
+    for (k = 0; k < nc; k++) {
+        if (!cand[k].h || !cand[k].uses)
+            continue;
+        ir_replace(f, cand[k].next, cand[k].lat);
+        nx = cand[k].phi;
+        unlink_phi(cand[k].h, nx, cand[k].pre);
+    }
+    free(role);
+    if (done) {
+        ir_resolve_all(f);
+        opt_dce(f);
+    }
 }
 
 /* x86-64 host, last before selection: the address of a load or store that is a sum with constants in several

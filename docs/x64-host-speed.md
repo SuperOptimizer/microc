@@ -166,6 +166,10 @@ test_zcache (+-2 G).
 | + memalias, veccover, branchfold branches | 2064 | 1.33 |
 | + spill weights apart from layout weights | 2056 | 1.33 |
 | + host inline limit 20, no-write library calls | 2029 | 1.31 |
+| + xmm16-31 on AVX-512 targets (xmm16-20261117) | 2008 | 1.30 |
+| + inlining: 280 where a local's address is passed, 500 for a function called once | 1975 | 1.28 |
+| + vectors chosen by ?: as values, unasked unrolling up to 3000 instructions | 1958 | 1.27 |
+| + 32-bit loop counters widened (iv_widen) | 1941 | 1.25 |
 
 Per test now (mcc / clang): volcomp_fast 80.6 / 68.0, zcache 177 / 199, wind_sampler 184 / 130, spatial_augment 808 / 560,
 reg 119 / 78.8, scrollaug 99 / 67.8, strip 87 / 56.9, fit_emb 84.8 / 67.0, crush 91.6 / 70.7, repair 298 / 249.
@@ -186,8 +190,25 @@ What went in (each with its switch):
   48 are no better.
 - Library calls that write nothing but errno (getenv, strlen, strcmp, atof ...) keep what gvn knows of locals and
   named globals (`MCC_NONOWRITE`).
-- `MCC_UNROLLINS=N` (measuring only): the unasked unrolling budget. 4000 is -12 G on test_spatial_augment and +8 G on
-  test_zcache; the default (1200) stays.
+- xmm16-xmm31 on targets with AVX-512 F, VL, BW, DQ (`MCC_NOXMM16`; `MCC_XMM16=2` takes them first, for testing;
+  `MCC_NODSPLIT`, `MCC_NOVSPLIT`): the allocator runs with xmm0-12 first and again with the high registers only if xmm
+  values spilled; comparisons into a mask, blends, gathers, hadd and the 128-bit legacy path keep their operands low.
+  -20 G: the stack traffic left in fit_vox2 / write_spatial_tm is values alive across calls, which no xmm register
+  survives.
+- Inlining (`opt_inline.c`): a callee passed the address of a local up to 280 instructions (was 160:
+  `-finline-slotarg=N`, `MCC_INLINESLOT`; spatial_aug_pull into its three callers, -26 G); a function called from one
+  place up to 500 (was 200, `MCC_INLINEONCE`; -6 G). No gain from: the `inline` keyword's limit above 48
+  (`MCC_INLINEHINT`), a larger limit at call sites inside loops, called-once functions of more than 48 blocks (zcache
+  +10 G: the big function's registers).
+- A vector chosen by `?:` is copied into one temporary in each arm and becomes a value (`MCC_NOCONDVEC`); it was
+  chosen by its address, so both arms were stored and the result loaded through a pointer (write_spatial_tm's gathers).
+- Unasked unrolling up to 3000 instructions (was 1200; `MCC_UNROLLINS=N`): -16 G, 4 % more code. (With the inlining
+  above the earlier loss on test_zcache turned into a gain of 10 G.)
+- `iv_widen` (opt.c, last before selection, `MCC_NOIVWIDEN`, `MCC_IVWLOG`): a 32-bit counter read widened becomes a
+  64-bit counter where i + step cannot wrap (the way back is taken only while next < n and the first value is a
+  constant, known small or was compared before the loop; or the header leaves unless i < n); `(long)(i - k)` of a
+  counter that goes up from a known first value too. movslq went from 5 % to 1-2 % of the tests' own instructions;
+  -15 G.
 - From the branches: see "Memory" above; opt_vec.c narrowing / narrow lanes / exact counts / bit reductions
   (`MCC_NOVECNARROW`, `MCC_NOVECZX`, `MCC_NOVECEXT`, `MCC_NOVECEXACT`, `MCC_NOVECBITRED`, `MCC_VECEPI=1`); jump threading
   on ranges, selects value-numbered, loop exits and if bodies in the frequency guess, address sums reshaped
@@ -206,8 +227,10 @@ Where the rest is (10M-instruction samples over the ten tests, clang 153 k, mcc 
 +134 G, library code +65 G (more calls: helpers not inlined into loops, so their hypot / atan2 are not merged with
 the caller's), other loads +60 G, stack stores +41 G, branches +32 G, copies +31 G, other stores +18 G.
 
-- Float / vector code with more than 13 live values (fit_vox2, write_spatial_tm, warp_phase_w4): xmm16-31 on AVX-512
-  targets is the fix (in work, branch xmm16-20261117).
+- Float / vector values alive across calls (fit_vox2, write_spatial_tm): every xmm register is caller-saved, so they
+  live in memory; splitting the range around the call (reload once after it) is what is left to do.
+- By mnemonic (mn.sh), against clang, per test: compare results made into 0 / 1 and tested again (setcc, movzbl,
+  test), `xor r, r` for a zero inside loops (a cmov's operand), xorps before cvtsi2sd, twice the register copies.
 - Small leaf functions use callee-saved registers and pay six saves and restores (rblk_sample); r10 / r11 are emission
   scratch and not allocatable.
 - Vectoriser: filt_axis (clamped gather, strict reductions), 16-trip loops the parser unrolls first (needs SLP),

@@ -69,26 +69,46 @@ void *hw_entry(const char *name) { return hw.lib ? dlsym(hw.lib, name) : 0; }
 #define HW_NAME(m, name, args) name,
 static const char *const names[] = {HW_DRIVER(HW_NAME) 0};
 
+/* Why the driver could not be used, when that is a failure and not an absence: it is there and does not
+   load, or loads and does not start. "" when it was opened, or is not on this machine, or finds no device. */
+static char why[600];
+const char *hw_why(void) { return why; }
+
 static int open_driver(void)
 {
     void *lib, **slot = (void **)(void *)&hw;
-    const char *path = getenv("MCUDA_LIBCUDA");
+    const char *path = getenv("MCUDA_LIBCUDA"), *name, *msg;
     int i, n, r;
-    lib = dlopen(path && path[0] ? path : "libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
-    if (!lib)
+    size_t ml, nl;
+    name = path && path[0] ? path : "libcuda.so.1";
+    lib = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+    if (!lib) {
+        /* no such library ("...: libcuda.so.1", "libcuda.so.1: cannot open shared object file..."): absent */
+        msg = dlerror();
+        if (!msg)
+            msg = "";
+        ml = strlen(msg);
+        nl = strlen(name);
+        if (!((strncmp(msg, "no such shared object", 21) == 0 && ml >= nl && strcmp(msg + ml - nl, name) == 0) ||
+              (strncmp(msg, name, nl) == 0 && strstr(msg, "cannot open shared object file"))))
+            snprintf(why, sizeof why, "the driver (%s) is here but cannot be loaded: %s", name, msg);
         return 35; /* cudaErrorInsufficientDriver */
+    }
     for (i = 0; names[i]; i++) {
         void *f = dlsym(lib, names[i]);
         if (!f) {
-            fprintf(stderr, "mcuda: the driver has no %s\n", names[i]);
+            snprintf(why, sizeof why, "the driver (%s) has no %s", name, names[i]);
             return 35;
         }
         slot[i] = f; /* (the members are all pointers to functions, in the order of the names) */
     }
     hw.lib = lib;
     r = hw.Init(0);
-    if (r)
+    if (r) {
+        if (r != 100)
+            snprintf(why, sizeof why, "the driver (%s) does not start: cuInit gives error %d", name, r);
         return r == 100 ? 100 : r == 999 ? 999 : r;
+    }
     n = 0;
     r = hw.DeviceGetCount(&n);
     if (r || n < 1)

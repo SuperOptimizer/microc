@@ -231,8 +231,12 @@ static int relocate(Lib *l, Rela *r, size_t n)
             const char *name = l->strtab + s->name;
             void *p = resolve(l, name, 0);
             if (!p && (s->info >> 4) != 2) { /* (a weak one that nothing defines is 0) */
-                if (bad < 8)
-                    dl_err("undefined symbol", name);
+                if (!bad) { /* (the first is the message; the trace has them all) */
+                    char buf[400];
+                    snprintf(buf, sizeof buf, "%s (%s wants it)", name, l->path);
+                    dl_err("undefined symbol", buf);
+                } else if (dl_debug())
+                    fprintf(stderr, "dl: undefined symbol: %s\n", name);
                 bad++;
                 continue;
             }

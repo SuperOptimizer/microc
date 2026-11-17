@@ -63,12 +63,16 @@ test-ulibs-x64: ulibs-x64
 hostfs: tools x64 cuda
 	@[ ! -d $(EXT)/zlib-1.4 ] || EXT=$(EXT) ARCH=x86_64 THREADS=$(THREADS) build/stage$(STAGE)/bin/sh mkulibs.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 	@[ ! -d $(EXT)/dropbear-$(DROPBEAR_VERSION) ] || EXT=$(EXT) DROPBEAR_VERSION=$(DROPBEAR_VERSION) build/stage$(STAGE)/bin/sh mkssh.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
-	@build/stage$(STAGE)/bin/sh mkhostfs.sh build/stage$(STAGE)/mcc build/hostfs
+	@SSH=$(SSH) build/stage$(STAGE)/bin/sh mkhostfs.sh build/stage$(STAGE)/mcc build/hostfs
+# dlcheck: the same check on this machine (build/dlcheck FILE.so ...: copies of a driver's libraries)
+dlcheck: $(MCC)
+	@build/stage$(STAGE)/mcc -Ilibc/linux -o build/dlcheck libc/linux/dlcheck.c && echo "build/dlcheck"
 test-hostfs: hostfs
 	@UFSM=$(UFSM) GPU=$(GPU) DOCKER=$(DOCKER) UFSM_GPU_TESTS="$(UFSM_GPU_TESTS)" sh tests/hostfs.sh build/hostfs
 EXT = $(CURDIR)/build/ext
 UFSM =
 GPU =
+SSH =
 DOCKER =
 DROPBEAR_VERSION = 2026.90
 UFSM_GPU_TESTS =
@@ -134,4 +138,4 @@ STAGE = 0
 clean:
 	rm -rf build
 
-.PHONY: hostfs test-hostfs test-x64-cuda all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean
+.PHONY: dlcheck hostfs test-hostfs test-x64-cuda all libc test tools test-tools test-threads ulibs test-ulibs cuda test-cuda test-mangle test-lto test-cuerr bootstrap clean

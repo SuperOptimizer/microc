@@ -3,8 +3,9 @@
    another function, D(name, object) an object. Declared here without their types, so that no header is
    needed: only the addresses are taken. The list is what NVIDIA's libcuda.so.1 and
    libnvidia-ptxjitcompiler.so.1 (driver 615) import; a name that is missing shows as "undefined symbol" in
-   dlerror, and is added here. __glibc_lookup sorts the table at its first use. */
-#ifdef __x86_64__
+   dlerror, and is added here (libc/linux/dlcheck.c tells them for a driver before it is tried: it takes
+   the list from this file, with GLIBC_NAMES_ONLY). __glibc_lookup sorts the table at its first use. */
+#if defined(__x86_64__) || defined(GLIBC_NAMES_ONLY)
 #define GLIBC_LIST(F, A, D) \
     A(_IO_getc, __glibc_IO_getc) \
     A(_IO_putc, __glibc_IO_putc) \
@@ -282,7 +283,9 @@
     F(rename) \
     F(wcslen) \
     /* end */
+#endif
 
+#if defined(__x86_64__) && !defined(GLIBC_NAMES_ONLY)
 #define DECL_F(n) extern void n(void);
 #define DECL_A(n, fn) extern void fn(void);
 #define DECL_D(n, obj) extern char obj[];
@@ -297,6 +300,6 @@ struct glibc_entry {
 #define ROW_D(n, obj) {#n, (void *)obj},
 struct glibc_entry __glibc_table[] = {GLIBC_LIST(ROW_F, ROW_A, ROW_D) {0, 0}};
 const int __glibc_table_n = (int)(sizeof __glibc_table / sizeof __glibc_table[0]) - 1;
-#else
+#elif !defined(GLIBC_NAMES_ONLY)
 extern int __glibctab_nothing_here;
 #endif

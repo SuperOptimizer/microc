@@ -15,6 +15,7 @@
 #                                brings in) and on the CPU otherwise (cuda/mux)
 #   /usr/dropbearmulti           ssh (mkssh.sh: Dropbear, not ours, built by mcc from its source): dropbear the
 #                                server, dbclient / ssh the client, dropbearkey, scp; /usr/bin/start-ssh
+#   /usr/bin/dlcheck             says what a driver's libraries import that our dlopen has not (libc/linux/dlcheck.c)
 #   /etc/passwd, group, hosts    root alone; /tmp, /root, /proc, /sys, /dev: empty
 #   /etc/ssl/certs/ca-certificates.crt   the certificate authorities HTTPS trusts (libcurl reads it): the one
 #                                file here that is neither made by mcc nor from this tree. It is a copy of
@@ -33,6 +34,11 @@ D=${MCC%/*}
 [ -f $D/linux-x64/lib/libc.a ] || { echo "mkhostfs: no x86-64 Linux C library in $D/linux-x64 (make x64)" >&2; exit 1; }
 PATH=$D/bin; LC_ALL=C; export PATH LC_ALL # (LC_ALL: src/*.c in the order the image itself will see them)
 R=$OUT/rootfs; T=$OUT/obj
+# ssh is in the image only when mkssh.sh has built it (SSH=1: and it is an error when it has not)
+if [ ! -f $D/linux-x64/ssh/dropbearmulti ] && [ -n "$SSH" ]; then
+    echo "mkhostfs: SSH=$SSH, and there is no ssh to put in: $D/linux-x64/ssh/dropbearmulti is not built (mkssh.sh; it wants Dropbear's source unpacked under build/ext: README, \"ssh\")" >&2
+    exit 1
+fi
 CC="$MCC --target=x86_64-linux-gnu -mno-glibc"
 EPOCH=${SOURCE_DATE_EPOCH:-1700000000}
 rm -rf $R $T $OUT/hostfs.tar
@@ -47,6 +53,8 @@ for f in box/*.c; do
     objs="$objs $o"
 done
 $CC -o $R/usr/mbox $objs
+# dlcheck: what a driver's libraries import that the C library's dlopen has not (libc/linux/dlcheck.c)
+$CC -Ilibc/linux -o $R/usr/bin/dlcheck libc/linux/dlcheck.c
 
 # every tool by name. The applet list is the host mbox's: the same source.
 for a in $($D/mbox --list); do
@@ -185,3 +193,8 @@ CMD ["/bin/sh"]
 XEOF
 rm -rf $T
 echo "hostfs: $OUT/hostfs.tar ($(wc -c < $OUT/hostfs.tar) bytes, $(tar -tf $OUT/hostfs.tar | wc -l) members)"
+if [ -f $D/linux-x64/ssh/dropbearmulti ]; then
+    echo "hostfs: with ssh (Dropbear: dropbear, dbclient, scp, start-ssh)"
+else
+    echo "hostfs: WITHOUT ssh: no server, no client in this image (Dropbear's source is not under build/ext, so mkssh.sh did not build it: README, \"ssh\"; SSH=1 makes this an error)"
+fi

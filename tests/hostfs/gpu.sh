@@ -52,6 +52,8 @@ EOF
 if cc -o cuinit cuinit.c 2> cuinit.err && ./cuinit > cuinit.out 2>> cuinit.err && grep -q '^cuInit: 0' cuinit.out && grep -q '^device 0: ' cuinit.out; then
     ok "gpu-cuinit ($(grep -c '^device' cuinit.out) devices; $(sed -n 's/^device 0: //p' cuinit.out))"
 else bad gpu-cuinit; cat cuinit.out cuinit.err | head -5; fi
+# the driver's two libraries import nothing that our C library has not (dlcheck finds them where the loader does)
+if dlcheck > dlcheck.out 2>&1; then ok "gpu-dlcheck ($(tail -1 dlcheck.out | sed 's/^dlcheck: //'))"; else bad gpu-dlcheck; cat dlcheck.out; fi
 
 cat > k.cu <<'EOF'
 #include <stdio.h>

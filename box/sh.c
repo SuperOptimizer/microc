@@ -2,6 +2,7 @@
    one command line at a time into a small tree, which is then walked. Words are
    kept as written and expanded when the command runs. */
 #include "box.h"
+#include <setjmp.h>
 
 enum { T_EOF, T_NL, T_WORD, T_AND, T_OR, T_SEMI, T_DSEMI, T_AMP, T_PIPE, T_LP, T_RP, T_REDIR };
 enum { R_IN, R_OUT, R_APP, R_RW, R_DUPIN, R_DUPOUT, R_HERE, R_HERETAB };
@@ -211,9 +212,18 @@ static char *inner(const char *from, const char *to, int close)
 
 /* ---- lexer */
 
+static jmp_buf trial_env; /* interactive(): a parse that only asks whether the text is a whole command */
+static int trial;
+
 static void syntax(const char *msg)
 {
+    if (trial && P->tok == T_EOF)
+        longjmp(trial_env, 1); /* the text ended early: more lines are to come */
     curline = P->line;
+    if (trial) {
+        sh_err("syntax error: %s", msg);
+        longjmp(trial_env, 2);
+    }
     sh_err("syntax error: %s", msg);
     fflush(stderr);
     exit(2);
@@ -2780,6 +2790,103 @@ static int run_string(const char *s)
     return status;
 }
 
+/* ---- the shell at a terminal */
+
+/* 0: TEXT is whole; 1: it ends inside a quotation, a compound command or after a backslash; 2: it is wrong */
+static int whole_command(const char *text)
+{
+    Parser ps, *save = P;
+    const char *p;
+    int q = 0, r;
+    for (p = text; *p; p++) {
+        if (*p == '\\' && q != '\'') {
+            if (!p[1] || (p[1] == '\n' && !p[2]))
+                return 1;
+            p++;
+        } else if (q) {
+            if (*p == q)
+                q = 0;
+        } else if (*p == '\'' || *p == '"')
+            q = *p;
+        else if (*p == '#' && (p == text || p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n'))
+            while (p[1] && p[1] != '\n')
+                p++;
+    }
+    if (q)
+        return 1;
+    memset(&ps, 0, sizeof ps);
+    ps.p = text;
+    ps.line = 1;
+    P = &ps;
+    trial = 1;
+    r = setjmp(trial_env);
+    if (r == 0) {
+        lex();
+        while (parse_list(1))
+            ;
+    }
+    trial = 0;
+    P = save;
+    return r;
+}
+
+static void on_int(int sig)
+{
+    (void)sig;
+    if ((int)getpid() != shpid)
+        _exit(130); /* a command run in a copy of the shell: the interrupt is for it */
+}
+
+/* Commands typed at a terminal: a prompt, a line, and what it says is run once it is a whole command (a
+   quotation or a compound command left open asks for more lines). A syntax error or an interrupt drops what
+   was typed; end of input leaves. Lines are edited by the terminal: there is no history or completion, and a
+   here-document must be typed before its command is run, so it has to be inside a compound command. */
+static int interactive(void)
+{
+    Buf b;
+    char c;
+    long n;
+    int more = 0;
+    memset(&b, 0, sizeof b);
+    signal(SIGINT, on_int);
+    for (;;) {
+        fflush(stdout);
+        fputs(more ? "> " : getuid() == 0 ? "# " : "$ ", stderr);
+        fflush(stderr);
+        for (;;) {
+            n = read(0, &c, 1);
+            if (n < 0 && errno == EINTR) {
+                b.n = 0;
+                more = 0;
+                fputc('\n', stderr);
+                break;
+            }
+            if (n <= 0) {
+                fputc('\n', stderr);
+                return status;
+            }
+            bputc(&b, c);
+            if (c == '\n') {
+                more = whole_command(bstr(&b));
+                if (more == 0) {
+                    char *text = xstrdup(b.s);
+                    curline = 0;
+                    run_string(text);
+                    retp = brkn = contn = 0;
+                    free(text);
+                }
+                if (more != 1)
+                    b.n = 0;
+                if (more == 2) {
+                    status = 2;
+                    more = 0;
+                }
+                break;
+            }
+        }
+    }
+}
+
 /* ---- echo, printf, test: builtins that are also commands */
 
 static int escape(const char **pp, int *stop)
@@ -3183,6 +3290,11 @@ int sh_main(int argc, char **argv)
         set_pos(argv + i, argc - i);
     } else {
         set_pos(argv + i, 0);
+        if (isatty(0) && isatty(2)) {
+            st = interactive();
+            retp = 0;
+            sh_exit(st);
+        }
         text = readall(0, 0);
     }
     st = run_string(text);

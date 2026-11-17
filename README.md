@@ -676,6 +676,44 @@ dynamic linking by mcc's own linker (local-exec thread-local storage only), `lon
 gcc's), link-time optimisation in the ELF linker (either Linux target). Its code runs mcc itself about 1.2
 times slower than gcc -O2's.
 
+## hostfs: a container root file system
+
+`mkhostfs.sh MCC OUTDIR` (or `make hostfs`, into `build/hostfs`) makes a root file system for x86-64 Linux
+containers in which every program is built by mcc from this tree against our own C library, statically:
+`OUTDIR/rootfs`, the same as `OUTDIR/hostfs.tar` (the archive is written by mbox's `tar`, with owner root and
+one fixed time, so the same tree gives the same bytes), and a `Dockerfile` (`FROM scratch`, `ADD hostfs.tar /`).
+About 9 MB. Nothing in it comes from a distribution.
+
+| path | what |
+| --- | --- |
+| `/usr/mbox` | the shell and the tools (`box/`); `init` and `tar` were added for this |
+| `/usr/mcc` | the compiler, assembler, linker, binutils, make, lex, yacc |
+| `/usr/bin` | every tool by name (links to the two programs); `gcc`, `ld`, `ar`, `nm`, `nvcc`, ... and `pkg-config` are two-line scripts; `/bin` and `/sbin` are links to it |
+| `/usr/linux-x64` | the C library (`include`, `lib/crt1.o`, `lib/libc.a`) and the third-party libraries (`ext`) |
+| `/usr/cuda/include` | what a `.cu` file includes |
+| `/etc/passwd`, `group`, `hosts` | root alone; `/tmp`, `/root`, `/proc`, `/sys`, `/dev` are empty |
+
+`init [COMMAND...]` is the image's entry point: it runs the command (default `/bin/sh`), waits for every
+orphan a process 1 inherits, passes TERM, INT, HUP and QUIT on to the command and leaves with its status.
+`sh` at a terminal prompts and runs each command when it is whole (no history, no job control).
+
+    make hostfs                             # build/hostfs/{rootfs,hostfs.tar,Dockerfile}
+    docker import build/hostfs/hostfs.tar mcc-hostfs     # or: docker build -t mcc-hostfs build/hostfs
+    X64_SSH="ssh user@host" X64_DIR=dir make test-hostfs [UFSM=path/to/ufsm]
+
+`tests/hostfs.sh` needs no Docker and no root: on the x86-64 machine it unpacks the archive, checks with that
+machine's `readelf` that every ELF file in it is a static executable or a relocatable object (no interpreter,
+no dynamic section), and runs `tests/hostfs/smoke.sh` inside it through bubblewrap (`bwrap --bind rootfs /
+--unshare-all --as-pid-1`), started by the image's `init`: the tools, a C program, one with threads, make with
+`ar` and `ld -r`, a program linking every third-party library through `pkg-config`, a CUDA unit compiled to
+an object, and mcc building itself to the bytes of the installed `/usr/mcc`. With `UFSM=dir`, ufsm's tests
+that need no GPU are built there by ufsm's own Makefile and run (`tests/hostfs/ufsm.sh`).
+
+Not in it: a CUDA run time for x86-64 (mcuda, the CPU one, is built for arm64 only; the GPU one needs
+NVIDIA's `libcuda.so.1`, a shared library of the GNU C library, and a dynamic loader, which the image has
+not), certificates for HTTPS (`/etc/ssl/certs/ca-certificates.crt` is data to be supplied), time zones
+(the library knows UTC), bash and python (ufsm's suite runner and some of its tests), an ssh server.
+
 ## Known gaps
 
 - Structures are always passed and returned by reference. This differs from

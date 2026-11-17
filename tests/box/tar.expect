@@ -1,0 +1,25 @@
+same archive twice
+a.txt
+D/
+D/D/
+D/D/D/
+D/D/D/D/
+D/D/D/D/a-file-whose-path-is-longer-than-two-hundred-and-fifty-five-characters.txt
+sub/
+sub/deep/
+sub/lnk
+sub/nums
+round trip
+../a.txt
+drwxr-x---
+-rw-------
+sub/nums
+part:
+sub
+part/sub:
+nums
+tar: x/../x/f: a path with .. (not unpacked)
+status 1
+tar: not a tar archive (bad header checksum)
+status 2
+exit 0

@@ -50,6 +50,8 @@ int find_main(int argc, char **argv);
 int awk_main(int argc, char **argv);
 int gzip_main(int argc, char **argv);
 int bzip2_main(int argc, char **argv);
+int tar_main(int argc, char **argv);
+int init_main(int argc, char **argv);
 
 static const struct {
     const char *name;
@@ -116,5 +118,7 @@ static const struct {
     { "bzip2", bzip2_main },
     { "gunzip", gzip_main },
     { "zcat", gzip_main },
+    { "tar", tar_main },
+    { "init", init_main },
     { 0, 0 }
 };

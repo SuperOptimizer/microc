@@ -95,6 +95,12 @@ static void dump(void)
     close(fd);
 }
 
+/* (the orderings as numbers: only the Linux targets predefine the names) */
+#ifndef __ATOMIC_ACQUIRE
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_ACQ_REL 4
+#endif
+
 /* The first call of any function of a unit registers the unit's table. Threads may race here (ufsm's samplers start
    many at once): the table is claimed by one of them, pushed onto the list without a lock, and dump() is registered
    once. (The counters themselves are plain increments: under threads a few counts can be lost, which a profile can

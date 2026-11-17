@@ -186,6 +186,14 @@ enum cudaMemoryType {
     cudaMemoryTypeManaged = 3
 };
 
+/* (CUDA's layout) */
+struct cudaFuncAttributes {
+    size_t sharedSizeBytes, constSizeBytes, localSizeBytes;
+    int maxThreadsPerBlock, numRegs, ptxVersion, binaryVersion, cacheModeCA, maxDynamicSharedSizeBytes, preferredShmemCarveout;
+    int clusterDimMustBeSet, requiredClusterWidth, requiredClusterHeight, requiredClusterDepth, clusterSchedulingPolicyPreference;
+    int nonPortableClusterSizeAllowed, reserved[16];
+};
+
 enum cudaFuncAttribute {
     cudaFuncAttributeMaxDynamicSharedMemorySize = 8,
     cudaFuncAttributePreferredSharedMemoryCarveout = 9,
@@ -635,6 +643,9 @@ cudaError_t cudaGetDriverEntryPointByVersion(const char *proc, void **funcPtr, u
                                              cudaDriverEntryPointQueryResult *symbolStatus);
 /* func is whatever the compiler passes for a kernel: it is not looked at. */
 cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute attr, int value);
+/* On the card: what the driver says of the kernel's machine code (its registers a thread, static shared and local memory ...),
+   loading its module; without one (or for a func that is not a kernel's): all zero. */
+cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func);
 cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache cacheConfig);
 cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, const void *func, int blockSize,
                                                           size_t dynamicSMemSize);

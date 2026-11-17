@@ -277,6 +277,10 @@
     F(pthread_getaffinity_np) \
     F(pthread_setaffinity_np) \
     F(sched_getcpu) \
+    /* more that the driver's 620 libraries import (615 did not) */ \
+    F(dladdr) \
+    F(rename) \
+    F(wcslen) \
     /* end */
 
 #define DECL_F(n) extern void n(void);

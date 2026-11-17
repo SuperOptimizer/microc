@@ -5,7 +5,7 @@
 # MCC's directory must hold the tools (mkbox.sh: bin/, used here instead of the system's) and the x86-64
 # Linux C library (mklxlibc.sh MCC DIR x86_64). What it also holds goes in when it is there: the third-party
 # libraries (ARCH=x86_64 mkulibs.sh: linux-x64/ext), the CUDA headers and run time (mkcuda.sh: cuda/include,
-# linux-x64/cuda/lib).
+# linux-x64/cuda/lib), ssh (mkssh.sh: linux-x64/ssh).
 #
 #   /usr/mcc, /usr/mbox          the compiler (make, lex, yacc, linker, binutils) and the shell + tools
 #   /usr/bin                     every tool by name; /bin and /sbin are links to it
@@ -13,6 +13,8 @@
 #   /usr/cuda                    include: what a .cu file includes; lib64/libcudart.a: the CUDA run time, on the
 #                                GPU when NVIDIA's driver is there (libcuda.so.1, which the container run time
 #                                brings in) and on the CPU otherwise (cuda/mux)
+#   /usr/dropbearmulti           ssh (mkssh.sh: Dropbear, not ours, built by mcc from its source): dropbear the
+#                                server, dbclient / ssh the client, dropbearkey, scp; /usr/bin/start-ssh
 #   /etc/passwd, group, hosts    root alone; /tmp, /root, /proc, /sys, /dev: empty
 #   /etc/ssl/certs/ca-certificates.crt   the certificate authorities HTTPS trusts (libcurl reads it): the one
 #                                file here that is neither made by mcc nor from this tree. It is a copy of
@@ -85,6 +87,49 @@ esac
 exit $st
 XEOF
 chmod 755 $R/usr/bin/pkg-config
+# ssh: Dropbear, built by mcc from its source (mkssh.sh); not ours. Keys only; no key is in the image.
+if [ -f $D/linux-x64/ssh/dropbearmulti ]; then
+    cp $D/linux-x64/ssh/dropbearmulti $R/usr/dropbearmulti
+    for a in dropbear dbclient ssh dropbearkey scp; do
+        ln -s ../dropbearmulti $R/usr/bin/$a
+    done
+    cat > $R/usr/bin/start-ssh <<'XEOF'
+#!/bin/sh
+# start-ssh [PORT]: start the ssh server (Dropbear) for the user this runs as (root, in a container), by key
+# only, and return.
+#   who may log in: the public keys in $PUBLIC_KEY, $SSH_PUBLIC_KEY or $AUTHORIZED_KEYS (one a line, as the
+#       platform that starts the container passes them) are added to ~/.ssh/authorized_keys, which may also
+#       be mounted or written beforehand. Without any key there, nothing is started.
+#   the host's keys: those in /etc/dropbear (DROPBEAR_DIR) if it holds any (mount it to keep one identity
+#       over restarts); otherwise an ed25519 key is made there now. The image carries none.
+#   SSH_PORT: the port (default 22). The server's messages go to /tmp/dropbear.log.
+port=${1:-${SSH_PORT:-22}}
+home=${HOME:-/root}
+dir=${DROPBEAR_DIR:-/etc/dropbear}
+umask 077
+mkdir -p $home/.ssh $dir || exit 1
+for k in "$PUBLIC_KEY" "$SSH_PUBLIC_KEY" "$AUTHORIZED_KEYS"; do
+    [ -n "$k" ] || continue
+    printf '%s\n' "$k" | while read -r line; do
+        [ -n "$line" ] || continue
+        grep -q -x -F -e "$line" $home/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "$line" >> $home/.ssh/authorized_keys
+    done
+done
+if ! grep -q '^[a-z]' $home/.ssh/authorized_keys 2>/dev/null; then
+    echo "start-ssh: no public key (PUBLIC_KEY, or $home/.ssh/authorized_keys): not started" >&2
+    exit 1
+fi
+chmod 700 $home/.ssh; chmod 600 $home/.ssh/authorized_keys
+if ! ls $dir/dropbear_*_host_key >/dev/null 2>&1; then
+    dropbearkey -t ed25519 -f $dir/dropbear_ed25519_host_key >/dev/null 2>&1 || { echo "start-ssh: cannot make a host key in $dir" >&2; exit 1; }
+fi
+keys=
+for f in $dir/dropbear_*_host_key; do keys="$keys -r $f"; done
+# -s: no passwords (there are none in this build anyway)   -E: messages to standard error, not syslog
+dropbear -s -E -p "$port" -P /tmp/dropbear.pid $keys 2>> /tmp/dropbear.log
+XEOF
+    chmod 755 $R/usr/bin/start-ssh
+fi
 ln -s usr/bin $R/bin
 ln -s usr/bin $R/sbin
 

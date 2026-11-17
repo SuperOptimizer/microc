@@ -59,15 +59,18 @@ test-ulibs-x64: ulibs-x64
 # mkhostfs.sh) in which every program is built by mcc from this tree: the shell and tools, the compiler, the C
 # library, the CUDA headers and, when their sources are under build/ext (libc/ext/fetch.sh), the third-party
 # libraries. test-hostfs runs tests/hostfs/smoke.sh inside it on the x86-64 machine (X64_SSH, X64_DIR; it
-# needs bubblewrap there, not Docker and not root); with UFSM=dir also ufsm's tests that need no GPU.
+# needs bubblewrap there, not Docker and not root; DOCKER=1: in Docker as well); with UFSM=dir also ufsm's tests that need no GPU.
 hostfs: tools x64 cuda
 	@[ ! -d $(EXT)/zlib-1.4 ] || EXT=$(EXT) ARCH=x86_64 THREADS=$(THREADS) build/stage$(STAGE)/bin/sh mkulibs.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
+	@[ ! -d $(EXT)/dropbear-$(DROPBEAR_VERSION) ] || EXT=$(EXT) DROPBEAR_VERSION=$(DROPBEAR_VERSION) build/stage$(STAGE)/bin/sh mkssh.sh build/stage$(STAGE)/mcc build/stage$(STAGE)
 	@build/stage$(STAGE)/bin/sh mkhostfs.sh build/stage$(STAGE)/mcc build/hostfs
 test-hostfs: hostfs
-	@UFSM=$(UFSM) GPU=$(GPU) UFSM_GPU_TESTS="$(UFSM_GPU_TESTS)" sh tests/hostfs.sh build/hostfs
+	@UFSM=$(UFSM) GPU=$(GPU) DOCKER=$(DOCKER) UFSM_GPU_TESTS="$(UFSM_GPU_TESTS)" sh tests/hostfs.sh build/hostfs
 EXT = $(CURDIR)/build/ext
 UFSM =
 GPU =
+DOCKER =
+DROPBEAR_VERSION = 2026.90
 UFSM_GPU_TESTS =
 # mcc cross-built for x86-64 Linux, then building itself and running the C tests there
 test-x64-self: x64

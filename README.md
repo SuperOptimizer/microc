@@ -759,7 +759,7 @@ brings the driver's libraries and device nodes, as it does for any image.
 image the way NVIDIA's container run time does and run `tests/hostfs/gpu.sh` there: `cuInit` and the devices'
 names through `dlopen`, a kernel on the GPU and the same program on the CPU, the cublasLt comparison, and
 with `UFSM_GPU_TESTS` tests of ufsm. On two RTX 3090 (driver 615.71, under bubblewrap) all 63 checks pass
-(with ufsm's and ssh's);
+(with ufsm's and ssh's), and again under Docker (below);
 ufsm's `test_nn` takes 5 s on the GPU (498 s on the CPU's run time). `GPU=1 make test-x64-cuda` runs the
 programs of `tests/cuda` on the GPU: 41 pass; `mx` (for sm_120a) and `ldg` (it reads a `uint2` at an address
 that is a multiple of 4 but not of 8, which `ld.global.nc.v2.u32` does not take on a real device) are left out.
@@ -796,11 +796,38 @@ listens on a loopback nobody else can reach: a key pair is made, the server star
 client logs in by `dbclient` and by `ssh`, runs a command, gets its status, copies a file with `scp`; another
 key is refused and no password is asked for. It runs as a user that is not root, because in a user namespace
 made without privilege nobody may set groups, which the server does for root before starting root's shell:
-root's login is for Docker to show. A session with a terminal was tried by hand (`dbclient -t`: `/dev/pts/0`).
+root's login is shown under Docker (below). A session with a terminal was tried by hand (`dbclient -t`:
+`/dev/pts/0`).
+
+### Under Docker
+
+`DOCKER=1` makes `tests/hostfs.sh` (`make test-hostfs DOCKER=1 GPU=1 ...`) build the image from its
+`Dockerfile` on the machine and run the same scripts in real containers as well: `init` is process 1 and
+passes the command's status on; the smoke test; with `GPU=1` the GPU checks under `docker run --gpus all`,
+with nothing bound by hand; ssh as root in a container with `--network none`. Images and containers are named
+`mcc-hostfs-test*` and removed. With Docker 29.1 and NVIDIA's container toolkit on two RTX 3090 (driver
+615.71): 128 checks pass, 63 under bubblewrap and 65 under Docker; ufsm's `test_nn` takes 5 s there too.
+
+What NVIDIA's run time puts into this image, as seen there (no `nvidia` runtime was registered with Docker,
+no `/etc/docker/daemon.json`; the toolkit had written a CDI specification, `/var/run/cdi/nvidia.yaml`):
+
+| | `--gpus all` (or `--gpus device=N`) | `--device nvidia.com/gpu=all` (CDI) | `--runtime=nvidia` |
+|---|---|---|---|
+| works | yes | yes | no: "unknown or invalid runtime name" (it is not registered) |
+| libraries | `/usr/lib64`, 20 names | `/usr/lib/x86_64-linux-gnu`, 68 names | |
+| `libcuda`, `libnvidia-ptxjitcompiler` | mounted as `libcuda.so.615.71.10`; the link `libcuda.so.1` is made | the same | |
+| devices | `/dev/nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools`, `nvidia0`, `nvidia1` (those asked for) | those, `nvidia-modeset`, `/dev/dri/*` | |
+| environment | `NVIDIA_VISIBLE_DEVICES=all` (or the number) | `NVIDIA_VISIBLE_DEVICES=void`, `NVIDIA_CTK_LIBCUDA_DIR=/usr/lib/x86_64-linux-gnu` | |
+| other | `/usr/bin/nvidia-smi` and four more programs (they need glibc: they do not run here), firmware, `/proc/driver/nvidia`, an `/etc/ld.so.cache` | the same | |
+
+The image has no `ldconfig` and no `/etc/ld.so.conf`; both ways bring their own, and the short names and the
+cache appear all the same. Our `dlopen` reads no cache: it finds the libraries in either directory, by the
+short name or, were the link missing, by the full one. Without any of these options the same program runs on
+the CPU (`mcuda: the CPU run time (no driver or no device: error 35)`).
 
 Not in it: time zones (the library knows UTC), bash and python (ufsm's suite runner and some of its tests),
-sftp. Not tried: Docker itself and NVIDIA's container run time (the checks above are under bubblewrap, with
-the libraries and devices bound by hand), RunPod.
+sftp. Not tried: RunPod (what its run time injects is taken to be what `--gpus all` does; the name of the
+variable that carries the public key is from memory).
 
 ## Known gaps
 

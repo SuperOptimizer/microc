@@ -95,6 +95,11 @@ test-lto: $(MCC) $(LIBC)
 test-cuerr: $(MCC) $(LIBC)
 	@sh tests/cuerr.sh build/stage$(STAGE)
 
+# mcudahw on a card (tests/hwflags.sh; opt-in, not in `test`: it needs a GPU and the machine's GPU lock): cudaSetDeviceFlags reaches
+# the primary context, a blocking-sync wait sleeps
+test-hwflags: cuda
+	@sh tests/hwflags.sh build/stage$(STAGE)
+
 # kernel names (tests/mangle.sh): the Itanium C++ ABI's, as nvcc writes them, so profiles of mcc and nvcc builds match
 test-mangle: cuda
 	@sh tests/mangle.sh build/stage$(STAGE)

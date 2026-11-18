@@ -72,12 +72,23 @@ cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, unsigned int fl
 
 static unsigned int dev_flags;
 
+/* The scheduling flags (spin / yield / blocking sync) go to the device's primary context, as NVIDIA's run time does: before, they
+   were only kept here, and nn_flat.cu's cudaDeviceScheduleBlockingSync never reached the driver (its waits spun). The context is
+   current by now (ENTER): cuCtxSetFlags (CUDA 12.1 on) changes it while it lives; an older driver gets the primary context's flags,
+   which take effect where it is made again. */
 cudaError_t cudaSetDeviceFlags(unsigned int flags)
 {
+    int r;
+    unsigned cf;
+    int (*set_cur)(unsigned);
     if (flags & ~(unsigned)cudaDeviceMask)
         return ret(cudaErrorInvalidValue);
+    ENTER();
     dev_flags = flags;
-    return cudaSuccess;
+    cf = flags & 0x17u; /* CU_CTX_SCHED_* and LMEM_RESIZE_TO_MAX are the same bits; MAP_HOST (8) a primary context always has */
+    set_cur = (int (*)(unsigned))hw_entry("cuCtxSetFlags");
+    r = set_cur ? set_cur(cf) : hw.PrimaryCtxSetFlags(hw_dev, cf);
+    return ret(r);
 }
 
 cudaError_t cudaGetDeviceFlags(unsigned int *flags)

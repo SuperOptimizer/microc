@@ -2907,6 +2907,18 @@ static int opt_licmcalls = -1;
 #define LICM_STORES 48 /* the stores of a loop that are remembered (16 without roots) */
 #define LICM_WHOLE 0xff /* store_mem: a write of unknown length */
 
+/* Device code: loops are hoisted from (without MCC_LICM) when what they carry round is no more than opt_licm_phi values
+   (the phis of the loop's head): a loop of many accumulators (conv_fwd_f4v_k's 224 MMAs) has no registers to spare for
+   values worked out before it, and spills with them, where a loop of few (conv_fwd_s2_f8_k: 32) recomputed each trip
+   its addresses' 64-bit parts, divisions by constants and lane numbers (664 SASS instructions in its MMA loop against
+   nvcc's 218; hoisted, 270). MCC_LICMPHI=N; 0 (the default): no device loop hoisted from. Off because the GPU did not follow the
+   counts: on an RTX 4060, at 16, conv_fwd_s2_f8_k ran as fast as without and bwd_data_s2_f4_k<4,8> 31 % slower. */
+#ifndef LICM_PHI_DEFAULT
+#define LICM_PHI_DEFAULT 0
+#endif
+int opt_licm_phi = -1;
+int opt_licm_cost = -1; /* MCC_LICMCOST=0: every pure value of a device loop may go (see licm) */
+
 static int licm(void)
 {
     u32 *mark, *stack, k, j, p, v, nx, sp, nblk0 = f->nblk;
@@ -2932,6 +2944,13 @@ static int licm(void)
         int clobbers_all = 0, replaced = 0, has_call = 0;
         Block *hb = &f->blk[h];
 
+        if (opt_dev_fn && !opt_dolicm) {
+            int nph = 0;
+            for (v = hb->phis; v && nph <= opt_licm_phi; v = f->ins[v].next)
+                nph++;
+            if (nph > opt_licm_phi)
+                continue;
+        }
         sp = 0;
         for (p = 0; p < hb->npreds; p++) {
             u32 q = hb->preds[p];
@@ -3141,6 +3160,14 @@ static int licm(void)
                             ok = 0;
                         else if (!f->ins[i->a].blk && (ir_opcount(f, v) < 2 || !f->ins[i->b].blk))
                             ok = 0;
+                    }
+                    if (ok && opt_dev_fn && !opt_dolicm && opt_licm_cost) {
+                        /* device code (not MCC_LICM): only what costs more than an instruction where it is, a 64-bit
+                           value (two registers, and its arithmetic two or more instructions: an address's sign extension
+                           and product) or a division: a 32-bit sum of lane numbers costs as much in the loop as the
+                           register it would hold through it (conv_bwd_w_f4_k at its cap of 96 registers spilled) */
+                        int op = i->op;
+                        ok = i->ty == IT_I64 || op == OP_SDIV || op == OP_UDIV || op == OP_SREM || op == OP_UREM;
                     }
                 } else if (i->op == OP_CALL && (i->flags & IF_PURE) && !opt_nopurelicm && always) {
                     /* a math function of loop-invariant arguments in a block every trip runs (so it is not
@@ -4491,7 +4518,11 @@ static void run_passes(Func *fn)
         gvn();
         ir_resolve_all(f);
     }
-    if (!(opt_dev_fn && !opt_dolicm) && !(opt_cuda && opt_nolicm) && licm())
+    if (opt_licm_cost < 0)
+        opt_licm_cost = getenv("MCC_LICMCOST") ? atoi(getenv("MCC_LICMCOST")) : 1;
+    if (opt_licm_phi < 0)
+        opt_licm_phi = getenv("MCC_LICMPHI") ? atoi(getenv("MCC_LICMPHI")) : LICM_PHI_DEFAULT;
+    if (!(opt_dev_fn && !opt_dolicm && !opt_licm_phi) && !(opt_cuda && opt_nolicm) && licm())
         ir_resolve_all(f);
     /* x86-64: the tests of an || / && chain that the loop does not change, now outside it, grouped, so the group
        leaves the loop too */

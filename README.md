@@ -632,6 +632,8 @@ and how much of its state stays in memory, so device code is treated differently
   one through a pointer is one `ld` / `st.v2` / `.v4`, and loads or stores of one base at consecutive places whose address is known
   to be aligned to the whole are one vector instruction (`MCC_NOVEC`);
 - a 16-bit float that is only widened and narrowed again is its bits as they were (`MCC_NOH16`);
+- `MCC_LICMPHI=N` (an experiment, off by default): loops whose head carries at most N values have their 64-bit values and
+  divisions computed before them (`MCC_LICMCOST=0`: every pure value); at 16 one of ufsm's kernels was 31 % slower and none faster;
 
 `MCC_NOUNROLL`, `MCC_NOAUTO`, `MCC_NOSPLIT`, `MCC_NOSH32`, `MCC_NOIFC`, `MCC_NOCHAIN`, `MCC_NOWIDE`, `MCC_NOMINMAX`,
 `MCC_NOSELK`, `MCC_NOGLOBAL`, `MCC_NOLOCAL`, `MCC_NOIFCALL`, `MCC_NOPRED`, `MCC_NODIST`, `MCC_NOASMCO`, `MCC_LICM` (`=2`: all but what costs nothing in the loop) in the environment turn these

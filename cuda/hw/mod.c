@@ -1952,6 +1952,26 @@ static int job_dump(Job *J)
 }
 
 /* Kernel `item` of module mod, loaded: K->module and K->f, or K->err. Lock held. */
+/* MCUDA_KLOG=FILE: the name of every kernel a process loads (from the cache or compiled), a line each, appended by one
+   write: parallel processes can share the file. A test suite records which kernels each test runs, and warms just those
+   (MCUDA_PRECOMPILE_ONLY=@FILE). */
+static void klog(const Item *it)
+{
+    static int fd = -2;
+    char line[1100];
+    int n;
+    if (fd == -2) {
+        const char *f = getenv("MCUDA_KLOG");
+        fd = f && f[0] ? open(f, O_WRONLY | O_APPEND | O_CREAT, 0666) : -1;
+    }
+    if (fd < 0 || it->len > 1000)
+        return;
+    memcpy(line, it->name, (size_t)it->len);
+    line[it->len] = '\n';
+    n = write(fd, line, (size_t)it->len + 1);
+    (void)n;
+}
+
 static void kload(Kern *K, int mod, int item)
 {
     Job J;
@@ -1963,6 +1983,7 @@ static void kload(Kern *K, int mod, int item)
     int whole, lockfd = -1;
 
     K->tried = 1;
+    klog(&mods[mod].items[item]);
     job_prep(&J, mod, item);
     r = J.r;
     job_dump(&J);
@@ -2098,7 +2119,7 @@ static void kload(Kern *K, int mod, int item)
 
 /* ---- MCUDA_PRECOMPILE=N ----
    The program's first use of the device becomes this instead: every kernel of the program (MCUDA_PRECOMPILE_ONLY=
-   TEXT: those with TEXT in their names) that the cache does not hold goes through the driver's compiler, N at
+   TEXT: those with TEXT in their names; =@FILE: those named in FILE, e.g. a test's MCUDA_KLOG) that the cache does not hold goes through the driver's compiler, N at
    a time, and into the cache; then the program ends. For a build to pay for what the first run would. */
 typedef struct {
     int mod, item;
@@ -2118,17 +2139,77 @@ static int pre_cmp(const void *a, const void *b)
     return x->mod != y->mod ? x->mod - y->mod : x->item - y->item;
 }
 
+/* MCUDA_PRECOMPILE_ONLY=@FILE: the kernels named in FILE, one mangled name a line (as MCUDA_KLOG writes them) */
+static char *only_text;
+static const char **only_names;
+static int only_n;
+
+static int only_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    long n;
+    int cap = 0;
+    char *p, *e;
+    if (!f) {
+        fprintf(stderr, "mcuda: MCUDA_PRECOMPILE_ONLY: cannot read %s\n", path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    only_text = (char *)xrealloc(0, (size_t)(n > 0 ? n : 0) + 1);
+    n = (long)fread(only_text, 1, (size_t)(n > 0 ? n : 0), f);
+    fclose(f);
+    only_text[n > 0 ? n : 0] = 0;
+    for (p = only_text; *p; p = e) {
+        e = strchr(p, '\n');
+        if (e)
+            *e++ = 0;
+        else
+            e = p + strlen(p);
+        while (*p == ' ' || *p == '\t' || *p == '\r')
+            p++;
+        {
+            size_t l = strlen(p);
+            while (l && (p[l - 1] == ' ' || p[l - 1] == '\t' || p[l - 1] == '\r'))
+                p[--l] = 0;
+            if (!l)
+                continue;
+        }
+        if (only_n == cap) {
+            cap = cap ? cap * 2 : 64;
+            only_names = (const char **)xrealloc((void *)only_names, (size_t)cap * sizeof *only_names);
+        }
+        only_names[only_n++] = p;
+    }
+    return 0;
+}
+
+static int only_has(const Item *it)
+{
+    int k;
+    for (k = 0; k < only_n; k++)
+        if ((int)strlen(only_names[k]) == it->len && memcmp(only_names[k], it->name, (size_t)it->len) == 0)
+            return 1;
+    return 0;
+}
+
 static void pre_collect(void)
 {
     const char *only = getenv("MCUDA_PRECOMPILE_ONLY"), *fifo = getenv("MCUDA_PRECOMPILE_FIFO");
-    int m, k, cap = 0;
+    int m, k, cap = 0, list = only && only[0] == '@';
+    if (list && only_load(only + 1) != 0)
+        return;
     for (m = 0; m < nmods; m++) {
         index_mod(m);
         for (k = 0; k < mods[m].nitems; k++) {
             const Item *it = &mods[m].items[k];
             if (it->kind != IT_ENTRY)
                 continue;
-            if (only && only[0]) {
+            if (list) {
+                if (!only_has(it))
+                    continue;
+            } else if (only && only[0]) {
                 char nm[300];
                 sprintf(nm, "%.*s", it->len < 290 ? it->len : 290, it->name);
                 if (!strstr(nm, only))

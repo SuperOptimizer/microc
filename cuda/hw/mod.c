@@ -20,6 +20,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/file.h>
 
 typedef unsigned long long u64;
 
@@ -574,6 +577,36 @@ static void cache_write(const char *path, const void *p, size_t n)
         rename(tmp, path);
     else
         remove(tmp);
+}
+
+/* One process at a time compiles a given text: a parallel cold test suite started the same 20-90 s kernels in every test
+   process at once. The first takes PATH.lock, the others wait on it and then find the code in the cache. (The lock file
+   goes once the code is there: who comes later reads the cache first; who waited on the old file looks again after it.)
+   -1: no lock (no file system lock here), which compiles as before. */
+static int cache_lock(const char *path)
+{
+    char lk[1200];
+    int fd;
+    sprintf(lk, "%s.lock", path);
+    fd = open(lk, O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+        return -1;
+    while (flock(fd, LOCK_EX) != 0)
+        if (errno != EINTR) {
+            close(fd);
+            return -1;
+        }
+    return fd;
+}
+
+static void cache_unlock(const char *path, int fd)
+{
+    char lk[1200];
+    if (fd < 0)
+        return;
+    sprintf(lk, "%s.lock", path);
+    unlink(lk);
+    close(fd);
 }
 
 /* ---- loading a group ---- */
@@ -1927,7 +1960,7 @@ static void kload(Kern *K, int mod, int item)
     size_t size = 0;
     CUhandle link = 0;
     double t0;
-    int whole;
+    int whole, lockfd = -1;
 
     K->tried = 1;
     job_prep(&J, mod, item);
@@ -1973,8 +2006,11 @@ static void kload(Kern *K, int mod, int item)
             fprintf(stderr, "mcuda: %s: the driver does not compile its PTX as a whole program (error %d)\n%s\n", J.kname, r, log);
         else if (verbose())
             fprintf(stderr, "mcuda: %s: compiled as a whole program (setmaxnreg) in %.2f s\n", J.kname, now() - t0);
-    } else if (!r && J.have_path)
+    } else if (!r && J.have_path) {
         image = cache_read(J.path, &size);
+        if (!image && (lockfd = cache_lock(J.path)) >= 0)
+            image = cache_read(J.path, &size); /* (made while this waited) */
+    }
     if (image) {
         r = hw.ModuleLoadData(&K->module, image);
         if (r) { /* a file that is not what it should be */
@@ -2001,6 +2037,7 @@ static void kload(Kern *K, int mod, int item)
         if (link)
             hw.LinkDestroy(link);
     }
+    cache_unlock(J.path, lockfd);
     free(image);
     if (verbose() && (locals_slots || locals_fwds)) {
         fprintf(stderr, "mcuda: %s: %lu locals in registers, %lu loads taken from the store before\n", J.kname, locals_slots, locals_fwds);
@@ -2138,10 +2175,18 @@ static void *pre_worker(void *arg)
             CUhandle link = 0;
             void *cubin = 0;
             size_t size = 0;
-            double t0 = now();
-            int r = job_compile(&J, &link, &cubin, &size);
+            double t0;
+            int r, lockfd = cache_lock(J.path);
+            if (access(J.path, R_OK) == 0) { /* (another process made it while this waited) */
+                cache_unlock(J.path, lockfd);
+                job_free(&J);
+                continue;
+            }
+            t0 = now();
+            r = job_compile(&J, &link, &cubin, &size);
             if (!r)
                 cache_write(J.path, cubin, size);
+            cache_unlock(J.path, lockfd);
             if (link)
                 hw.LinkDestroy(link);
             hw_lock();

@@ -2063,28 +2063,32 @@ static void kload(Kern *K, int mod, int item)
    The program's first use of the device becomes this instead: every kernel of the program (MCUDA_PRECOMPILE_ONLY=
    TEXT: those with TEXT in their names) that the cache does not hold goes through the driver's compiler, N at
    a time, and into the cache; then the program ends. For a build to pay for what the first run would. */
-static int pre_mod, pre_item;
+typedef struct {
+    int mod, item;
+    long size;
+} PreJob;
+static PreJob *pre_list;
+static int pre_n, pre_next;
 static unsigned long pre_seen, pre_made, pre_bad;
 
-static void *pre_worker(void *arg)
+/* (largest first: the big conv kernels take 20-90 s each in the driver's compiler and decide the wall time when one
+   of them starts last; MCUDA_PRECOMPILE_FIFO=1: the modules' order as before) */
+static int pre_cmp(const void *a, const void *b)
 {
-    const char *only = getenv("MCUDA_PRECOMPILE_ONLY");
-    (void)arg;
-    if (hw_enter())
-        return 0;
-    for (;;) {
-        Job J;
-        int have = 0;
-        hw_lock();
-        while (!have && pre_mod < nmods) {
-            const Item *it;
-            index_mod(pre_mod);
-            if (pre_item >= mods[pre_mod].nitems) {
-                pre_mod++;
-                pre_item = 0;
-                continue;
-            }
-            it = &mods[pre_mod].items[pre_item++];
+    const PreJob *x = (const PreJob *)a, *y = (const PreJob *)b;
+    if (x->size != y->size)
+        return x->size < y->size ? 1 : -1;
+    return x->mod != y->mod ? x->mod - y->mod : x->item - y->item;
+}
+
+static void pre_collect(void)
+{
+    const char *only = getenv("MCUDA_PRECOMPILE_ONLY"), *fifo = getenv("MCUDA_PRECOMPILE_FIFO");
+    int m, k, cap = 0;
+    for (m = 0; m < nmods; m++) {
+        index_mod(m);
+        for (k = 0; k < mods[m].nitems; k++) {
+            const Item *it = &mods[m].items[k];
             if (it->kind != IT_ENTRY)
                 continue;
             if (only && only[0]) {
@@ -2093,7 +2097,31 @@ static void *pre_worker(void *arg)
                 if (!strstr(nm, only))
                     continue;
             }
-            job_prep(&J, pre_mod, pre_item - 1);
+            if (pre_n == cap) {
+                cap = cap ? cap * 2 : 256;
+                pre_list = (PreJob *)xrealloc(pre_list, (size_t)cap * sizeof *pre_list);
+            }
+            pre_list[pre_n].mod = m;
+            pre_list[pre_n].item = k;
+            pre_list[pre_n++].size = (long)(it->e - it->b);
+        }
+    }
+    if (!(fifo && fifo[0] == '1'))
+        qsort(pre_list, (size_t)pre_n, sizeof *pre_list, pre_cmp);
+}
+
+static void *pre_worker(void *arg)
+{
+    (void)arg;
+    if (hw_enter())
+        return 0;
+    for (;;) {
+        Job J;
+        int have = 0;
+        hw_lock();
+        if (pre_next < pre_n) {
+            job_prep(&J, pre_list[pre_next].mod, pre_list[pre_next].item);
+            pre_next++;
             pre_seen++;
             have = 1;
         }
@@ -2140,6 +2168,7 @@ void hw_precompile(int n)
         n = 64;
     hw_lock();
     take();
+    pre_collect();
     hw_unlock();
     for (i = 0; i < n - 1; i++)
         if (pthread_create(&th[made], 0, pre_worker, 0) == 0)

@@ -7973,13 +7973,15 @@ typedef struct Init {
     u64 max;         /* highest offset written, for incomplete arrays */
     Expr pending;    /* an expression parsed ahead of its use */
     int has_pending;
+    int try_static;  /* automatic, but the bytes are kept in buf too while every element is a constant */
+    int nonconst;    /* try_static: one was not */
 } Init;
 
 static void init_reserve(Init *in, u64 end)
 {
     if (end > in->max)
         in->max = end;
-    if (in->is_static && end > in->buf.len)
+    if ((in->is_static || in->try_static) && end > in->buf.len)
         buf_zero(&in->buf, (size_t)(end - in->buf.len));
 }
 
@@ -8033,13 +8035,23 @@ static void init_scalar(Init *in, Type *ty, u64 off, Field *bf)
     }
     if (!in->is_static) {
         Expr lv;
+        if (!type_is_record(ty))
+            convert(&e, ty);
+        if (in->try_static && !in->nonconst) {
+            Ins *ci = &F->ins[e.v];
+            u32 size = (u32)type_size(ty), k;
+            u64 v = (u64)ci->a | ((u64)ci->b << 32);
+            if (bf || type_is_record(ty) || type_is_128(ty) || (ci->op != OP_CONST && ci->op != OP_FCONST))
+                in->nonconst = 1;
+            else
+                for (k = 0; k < size; k++)
+                    in->buf.p[off + k] = (u8)(v >> (8 * k));
+        }
         set_expr(&lv, ty, ir_slot_addr(F, in->slot, (i64)off), 1);
         if (bf) {
             lv.bitoff = bf->bitoff;
             lv.bitwidth = bf->bitwidth;
         }
-        if (!type_is_record(ty))
-            convert(&e, ty);
         store_expr(&lv, &e);
         return;
     }
@@ -8108,6 +8120,7 @@ static void init_string(Init *in, Type *ty, u64 off)
             n = ty->len; /* the terminator may be dropped */
     }
     init_reserve(in, off + n);
+    in->nonconst = 1;
     if (in->is_static)
         memcpy(in->buf.p + off, b.p, (size_t)n);
     else
@@ -8469,6 +8482,24 @@ static void define_data(Sym *s, Init *in)
     O->syms[sym].kind = (u8)(s->is_tls ? 3 : 2);
     O->syms[sym].size = size;
     s->defined = 1;
+}
+
+/* An automatic array of constant numbers ("const int t[13][3] = {...}" in a function): its initializer, all constant,
+   makes it an object of the program's (each call built its own copy on the stack: ufsm's tol_dir table, 1248 bytes of
+   local memory in loss_stats_k). Its address may differ between two calls at once only for a recursive function that
+   compares them, which no table does. MCC_NOCTAB: off. */
+static int opt_no_const_tables = -1;
+
+static int const_table(Type *ty)
+{
+    Type *e = ty;
+    if (opt_no_const_tables < 0)
+        opt_no_const_tables = getenv("MCC_NOCTAB") != 0;
+    if (ty->kind != TY_ARRAY || !type_complete(ty))
+        return 0;
+    while (e->kind == TY_ARRAY)
+        e = e->base;
+    return (e->quals & Q_CONST) && !(e->quals & Q_VOLATILE) && (type_is_int(e) || type_is_float(e));
 }
 
 static void static_init(Sym *s)
@@ -9724,6 +9755,7 @@ static int declaration(int file_scope)
                     next();
                 memset(&in, 0, sizeof in);
                 in.slot = s->slot;
+                in.try_static = const_table(ty) && tok.kind == T_LBRACE;
                 if (ty->kind == TY_ARRAY || (type_is_record(ty) && tok.kind == T_LBRACE))
                     zero = emit_mem(OP_MEMZERO, ir_slot_addr(F, s->slot, 0), 0, type_size(ty), type_align(ty));
                 initializer(&in, &s->ty);
@@ -9731,6 +9763,20 @@ static int declaration(int file_scope)
                 F->slots[s->slot].size = (u32)type_size(ty);
                 if (zero)
                     F->ins[zero].c = (u32)type_size(ty);
+                if (in.try_static && !in.nonconst && type_complete(ty) && !opt_no_const_tables) {
+                    /* every element a constant: one object of the program's instead of the stack copy made at
+                       each call (whose stores then have no reader and go) */
+                    Sym *t = new_sym(name, SK_VAR, ty);
+                    init_reserve(&in, type_size(ty));
+                    t->is_static = 1;
+                    t->objsym = obj_add_sym(O, 0, SEC_UNDEF, 0, 0);
+                    sym_align(t->objsym, ty);
+                    in.is_static = 1;
+                    define_data(t, &in);
+                    bind(t);
+                }
+                if (in.try_static)
+                    buf_free(&in.buf);
             }
             else if (opt_cxx && tok.kind == T_LPAREN)
                 paren_init(s, ty, loc);

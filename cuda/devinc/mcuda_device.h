@@ -17,14 +17,14 @@ struct dim3 {
 extern const dim3 threadIdx, blockIdx, blockDim, gridDim;
 static const int warpSize = 32;
 
-struct float2 { float x, y; };
+struct __attribute__((aligned(8))) float2 { float x, y; };
 struct float3 { float x, y, z; };
-struct float4 { float x, y, z, w; };
-struct int2 { int x, y; };
+struct __attribute__((aligned(16))) float4 { float x, y, z, w; };
+struct __attribute__((aligned(8))) int2 { int x, y; };
 struct int3 { int x, y, z; };
-struct int4 { int x, y, z, w; };
-struct uint2 { unsigned x, y; };
-struct uint4 { unsigned x, y, z, w; };
+struct __attribute__((aligned(16))) int4 { int x, y, z, w; };
+struct __attribute__((aligned(8))) uint2 { unsigned x, y; };
+struct __attribute__((aligned(16))) uint4 { unsigned x, y, z, w; };
 __host__ __device__ static __forceinline__ float2 make_float2(float x, float y) { float2 r = {x, y}; return r; }
 __host__ __device__ static __forceinline__ float3 make_float3(float x, float y, float z) { float3 r = {x, y, z}; return r; }
 __host__ __device__ static __forceinline__ float4 make_float4(float x, float y, float z, float w) { float4 r = {x, y, z, w}; return r; }

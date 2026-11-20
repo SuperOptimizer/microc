@@ -4326,6 +4326,90 @@ static void addr_shape(Func *fn)
     }
 }
 
+/* Device code: a load at a known place of a read-only object of this unit is the constant stored there. A table such as
+       __device__ static const float FLW[4][3] = {{0.375f, 0.625f, 0.f}, ...};   ... FLW[RZ0 + dz][k] ...
+   read with indices the unroller and the template arguments made constant was read through mcudahw's table of device
+   globals and a generic load each time (ufsm's fstem_fwd_k: 78 LD.E and 32 more table reads in its MMA loop; nvcc folds them).
+   The object's bytes are those of the unit's read-only section, with no relocation in the bytes read (an address stays a
+   load). MCC_NOCLOAD: off. */
+static int const_loads(void)
+{
+    static int off = -1;
+    u32 b, v, nx, n = 0;
+    if (off < 0)
+        off = getenv("MCC_NOCLOAD") != 0;
+    if (off || !opt_dev_fn || !opt_obj)
+        return 0;
+    for (b = 1; b < f->nblk; b++) {
+        for (v = f->blk[b].first; v; v = nx) {
+            Ins *i = &f->ins[v];
+            u32 a, sz, k, sym;
+            i64 at = 0;
+            u64 c, bits = 0, base;
+            ObjSym *os;
+            const u8 *p;
+            nx = i->next;
+            if (i->op != OP_LOAD || i->mem > M_F64)
+                continue;
+            a = ir_resolve(f, i->a);
+            for (k = 0; k < 8; k++) { /* (address + constant) chains */
+                Ins *ai = &f->ins[a];
+                if (ai->op != OP_ADD || ai->ty != IT_I64)
+                    break;
+                if (ir_is_const(f, ir_resolve(f, ai->b), &c))
+                    a = ir_resolve(f, ai->a);
+                else if (ir_is_const(f, ir_resolve(f, ai->a), &c))
+                    a = ir_resolve(f, ai->b);
+                else
+                    break;
+                at += (i64)c;
+            }
+            if (f->ins[a].op != OP_ADDR)
+                continue;
+            sym = f->ins[a].a;
+            at += (i64)(i32)f->ins[a].b;
+            if (sym >= opt_obj->nsyms)
+                continue;
+            os = &opt_obj->syms[sym];
+            sz = M_SIZE(i->mem);
+            if (os->sec != SEC_CONST || os->kind == 1 || !os->size || at < 0 || (u64)at + sz > os->size)
+                continue;
+            base = os->value + (u64)at;
+            if (base + sz > opt_obj->sec[SEC_CONST].len)
+                continue;
+            for (k = 0; k < opt_obj->nrel[SEC_CONST]; k++) {
+                const ObjReloc *r = &opt_obj->rel[SEC_CONST][k];
+                if (r->off + 8 > base && r->off < base + sz)
+                    break;
+            }
+            if (k < opt_obj->nrel[SEC_CONST])
+                continue;
+            p = opt_obj->sec[SEC_CONST].p + base;
+            for (k = 0; k < sz; k++)
+                bits |= (u64)p[k] << (8 * k);
+            switch (i->mem) {
+            case M_8S: bits = (u64)(i64)(i8)bits; break;
+            case M_16S: bits = (u64)(i64)(i16)bits; break;
+            case M_32: if (i->ty == IT_I64) bits = (u64)(i64)(i32)bits; break;
+            default: break;
+            }
+            if (i->ty == IT_F32 || i->ty == IT_F64) {
+                if ((i->ty == IT_F32) != (i->mem == M_F32) || (i->ty == IT_F64) != (i->mem == M_F64))
+                    continue;
+                ir_replace(f, v, ir_fconst_bits(f, i->ty, bits));
+            } else if (i->ty == IT_I32 || i->ty == IT_I64) {
+                if (i->mem == M_F32 || i->mem == M_F64)
+                    continue;
+                ir_replace(f, v, ir_const(f, i->ty, i->ty == IT_I32 ? (u64)(u32)bits : bits));
+            } else {
+                continue;
+            }
+            n++;
+        }
+    }
+    return n != 0;
+}
+
 static void run_passes(Func *fn)
 {
     int round;
@@ -4350,6 +4434,8 @@ static void run_passes(Func *fn)
         ir_resolve_all(f);
     }
     f = fn;
+    if (const_loads())
+        ir_resolve_all(f);
     gvn();
     if (opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1 && !opt_nosplit)) {
         /* arrays handed to functions that are now part of this one (x86-64: a decoder's state record whose
@@ -4378,6 +4464,11 @@ static void run_passes(Func *fn)
             if (opt_norounds)
                 break;
         }
+    }
+    if (const_loads()) {
+        ir_resolve_all(f);
+        gvn();
+        ir_resolve_all(f);
     }
     if (opt_dev_fn && ptx_single_trip(f))
         ir_resolve_all(f);

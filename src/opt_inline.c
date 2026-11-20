@@ -12,9 +12,15 @@ int opt_inline_host = 20;  /* the same for host code: a helper of two library ca
                               callers, where what it computes is often already there (ufsm's CPU tests: -1.3 % instructions,
                               no larger; 32 and 48 are no better). -finline-limit=N sets both. */
 #define MAX_INLINE_BLOCKS 48
+/* Device code: a call costs far more than on the host. ptxas keeps every call of a relocatable text (the driver links each kernel),
+   passes the parameters through memory, saves the callee's registers around it, and an object whose address is passed (a
+   constructor's this, an out parameter) goes to local memory; nvcc (NVVM) inlines nearly every device function. So device functions
+   are inlined up to opt_inline_dev instructions and opt_inline_devblk blocks (-finline-dev=N, -finline-devblk=N; MCC_INLINEDEV /
+   MCC_INLINEDEVBLK). */
+int opt_inline_dev = 300, opt_inline_devblk = 400;
 int opt_inline_oncelim = 500; /* a function called from one place only */
 #define ONCE_INLINE_INS ((u32)opt_inline_oncelim)
-#define MAX_CALLER_INS 60000
+#define MAX_CALLER_INS 60000 /* (device code: a callee of at most 16 instructions beyond its parameters is inlined into a caller of any size) */
 
 typedef struct Body {
     Ins *ins;
@@ -83,7 +89,7 @@ int opt_inline_hot = 40; /* limit at call sites a profile shows to be hot */
    loop) keeps every field in memory for the whole function. -finline-slotarg=N; 0: off */
 int opt_inline_slotarg = 280;
 int opt_hot_shift = 10;  /* hot: runs at least 1/2^n as often as the busiest block of the program */
-#define LIMIT (opt_size ? 3 : opt_dev_fn || opt_cuda ? opt_inline_limit : opt_inline_host)
+#define LIMIT (opt_size ? 3 : opt_dev_fn ? opt_inline_dev : opt_cuda ? opt_inline_limit : opt_inline_host)
 
 int opt_inline_mode; /* of the function being optimised: 0 inline by size, 1 always, 2 never, 3 by size, declared inline */
 int opt_novec;       /* of the function being optimised: no vector code, which only the processor's back end takes */
@@ -158,9 +164,11 @@ void inline_save(Func *f)
     if (opt_inline_mode != 1) {
         u32 lim = opt_inline_once ? ONCE_INLINE_INS : f->blk[1].freq > 1 && !opt_size ? (u32)opt_inline_hot :
                   opt_inline_mode == 3 && !opt_size ? (u32)opt_inline_hint : (u32)LIMIT;
+        if (opt_dev_fn && !opt_size && (u32)opt_inline_dev > lim)
+            lim = (u32)opt_inline_dev;
         if (!opt_dev_fn && !opt_size && (u32)opt_inline_slotarg > lim)
             lim = (u32)opt_inline_slotarg; /* (kept for the call sites that pass a local's address) */
-        if (count > lim + f->nparams || live > MAX_INLINE_BLOCKS)
+        if (count > lim + f->nparams || live > (opt_dev_fn ? (u32)opt_inline_devblk : MAX_INLINE_BLOCKS))
             return;
     }
     y = body_copy(f);
@@ -642,7 +650,7 @@ int inline_calls(Func *fn)
             if (c->op != OP_ADDR || c->b != 0 || c->a >= nbodies || !bodies[c->a] || c->a == f->sym)
                 continue;
             y = bodies[c->a];
-            if (i->ty != y->ret_ty || (f->nins > MAX_CALLER_INS && !y->always))
+            if (i->ty != y->ret_ty || (f->nins > MAX_CALLER_INS && !y->always && !(opt_dev_fn && y->size <= 16 + y->nparams)))
                 continue;
             {
                 u32 pk, ak = 0;
@@ -675,6 +683,8 @@ int inline_calls(Func *fn)
                 u32 fr = f->blk[cur].freq;
                 u32 lim = fr == 1 ? 3 : fr && fr - 1 >= (prof_max >> opt_hot_shift) && !opt_size ? (u32)opt_inline_hot :
                           y->hinted && !opt_size ? (u32)opt_inline_hint : (u32)LIMIT;
+                if (opt_dev_fn && !opt_size && (u32)opt_inline_dev > lim)
+                    lim = (u32)opt_inline_dev;
                 if (y->size > lim + y->nparams && !opt_dev_fn && !opt_size && fr != 1 && (u32)opt_inline_slotarg > lim) {
                     u32 ak;
                     for (ak = 0; ak < i->b; ak++)

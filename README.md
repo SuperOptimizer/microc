@@ -624,6 +624,14 @@ and how much of its state stays in memory, so device code is treated differently
   (the two are read where the load stood);
 - a float rounded to a 16-bit float and then stored as one is rounded once.
 - `extern template` is honoured, so a unit does not instantiate again the kernels another unit provides.
+- device functions are inlined up to 300 IR instructions and 400 blocks (`-finline-dev=N`, `-finline-devblk=N`,
+  `MCC_INLINEDEV`, `MCC_INLINEDEVBLK`; it was 12 / 48, as for the host): a call left in a kernel passes its arguments and an
+  object whose address it takes through local memory (ufsm's training kernels: 23.4 s against 19.3 s on an RTX 4060 laptop GPU);
+- a load at a known place of a read-only table of the unit is the constant stored there (`MCC_NOCLOAD`);
+- the vector types have CUDA's alignment (`__half2` 4, `float2` / `int2` / `uint2` 8, `float4` / `int4` / `uint4` 16), a copy of
+  one through a pointer is one `ld` / `st.v2` / `.v4`, and loads or stores of one base at consecutive places whose address is known
+  to be aligned to the whole are one vector instruction (`MCC_NOVEC`);
+- a 16-bit float that is only widened and narrowed again is its bits as they were (`MCC_NOH16`);
 
 `MCC_NOUNROLL`, `MCC_NOAUTO`, `MCC_NOSPLIT`, `MCC_NOSH32`, `MCC_NOIFC`, `MCC_NOCHAIN`, `MCC_NOWIDE`, `MCC_NOMINMAX`,
 `MCC_NOSELK`, `MCC_NOGLOBAL`, `MCC_NOLOCAL`, `MCC_NOIFCALL`, `MCC_NOPRED`, `MCC_NODIST`, `MCC_NOASMCO`, `MCC_LICM` (`=2`: all but what costs nothing in the loop) in the environment turn these

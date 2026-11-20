@@ -1057,6 +1057,32 @@ static void slot_carve(Func *f)
         ir_resolve_all(f);
 }
 
+/* Device code: the alignment (IF_ALIGN, log2) that a part of a copy at byte d has when the copy's address p is that of an object of
+   alignment al (the copied type's: a float4 is 16, a __half2 4): the lowest set bit of al and d. Not for an address in the
+   function's own frame, whose loads the passes after this one take apart by their flags. */
+static u32 split_align(Func *f, u32 p, u32 al, u32 d)
+{
+    u32 k, a = al ? al : 1;
+    u64 c;
+    p = ir_resolve(f, p);
+    for (k = 0; k < 8 && f->ins[p].op == OP_ADD; k++) {
+        if (ir_is_const(f, ir_resolve(f, f->ins[p].b), &c))
+            p = ir_resolve(f, f->ins[p].a);
+        else if (ir_is_const(f, ir_resolve(f, f->ins[p].a), &c))
+            p = ir_resolve(f, f->ins[p].b);
+        else
+            break;
+    }
+    if (f->ins[p].op == OP_SLOT)
+        return 0;
+    if (d)
+        while (a > 1 && d % a)
+            a >>= 1;
+    for (k = 0; a > 1 && k < 7; k++)
+        a >>= 1;
+    return k;
+}
+
 int opt_split(Func *f)
 {
     u32 b, v, k, n, nu = 0, capu = 0, nslots = f->nslots, j, p, done = 0;
@@ -1247,6 +1273,8 @@ int opt_split(Func *f)
                 }
                 ld = ir_raw(f, OP_LOAD, mem_ty(pm), sa, 0);
                 f->ins[ld].mem = (u8)pm;
+                if (!g1 && opt_dev_fn)
+                    f->ins[ld].flags = (u8)split_align(f, src, f->ins[at].mem, d);
                 ir_insert_before(f, at, ld);
                 if (g0) {
                     split_write(f, at, s0 - 1, use[j].off[0] + (i32)d, pm, ld);
@@ -1254,6 +1282,8 @@ int opt_split(Func *f)
                     da = split_addr(f, at, dst, d);
                     st = ir_raw(f, OP_STORE, IT_VOID, da, ld);
                     f->ins[st].mem = (u8)pm;
+                    if (opt_dev_fn)
+                        f->ins[st].flags = (u8)split_align(f, dst, f->ins[at].mem, d);
                     ir_insert_before(f, at, st);
                 }
             }

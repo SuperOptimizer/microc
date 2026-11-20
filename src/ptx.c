@@ -1850,6 +1850,7 @@ static const char *copy_base(u32 a, char *buf, i64 *off, const char **space)
     return buf;
 }
 
+extern int opt_novecmem;
 static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
 {
     const char *d, *s = 0, *t, *dsp, *ssp = "";
@@ -1882,6 +1883,20 @@ static void emit_copy(u32 dst, u32 src, u64 n, u32 al)
     while (off < n) {
         u32 w = n - off >= 8 && al >= 8 ? 8 : n - off >= 4 && al >= 4 ? 4 : n - off >= 2 && al >= 2 ? 2 : 1;
         const char *ty = w == 8 ? "u64" : w == 4 ? "u32" : w == 2 ? "u16" : "u8";
+        if (n - off >= 16 && al >= 16 && !opt_novecmem) {
+            /* 16 bytes of an object of 16-byte alignment (a float4, a uint4): one vector load and store, as nvcc's */
+            char t2[24];
+            t = temp(1);
+            strcpy(t2, t);
+            t = temp(1);
+            if (s)
+                P("\tld.%sv2.u64 {%s, %s}, [%s%+ld];\n", ssp, t2, t, s, (long)(soff + (i64)off));
+            else
+                P("\tmov.b64 %s, 0;\n\tmov.b64 %s, 0;\n", t2, t);
+            P("\tst.%sv2.u64 [%s%+ld], {%s, %s};\n", dsp, d, (long)(doff + (i64)off), t2, t);
+            off += 16;
+            continue;
+        }
         t = temp(w == 8 ? 1 : 0);
         if (s)
             P("\tld.%s%s %s, [%s%+ld];\n", ssp, ty, t, s, (long)(soff + (i64)off));
@@ -1977,6 +1992,9 @@ static int wide_mul(u32 v)
     }
     return 1;
 }
+
+static int vec_emit(u32 v);
+static u8 *vg_skip;
 
 static void emit_ins(u32 v)
 {
@@ -2147,6 +2165,10 @@ static void emit_ins(u32 v)
         return;
     case OP_LOAD: {
         static const char *const lt[] = {"s8", "u8", "s16", "u16", "u32", "u64", "f32", "f64"};
+        if (vg_skip && vg_skip[v])
+            return;
+        if (vec_emit(v))
+            return;
         if (special_load(v)) {
             P("\tmov.u32 %s, %s;\n", reg(v), special_load(v));
             return;
@@ -2179,6 +2201,10 @@ static void emit_ins(u32 v)
     }
     case OP_STORE: {
         static const char *const stt[] = {"u8", "u8", "u16", "u16", "u32", "u64", "f32", "f64"};
+        if (vg_skip && vg_skip[v])
+            return;
+        if (vec_emit(v))
+            return;
         if ((a = sh_maddr(i->a)) != 0) {
             b = ropnd(i->b);
             P("\tst.shared.%s [%s], %s;\n", stt[i->mem], a, b);
@@ -2702,29 +2728,83 @@ static const char *callee_name(u32 v)
     return intern_str(PO->syms[c->a].name);
 }
 
+static int opt_noh16 = -1; /* MCC_NOH16: the conversions stay */
+
+/* Is the 32-bit value v one whose bits above the low 16 are zero (a 16-bit float's bits as they are read or made)? */
+static int bits16(Func *f, u32 v)
+{
+    Ins *i = &f->ins[v];
+    const char *n;
+    u64 c;
+    if (i->ty != IT_I32)
+        return 0;
+    if (i->op == OP_LOAD)
+        return i->mem == M_16U || i->mem == M_8U;
+    if (i->op == OP_ZEXT16 || i->op == OP_ZEXT8)
+        return 1;
+    if (i->op == OP_CONST)
+        return (u32)i->a <= 0xffffU;
+    if (i->op == OP_AND)
+        return (ir_is_const(f, RV(i->b), &c) && (u32)c <= 0xffffU) || (ir_is_const(f, RV(i->a), &c) && (u32)c <= 0xffffU);
+    n = callee_name(v);
+    return n && (!strcmp(n, "__mcc_f2h") || !strcmp(n, "__mcc_f2bf"));
+}
+
 /* A float that was rounded to a 16-bit float and is then stored as one, or rounded again, is rounded once:
    the conversion for the store does it (the front end rounds where the type changes and converts where
-   the value is stored). */
+   the value is stored).
+   A 16-bit float that is only turned into a float and back (a __half read and stored or packed again: the front end
+   works on its float) is its bits as they were, and a float that was a 16-bit float is that rounded: ufsm's fstem_fwd_k
+   had 154 cvt.f32.f16 and 209 cvt.rn.f16.f32 to nvcc's 49 and 74 (which copies the bits). (A NaN's bits stay as they
+   were read, as with nvcc; through the floats they were quieted.) The conversion to a float reads the low 16 bits:
+   a mask or a zero extension of what it converts goes. */
 static void round_once(void)
 {
     Func *f = PF;
     u32 v;
-    int any = 0;
+    int any = 0, rep = 0;
+    if (opt_noh16 < 0)
+        opt_noh16 = getenv("MCC_NOH16") != 0;
     for (v = 1; v < f->nins; v++) {
         const char *n = callee_name(v), *m;
         u32 x;
-        if (!n || strncmp(n, "__mcc_f", 7))
+        if (!n || strncmp(n, "__mcc_", 6))
             continue;
         x = RV(f->xargs[f->ins[v].a]);
+        if (!strcmp(n, "__mcc_h2f") || !strcmp(n, "__mcc_bf2f")) {
+            Ins *xi = &f->ins[x];
+            u64 c;
+            if (xi->ty == IT_I32 && (xi->op == OP_ZEXT16 || (xi->op == OP_AND && ir_is_const(f, RV(xi->b), &c) && ((u32)c & 0xffffU) == 0xffffU))) {
+                f->xargs[f->ins[v].a] = RV(xi->a);
+                any = 1;
+            }
+            continue;
+        }
+        if (strncmp(n, "__mcc_f", 7))
+            continue;
         m = callee_name(x);
         if (!m)
             continue;
+        if (((!strcmp(n, "__mcc_f2h") && !strcmp(m, "__mcc_h2f")) || (!strcmp(n, "__mcc_f2bf") && !strcmp(m, "__mcc_bf2f"))) &&
+            !opt_noh16 && f->ins[v].ty == IT_I32 && bits16(f, RV(f->xargs[f->ins[x].a]))) {
+            ir_replace(f, v, RV(f->xargs[f->ins[x].a]));
+            any = rep = 1;
+            continue;
+        }
+        if (((!strcmp(n, "__mcc_fround16") && !strcmp(m, "__mcc_h2f")) || (!strcmp(n, "__mcc_froundbf") && !strcmp(m, "__mcc_bf2f"))) &&
+            !opt_noh16) {
+            ir_replace(f, v, x);
+            any = rep = 1;
+            continue;
+        }
         if (((!strcmp(n, "__mcc_f2bf") || !strcmp(n, "__mcc_froundbf")) && !strcmp(m, "__mcc_froundbf")) ||
             ((!strcmp(n, "__mcc_f2h") || !strcmp(n, "__mcc_fround16")) && !strcmp(m, "__mcc_fround16"))) {
             f->xargs[f->ins[v].a] = f->xargs[f->ins[x].a];
             any = 1;
         }
     }
+    if (rep)
+        ir_resolve_all(f);
     if (any)
         opt_dce(f);
 }
@@ -3686,7 +3766,7 @@ static int ld_leaves(Func *f, u32 v, const u8 *uses, int root, u32 *ld, u32 *sh,
     } else {
         sh[*n] = 0;
     }
-    if (i->op != OP_LOAD || (i->mem != M_8U && i->mem != M_16U) || uses[v] != 1 || (i->flags & ~IF_NC))
+    if (i->op != OP_LOAD || (i->mem != M_8U && i->mem != M_16U) || uses[v] != 1 || (i->flags & ~(IF_NC | IF_ALIGN)))
         return 0;
     ld[(*n)++] = v;
     return 1;
@@ -3869,6 +3949,187 @@ int ptx_single_trip(Func *f)
     rg_lo = rg_hi = 0;
     rg_st = 0;
     return done;
+}
+
+/* ---- vector loads and stores ----
+   A struct copy through a pointer is taken apart into its fields (opt_split): a uint4 / float4 copied from global memory was four
+   ld.global.u32, a __half2 two ld.global.u16 (and as many stores), where nvcc reads the whole object with one ld.v4.u32 / one 32-bit
+   load, since the type promises its alignment (ufsm's fstem_fwd_k: 32 LDG.E.U16 and 16 STG.E.U16 more than nvcc in its MMA loop).
+   Loads (stores) of one block, of one base address at consecutive places, n = 2 or 4 of them of one size, are one ld.v<n> (st.v<n>)
+   when the first one's address is known to be aligned to the whole (its IF_ALIGN, or what ld_tz finds) and nothing between them
+   writes memory (for stores: reads or writes it, or waits). The group's loads are made where its first one is; its stores where its
+   last one is. Global / generic and shared memory only. MCC_NOVEC: off. */
+int opt_novecmem = -1;
+static u32 *vg_mem;  /* per value: 1 + the index in vg_list of its group, for the value that emits it; 0 */
+static u8 *vg_skip;  /* per value: a member of a group that another one emits */
+static u32 *vg_list; /* groups: n, then the n members by ascending address */
+static u32 nvg_list, capvg_list;
+static u32 *vg_regs[4]; /* (while groups are found) per register class and number: how many values have it */
+
+/* 0 not to be grouped; 1 shared memory (sh_maddr); 2 the last path of OP_LOAD / OP_STORE (global or generic) */
+static int vec_space(u32 v)
+{
+    Ins *i = &PF->ins[v];
+    u32 a = RV(i->a);
+    if (i->op == OP_LOAD && special_load(v))
+        return 0;
+    if (sh_s && sh_base(a))
+        return 1;
+    {
+        i64 o;
+        Ins *bi = &PF->ins[ld_split(a, &o)];
+        if (bi->op == OP_SLOT || (bi->op == OP_ADDR && special_of(bi->a) >= 0))
+            return 0; /* (the frame: local_maddr's, which is known only while the code is written) */
+    }
+    if ((pm_s && pm_s[a]) || local_maddr(i->a) || (cn_s && cn_s[a]) || (lc_s && lc_s[a]))
+        return 0;
+    return 2;
+}
+
+static int vec_blocks(int op)
+{
+    return op == OP_STORE || op == OP_CALL || op == OP_MEMCPY || op == OP_MEMZERO || op == OP_ASMOUT || op == OP_XI ||
+           op == OP_VSTORE || op == OP_BYVAL;
+}
+
+static void vec_find(Func *f)
+{
+    u32 b, v;
+    if (opt_novecmem < 0)
+        opt_novecmem = getenv("MCC_NOVEC") != 0;
+    vg_mem = (u32 *)xmalloc(((size_t)f->nins + 1) * sizeof(u32));
+    vg_skip = (u8 *)xmalloc((size_t)f->nins + 1);
+    memset(vg_mem, 0, ((size_t)f->nins + 1) * sizeof(u32));
+    memset(vg_skip, 0, (size_t)f->nins + 1);
+    nvg_list = 0;
+    if (opt_novecmem)
+        return;
+    for (b = 0; b < 4; b++) {
+        vg_regs[b] = (u32 *)xmalloc(((size_t)nreg[b] + 2) * sizeof(u32));
+        memset(vg_regs[b], 0, ((size_t)nreg[b] + 2) * sizeof(u32));
+    }
+    for (v = 1; v < f->nins; v++)
+        if (regno[v] && f->ins[v].ty != IT_VOID && regno[v] <= nreg[cls_of(f->ins[v].ty)] + 1)
+            vg_regs[cls_of(f->ins[v].ty)][regno[v]]++;
+    for (b = 1; b < f->nblk; b++) {
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 m[4], base, x, n = 1, sz, k, want, tz, last, steps = 0;
+            i64 off, o2;
+            int sp, ld = i->op == OP_LOAD;
+            if ((i->op != OP_LOAD && i->op != OP_STORE) || vg_skip[v] || i->mem > M_F64)
+                continue;
+            sz = M_SIZE(i->mem);
+            base = ld_split(i->a, &off);
+            sp = vec_space(v);
+            if (!sp)
+                continue;
+            m[0] = v;
+            for (x = i->next; x && n < 4 && steps < 64; x = f->ins[x].next, steps++) {
+                Ins *xi = &f->ins[x];
+                if (xi->op == i->op && !vg_skip[x] && xi->mem <= M_F64 && M_SIZE(xi->mem) == sz &&
+                    (sz == 4 || sz == 8 || xi->mem == i->mem) && (xi->flags & IF_NC) == (i->flags & IF_NC) &&
+                    ld_split(xi->a, &o2) == base && o2 == off + (i64)(n * sz) && vec_space(x) == sp &&
+                    (!ld || !gl_s || gl_s[RV(xi->a)] == gl_s[RV(i->a)]) && (ld || !gl_s || !gl_s[RV(xi->a)] == !gl_s[RV(i->a)])) {
+                    m[n++] = x;
+                    continue;
+                }
+                if (vec_blocks(xi->op) || (!ld && xi->op == OP_LOAD))
+                    break;
+            }
+            if (n == 3)
+                n = 2;
+            /* the alignment: what the address sum shows, or what the type of the copied object promises */
+            tz = ld_tz(i->a, 0);
+            if ((i->flags & IF_ALIGN) > tz)
+                tz = i->flags & IF_ALIGN;
+            for (; n >= 2; n /= 2) {
+                want = n * sz;
+                if (want > 16)
+                    continue;
+                for (k = 0; (1u << k) < want; k++)
+                    ;
+                if (tz >= k)
+                    break;
+            }
+            if (n < 2)
+                continue;
+            /* each member's value (a load's result, a store's operand) must have a register of its own: its life now starts
+               earlier (loads) or ends later (stores), and coalesce lets a loop's phi share one with the value it takes back */
+            for (k = 0; k < n; k++) {
+                u32 w = ld ? m[k] : RV(f->ins[m[k]].b);
+                if (f->ins[w].op != OP_CONST && f->ins[w].op != OP_FCONST && regno[w] && vg_regs[cls_of(f->ins[w].ty)][regno[w]] != 1)
+                    break;
+            }
+            if (k < n)
+                continue;
+            /* a store's values must have registers: the group is emitted at its last store, by then all are known */
+            last = m[n - 1];
+            if (nvg_list + 5 > capvg_list) {
+                capvg_list = capvg_list ? capvg_list * 2 : 256;
+                vg_list = (u32 *)xrealloc(vg_list, capvg_list * sizeof(u32));
+            }
+            vg_list[nvg_list] = n;
+            for (k = 0; k < n; k++) {
+                vg_list[nvg_list + 1 + k] = m[k];
+                vg_skip[m[k]] = 1;
+            }
+            vg_mem[ld ? v : last] = nvg_list + 1;
+            vg_skip[ld ? v : last] = 0;
+            nvg_list += 1 + n;
+        }
+    }
+    for (b = 0; b < 4; b++) {
+        free(vg_regs[b]);
+        vg_regs[b] = 0;
+    }
+}
+
+/* the group that value v emits: its vector instruction; 0 if v emits none */
+static int vec_emit(u32 v)
+{
+    static const char *const lt[] = {"s8", "u8", "s16", "u16", "b32", "b64", "b32", "b64"};
+    Ins *i = &PF->ins[v];
+    u32 g, n, k, first;
+    const char *a, *sp;
+    char ops[160];
+    size_t o = 0;
+    if (!vg_mem || !vg_mem[v])
+        return 0;
+    g = vg_mem[v] - 1;
+    n = vg_list[g];
+    first = vg_list[g + 1];
+    for (k = 0; k < n; k++) {
+        u32 x = vg_list[g + 1 + k];
+        const char *r;
+        if (i->op == OP_LOAD) {
+            r = reg(x);
+        } else {
+            u32 val = PF->ins[x].b;
+            r = ropnd(val);
+            if (r[0] != '%') { /* (a vector's elements are registers) */
+                const char *t = temp(cls_of(PF->ins[RV(val)].ty));
+                P("\tmov.%s %s, %s;\n", PF->ins[RV(val)].ty == IT_F32 ? "f32" : PF->ins[RV(val)].ty == IT_F64 ? "f64" :
+                                         PF->ins[RV(val)].ty == IT_I64 ? "b64" : "b32", t, r);
+                r = t;
+            }
+        }
+        o += (size_t)sprintf(ops + o, "%s%.30s", k ? ", " : "", r);
+    }
+    if ((a = sh_maddr(PF->ins[first].a)) != 0) {
+        sp = "shared.";
+    } else {
+        a = maddr(PF->ins[first].a);
+        if (i->op == OP_LOAD)
+            sp = (i->flags & IF_NC) && !opt_nonc ? "global.nc." : gl_s && gl_s[RV(i->a)] ? gl_s[RV(i->a)] == 2 ? "global.nc." : "global." : "";
+        else
+            sp = gl_s && gl_s[RV(PF->ins[first].a)] ? "global." : "";
+    }
+    if (i->op == OP_LOAD)
+        P("\tld.%sv%u.%s {%s}, [%s];\n", sp, n, lt[i->mem], ops, a);
+    else
+        P("\tst.%sv%u.%s [%s], {%s};\n", sp, n, lt[i->mem], a, ops);
+    return 1;
 }
 
 void ptx_gen(Func *f, Obj *o, int entry)
@@ -4096,6 +4357,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     }
     coalesce(live);
     coalesce_asm(live);
+    vec_find(f);
 
     /* the frame */
     for (k = 0; k < f->nslots; k++)
@@ -4270,6 +4532,10 @@ void ptx_gen(Func *f, Obj *o, int entry)
         sh_s = 0;
     }
     free(gl_s);
+    free(vg_mem);
+    free(vg_skip);
+    vg_mem = 0;
+    vg_skip = 0;
     free(xrem);
     xrem = 0;
     free(xc_seg);

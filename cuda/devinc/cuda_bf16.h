@@ -3,7 +3,7 @@
 #define MCUDA_BF16_H
 typedef __bf16 __nv_bfloat16;
 typedef __nv_bfloat16 nv_bfloat16;
-struct __nv_bfloat162 {
+struct __attribute__((aligned(4))) __nv_bfloat162 {
     __nv_bfloat16 x, y;
     __nv_bfloat162() {}
     __nv_bfloat162(__nv_bfloat16 a, __nv_bfloat16 b) : x(a), y(b) {}

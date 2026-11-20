@@ -3773,6 +3773,8 @@ static void unswitch(Func *fn)
             ir_dump(f);
         f->copies = 1;
         ir_resolve_all(f);
+        compute_dom(); /* (simplify_cfg's forward_phi_blocks reads it: the copy's blocks have none yet, stale ones of
+                          earlier block numbers made a copied header seem not to dominate its loop, and its phis went) */
         simplify_cfg();
         ir_resolve_all(f);
         opt_dce(f);
@@ -3788,6 +3790,7 @@ static void unswitch(Func *fn)
     }
     gvn();
     ir_resolve_all(f);
+    compute_dom();
     if (simplify_cfg()) {
         ir_resolve_all(f);
         gvn();

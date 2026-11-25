@@ -1463,8 +1463,12 @@ static int forward_phi_blocks(void)
    each predecessor of block B knows which way B's branch goes, so it goes there directly, and B (phis, a few pure
    instructions, the branch) disappears. Values B defines are used only in B, or (its phis) where its successors
    dominate, which get them through a new phi of the predecessors that now come to them (or the one value when one
-   does), or as the arguments of the successors' own phis on B's edge. Not for a loop's head. MCC_NOJT: off. */
+   does), or as the arguments of the successors' own phis on B's edge. Not for a loop's head. MCC_NOJT: off.
+   Device code too (and the host code of .cu units): ufsm's volcomp GPU decoder (k_entropy: a bit reader's
+   gbr_get(...) inlined some 8 times per token) kept each call's success as a 0 / 1 value, a convergence region and
+   a test of it; threaded, sm_86: 88.0 -> 61.1 ms over 64 real chunks (nvcc 68.6), the same bytes. MCC_NOJTDEV: host only. */
 static int opt_nojt = -1;
+static int opt_nojtdev = -1;
 
 static int jt_eval(int op, int ty, u64 a, u64 b, u64 *r)
 {
@@ -1672,7 +1676,9 @@ static int jump_thread(void)
         opt_nojt = getenv("MCC_NOJT") != 0;
     if (opt_nojtr < 0)
         opt_nojtr = getenv("MCC_NOJTR") != 0;
-    if (opt_nojt || opt_dev_fn || opt_cuda)
+    if (opt_nojtdev < 0)
+        opt_nojtdev = getenv("MCC_NOJTDEV") != 0;
+    if (opt_nojt || ((opt_dev_fn || opt_cuda) && opt_nojtdev))
         return 0;
     compute_dom();
     for (B = 2; B < f->nblk; B++) {

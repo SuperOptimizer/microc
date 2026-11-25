@@ -1206,6 +1206,10 @@ static void expand(const char *t, char mark, const char *dst, const char **ops, 
    operations through them say so: one for memory of any kind finds out which kind as the program runs.
    MCC_NOGLOBAL turns this off. */
 static u8 *gl_s; /* the value is such an address */
+/* An address read from global memory is one of global memory too (a kernel's table of descriptors, each with its
+   buffers' addresses: ufsm's muon_desc_t / anvil_desc_t): ld.global / st.global, as nvcc's front end assumes (its
+   PTX: cvta.to.global of the loaded value). Plain global, never .nc. MCC_NOGLLOAD: generic as before. */
+static int opt_nogll = -1;
 
 /* The addresses that are of the function's own stack whichever way they are reached: a local object's, and
    what is computed from one. Read and written as local memory (ld.local, st.local), as nvcc does. */
@@ -1512,6 +1516,8 @@ static void gl_find(Func *f)
     /* first what is computed from a pointer parameter at all (the least such set: a number that is counted
        up from 0 is not in it), then, among those, what is so computed whichever way it is reached;
        2: also only read, through a "const T *__restrict__" parameter of the kernel (ld.global.nc, as nvcc) */
+    if (opt_nogll < 0)
+        opt_nogll = getenv("MCC_NOGLLOAD") != 0;
     memset(gl_s, 0, f->nins + 1);
     do {
         changed = 0;
@@ -1528,6 +1534,8 @@ static void gl_find(Func *f)
                 is = gl_s[RV(i->a)];
             else if (i->op == OP_SELECT)
                 is = gl_s[RV(i->b)] || gl_s[RV(i->c)];
+            else if (i->op == OP_LOAD)
+                is = !opt_nogll && gl_s[RV(i->a)] != 0;
             else if (i->op == OP_PHI)
                 for (k = 0; k < i->b; k++)
                     is |= gl_s[RV(f->xargs[i->a + k])];
@@ -1539,13 +1547,13 @@ static void gl_find(Func *f)
     } while (changed);
     for (v = 1; v < f->nins; v++)
         if (gl_s[v])
-            gl_s[v] = f->ins[v].op != OP_PARAM ? 2 : f->ins[v].mem == PARAM_GLOBAL_NC && !opt_nonc ? 2 : 1;
+            gl_s[v] = f->ins[v].op == OP_LOAD ? 1 : f->ins[v].op != OP_PARAM ? 2 : f->ins[v].mem == PARAM_GLOBAL_NC && !opt_nonc ? 2 : 1;
     do {
         changed = 0;
         for (v = 1; v < f->nins; v++) {
             Ins *i = &f->ins[v];
             u8 to;
-            if (!gl_s[v] || i->op == OP_PARAM)
+            if (!gl_s[v] || i->op == OP_PARAM || i->op == OP_LOAD)
                 continue;
             if (i->op == OP_ADD) {
                 u8 x = gl_s[RV(i->a)], y = gl_s[RV(i->b)];

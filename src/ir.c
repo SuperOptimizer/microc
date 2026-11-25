@@ -694,6 +694,126 @@ static u64 umax_of(Func *f, u32 v, int depth)
     }
 }
 
+/* Device code: the few constants an I32 value can be, when it is made of them (a select or phi of constants and
+   arithmetic with a constant: ufsm's mx_bw(C), C <= 8 ? 8 : C <= 16 ? 16 : 32, and bw / 4). A comparison of such a
+   value with a constant is decided when every member compares the same way, and otherwise put in the form
+   "x >= t" / "x < t" with t a member, so that tests which are the same for these values become the same
+   value (bwd_data_s2_mx2_k: j < q4 for j = 0 .. 7 with q4 in {2, 4, 8} is true, true, q4 >= 4 twice and
+   q4 >= 8 four times; nvcc's code tests twice where ours tested eight times, and ptxas then copied our
+   chain). Returns the number of members in s (sign-extended, at most CSET_N), or 0 if not known. MCC_NOCSET: off. */
+#define CSET_N 8
+static int opt_nocset = -1;
+
+static int cset_add(u64 *s, int n, u64 x)
+{
+    int k;
+    for (k = 0; k < n; k++)
+        if (s[k] == x)
+            return n;
+    if (n == CSET_N)
+        return -1;
+    s[n] = x;
+    return n + 1;
+}
+
+static int cset_of(Func *f, u32 v, u64 *s, int depth)
+{
+    Ins *i;
+    u64 c, t[CSET_N], r;
+    int n = 0, m, k, q;
+    v = ir_resolve(f, v);
+    i = &f->ins[v];
+    if (i->ty != IT_I32)
+        return 0;
+    if (ir_is_const(f, v, &c)) {
+        s[0] = (u64)(i64)(i32)(u32)c;
+        return 1;
+    }
+    if (!depth)
+        return 0;
+    switch (i->op) {
+    case OP_SELECT:
+        if (!(m = cset_of(f, i->b, s, depth - 1)) || !(q = cset_of(f, i->c, t, depth - 1)))
+            return 0;
+        for (n = m, k = 0; k < q && n > 0; k++)
+            n = cset_add(s, n, t[k]);
+        return n > 0 ? n : 0;
+    case OP_PHI:
+        if (i->b > CSET_N)
+            return 0;
+        for (k = 0; k < (int)i->b; k++) {
+            u32 x = ir_resolve(f, f->xargs[i->a + k]);
+            int j;
+            if (x == v)
+                continue;
+            if (!(m = cset_of(f, x, t, depth - 1)))
+                return 0;
+            for (j = 0; j < m && n >= 0; j++)
+                n = cset_add(s, n, t[j]);
+            if (n < 0)
+                return 0;
+        }
+        return n;
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_SDIV: case OP_UDIV: case OP_SREM: case OP_UREM:
+    case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR: case OP_SAR:
+    {
+        /* (every pair: a sound superset when both operands come from one value, as bw + ((bw >> 31) >> 30) of bw / 4) */
+        u64 tb[CSET_N];
+        int mb, j;
+        if (!(m = cset_of(f, i->a, t, depth - 1)) || !(mb = cset_of(f, i->b, tb, depth - 1)) || m * mb > 4 * CSET_N)
+            return 0;
+        for (k = 0; k < m; k++)
+            for (j = 0; j < mb; j++) {
+                if (!fold_int(i->op, 0, t[k], tb[j], &r) || (n = cset_add(s, n, (u64)(i64)(i32)(u32)r)) < 0)
+                    return 0;
+            }
+        return n;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* the comparison op of a (I32, members s[0 .. n)) with the constant y: its value, or the form x >= t / x < t */
+static u32 cset_cmp(Func *f, int op, u32 a, u64 y)
+{
+    u64 s[CSET_N], r, tmin = 0, fmin = 0;
+    int n, k, nt = 0, nf = 0, upper = 1, lower = 1;
+    if (opt_nocset < 0)
+        opt_nocset = getenv("MCC_NOCSET") != 0;
+    if (opt_nocset || f->ins[a].ty != IT_I32 || !(n = cset_of(f, a, s, 6)) || n < 2)
+        return 0;
+    for (k = 0; k < n; k++) {
+        if (!fold_int(op, 0, s[k], y, &r))
+            return 0;
+        if (r) {
+            if (!nt++ || (i64)s[k] < (i64)tmin)
+                tmin = s[k];
+        } else if (!nf++ || (i64)s[k] < (i64)fmin)
+            fmin = s[k];
+    }
+    if (!nf)
+        return ir_const(f, IT_I32, 1);
+    if (!nt)
+        return ir_const(f, IT_I32, 0);
+    if (op == OP_EQ || op == OP_NE)
+        return 0;
+    for (k = 0; k < n; k++) {
+        if ((s[k] >> 31) != 0)
+            return 0; /* (members not negative: the signed and the unsigned order agree) */
+        fold_int(op, 0, s[k], y, &r);
+        if (r != ((i64)s[k] >= (i64)tmin))
+            upper = 0;
+        if (r != ((i64)s[k] < (i64)fmin))
+            lower = 0;
+    }
+    if (upper)
+        return op == OP_SGE && y == tmin ? 0 : ir_ins(f, OP_SGE, IT_I32, a, ir_const(f, IT_I32, tmin));
+    if (lower)
+        return op == OP_SLT && y == fmin ? 0 : ir_ins(f, OP_SLT, IT_I32, a, ir_const(f, IT_I32, fmin));
+    return 0;
+}
+
 u64 ir_umax32(Func *f, u32 v)
 {
     return umax_of(f, v, 4);
@@ -994,6 +1114,11 @@ static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
             case OP_UGE: sw = OP_ULE; break;
             }
             return ir_ins(f, sw, ty, b, a);
+        }
+        if (cb && !w64 && opt_dev_fn && is_cmp(op)) {
+            u32 q = cset_cmp(f, op, a, y);
+            if (q)
+                return q;
         }
         if (cb && y == 0) {
             /* unsigned comparisons with zero */
@@ -1390,6 +1515,15 @@ void ir_phi_add_arg(Func *f, u32 phi, u32 val)
     f->xargs[at + n] = val;
     f->ins[phi].a = at;
     f->ins[phi].b = n + 1;
+}
+
+void ir_phi_set_args(Func *f, u32 phi, const u32 *vals, u32 n)
+{
+    u32 at = xalloc(f, n ? n : 1);
+    if (n)
+        memcpy(&f->xargs[at], vals, n * sizeof(u32));
+    f->ins[phi].a = at;
+    f->ins[phi].b = n;
 }
 
 /* ---- blocks ---- */

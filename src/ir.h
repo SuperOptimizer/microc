@@ -230,6 +230,7 @@ u32 ir_resolve(Func *f, u32 v);       /* follow OP_COPY chains */
 u32 ir_fold_at(Func *f, u32 v);       /* simplify placed instruction v; returns its replacement or 0 */
 void ir_resolve_all(Func *f);         /* rewrite every operand through OP_COPY */
 void ir_phi_add_arg(Func *f, u32 phi, u32 val);
+void ir_phi_set_args(Func *f, u32 phi, const u32 *vals, u32 n); /* the phi's arguments, all at once (one allocation) */
 void ir_replace(Func *f, u32 v, u32 with);
 
 extern u8 ir_opcount_tab[];

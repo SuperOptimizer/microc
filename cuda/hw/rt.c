@@ -74,8 +74,16 @@ static unsigned int dev_flags;
 
 cudaError_t cudaSetDeviceFlags(unsigned int flags)
 {
+    int r;
     if (flags & ~(unsigned)cudaDeviceMask)
         return ret(cudaErrorInvalidValue);
+    /* the flags go to the device's primary context (the runtime's values are the driver's CU_CTX_* ones): without this,
+       cudaDeviceScheduleBlockingSync was a no-op and every synchronising thread spun in the driver, a core each (ufsm) */
+    if (!hw_ctx_of(hw_cur()))
+        return ret(cudaErrorInvalidDevice);
+    r = hw.PrimaryCtxSetFlags(hw_dev, flags & 0x1fu);
+    if (r)
+        return ret((cudaError_t)r);
     dev_flags = flags;
     return cudaSuccess;
 }

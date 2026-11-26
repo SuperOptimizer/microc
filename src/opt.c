@@ -2007,7 +2007,7 @@ static int jump_thread(void)
    to the end. MCC_NOJTP: off. */
 static int opt_nojtp = -1;
 #define JTP_MAXPHI 192 /* (an unrolled step carries 32 sums and 32 loaded values, and what the guards before it merged) */
-#define JTP_MAXH 16
+#define JTP_MAXH 64 /* (fwd_epilogue's join: some 40 index values ahead of the flag test) */
 
 static int jtp_use_ok(u32 x, u32 B, u32 Sd, u32 So, int body)
 {
@@ -2043,6 +2043,28 @@ static int jtp_use_ok(u32 x, u32 B, u32 Sd, u32 So, int body)
     return 1;
 }
 
+/* c, B's condition, on the way in from predecessor k: decided when it is a phi of B, or a comparison of phis of B
+   and constants, whose arguments on that way are constants (a flag set on some ways: fwd_epilogue's mx_done, set by
+   the epilogue variant that ran and tested by the next, behind the index arithmetic the passes put in the join) */
+static int jtp_phi_decides(u32 c, u32 B, u32 k, u64 *cv)
+{
+    Ins *i = &f->ins[c];
+    u64 a[2];
+    u32 q;
+    if (i->op == OP_PHI && i->blk == B)
+        return ir_is_const(f, ir_resolve(f, f->xargs[i->a + k]), cv);
+    if (i->op < OP_EQ || i->op > OP_UGE)
+        return 0;
+    for (q = 0; q < 2; q++) {
+        u32 o = ir_resolve(f, q ? i->b : i->a);
+        if (f->ins[o].op == OP_PHI && f->ins[o].blk == B)
+            o = ir_resolve(f, f->xargs[f->ins[o].a + k]);
+        if (!ir_is_const(f, o, &a[q]))
+            return 0;
+    }
+    return jt_eval(i->op, f->ins[ir_resolve(f, i->a)].ty, a[0], a[1], cv);
+}
+
 static int jt_partial(void)
 {
     u32 B, v, k, q;
@@ -2061,8 +2083,6 @@ static int jt_partial(void)
             bb->succ[0] == bb->succ[1] || bb->succ[0] == B || bb->succ[1] == B || bb->succ[0] == 1 || bb->succ[1] == 1)
             continue;
         c = ir_resolve(f, bb->arg);
-        if (f->ins[c].op == OP_PHI && f->ins[c].blk == B)
-            continue;
         /* (not a loop's head: a way round it into the loop's body would make a loop with two ways in) */
         for (k = 0; k < bb->npreds; k++)
             if (rpo_num[bb->preds[k]] != 0xffffffffU && dominates(B, bb->preds[k]))
@@ -2081,7 +2101,7 @@ static int jt_partial(void)
                     break;
             if (q < bb->npreds)
                 continue;
-            if (!jt_implied(c, pp, B, 0, &cv))
+            if (!jtp_phi_decides(c, B, k, &cv) && !jt_implied(c, pp, B, 0, &cv))
                 continue;
             p = pp;
             pk = k;

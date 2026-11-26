@@ -2986,8 +2986,9 @@ static void xrem_mark(Func *f, u32 x, u32 b, int depth)
     Ins *xi;
     x = RV(x);
     xi = &f->ins[x];
-    if (!x || !xi->blk || depth > 8)
-        return;
+    if (!x || !xi->blk || depth > 8 || xi->op == OP_PHI)
+        return; /* (a phi's a is where its arguments are, not a value: read as one it was past the end of the
+                   instructions once jump threading had made phis with many arguments) */
     if (is_compare(xi->op) || ptree[x]) { /* (a tree of truth values is worked out where a branch or a choice reads it) */
         xrem_mark(f, xi->a, b, depth + 1);
         xrem_mark(f, xi->b, b, depth + 1);
@@ -3635,8 +3636,8 @@ static void range_fold(Func *f)
         for (v = 1; v < n; v++) {
             Ins *i = &f->ins[v];
             u32 a, b;
-            if (!i->blk || i->ty != IT_I32 || zero[v])
-                continue;
+            if (!i->blk || i->ty != IT_I32 || zero[v] || i->op == OP_PHI)
+                continue; /* (a phi's a, b are where its arguments are and how many) */
             a = RV(i->a);
             b = RV(i->b);
             if ((i->op == OP_SHR || i->op == OP_SAR || i->op == OP_SHL || i->op == OP_AND) && a < n && zero[a])

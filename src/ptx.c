@@ -2830,7 +2830,10 @@ static int moves_early(const u8 *live, u32 b, u32 s, u32 t)
     u32 k, v, n, *p, pi = 0, nb = f->nblk, *stack, sp = 0, w, x;
     u8 *hit, *reach;
     int ok = 1, more;
-    if (s > b || t == s || !sb->phis)
+    /* (a way back: s dominates b. Block numbers do not tell: a loop's exit block made before the unrolled copies is
+       numbered below them, and an early break out of `#pragma unroll` then made its 32 moves on the way on as well,
+       every copy: conv1_bwd_fused_k's co loop, 512 moves a voxel step. MCC_LATCHNUM=1: the old number test) */
+    if (t == s || !sb->phis || (getenv("MCC_LATCHNUM") ? s > b : !opt_dominates(s, b)))
         return 0;
     for (k = 0; k < sb->npreds; k++)
         if (sb->preds[k] == b)
@@ -4367,6 +4370,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     coalesce(live);
     coalesce_asm(live);
     vec_find(f);
+    opt_dom(f); /* (moves_early asks which edges are ways back) */
 
     /* the frame */
     for (k = 0; k < f->nslots; k++)

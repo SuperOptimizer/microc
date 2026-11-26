@@ -1463,8 +1463,12 @@ static int forward_phi_blocks(void)
    each predecessor of block B knows which way B's branch goes, so it goes there directly, and B (phis, a few pure
    instructions, the branch) disappears. Values B defines are used only in B, or (its phis) where its successors
    dominate, which get them through a new phi of the predecessors that now come to them (or the one value when one
-   does), or as the arguments of the successors' own phis on B's edge. Not for a loop's head. MCC_NOJT: off. */
+   does), or as the arguments of the successors' own phis on B's edge. Not for a loop's head. MCC_NOJT: off.
+   Device code too (and the host code of .cu units): ufsm's volcomp GPU decoder (k_entropy: a bit reader's
+   gbr_get(...) inlined some 8 times per token) kept each call's success as a 0 / 1 value, a convergence region and
+   a test of it; threaded, sm_86: 88.0 -> 61.1 ms over 64 real chunks (nvcc 68.6), the same bytes. MCC_NOJTDEV: host only. */
 static int opt_nojt = -1;
+static int opt_nojtdev = -1;
 
 static int jt_eval(int op, int ty, u64 a, u64 b, u64 *r)
 {
@@ -1672,7 +1676,9 @@ static int jump_thread(void)
         opt_nojt = getenv("MCC_NOJT") != 0;
     if (opt_nojtr < 0)
         opt_nojtr = getenv("MCC_NOJTR") != 0;
-    if (opt_nojt || opt_dev_fn || opt_cuda)
+    if (opt_nojtdev < 0)
+        opt_nojtdev = getenv("MCC_NOJTDEV") != 0;
+    if (opt_nojt || ((opt_dev_fn || opt_cuda) && opt_nojtdev))
         return 0;
     compute_dom();
     for (B = 2; B < f->nblk; B++) {
@@ -2907,6 +2913,18 @@ static int opt_licmcalls = -1;
 #define LICM_STORES 48 /* the stores of a loop that are remembered (16 without roots) */
 #define LICM_WHOLE 0xff /* store_mem: a write of unknown length */
 
+/* Device code: loops are hoisted from (without MCC_LICM) when what they carry round is no more than opt_licm_phi values
+   (the phis of the loop's head): a loop of many accumulators (conv_fwd_f4v_k's 224 MMAs) has no registers to spare for
+   values worked out before it, and spills with them, where a loop of few (conv_fwd_s2_f8_k: 32) recomputed each trip
+   its addresses' 64-bit parts, divisions by constants and lane numbers (664 SASS instructions in its MMA loop against
+   nvcc's 218; hoisted, 270). MCC_LICMPHI=N; 0 (the default): no device loop hoisted from. Off because the GPU did not follow the
+   counts: on an RTX 4060, at 16, conv_fwd_s2_f8_k ran as fast as without and bwd_data_s2_f4_k<4,8> 31 % slower. */
+#ifndef LICM_PHI_DEFAULT
+#define LICM_PHI_DEFAULT 0
+#endif
+int opt_licm_phi = -1;
+int opt_licm_cost = -1; /* MCC_LICMCOST=0: every pure value of a device loop may go (see licm) */
+
 static int licm(void)
 {
     u32 *mark, *stack, k, j, p, v, nx, sp, nblk0 = f->nblk;
@@ -2932,6 +2950,13 @@ static int licm(void)
         int clobbers_all = 0, replaced = 0, has_call = 0;
         Block *hb = &f->blk[h];
 
+        if (opt_dev_fn && !opt_dolicm) {
+            int nph = 0;
+            for (v = hb->phis; v && nph <= opt_licm_phi; v = f->ins[v].next)
+                nph++;
+            if (nph > opt_licm_phi)
+                continue;
+        }
         sp = 0;
         for (p = 0; p < hb->npreds; p++) {
             u32 q = hb->preds[p];
@@ -3141,6 +3166,14 @@ static int licm(void)
                             ok = 0;
                         else if (!f->ins[i->a].blk && (ir_opcount(f, v) < 2 || !f->ins[i->b].blk))
                             ok = 0;
+                    }
+                    if (ok && opt_dev_fn && !opt_dolicm && opt_licm_cost) {
+                        /* device code (not MCC_LICM): only what costs more than an instruction where it is, a 64-bit
+                           value (two registers, and its arithmetic two or more instructions: an address's sign extension
+                           and product) or a division: a 32-bit sum of lane numbers costs as much in the loop as the
+                           register it would hold through it (conv_bwd_w_f4_k at its cap of 96 registers spilled) */
+                        int op = i->op;
+                        ok = i->ty == IT_I64 || op == OP_SDIV || op == OP_UDIV || op == OP_SREM || op == OP_UREM;
                     }
                 } else if (i->op == OP_CALL && (i->flags & IF_PURE) && !opt_nopurelicm && always) {
                     /* a math function of loop-invariant arguments in a block every trip runs (so it is not
@@ -3773,6 +3806,8 @@ static void unswitch(Func *fn)
             ir_dump(f);
         f->copies = 1;
         ir_resolve_all(f);
+        compute_dom(); /* (simplify_cfg's forward_phi_blocks reads it: the copy's blocks have none yet, stale ones of
+                          earlier block numbers made a copied header seem not to dominate its loop, and its phis went) */
         simplify_cfg();
         ir_resolve_all(f);
         opt_dce(f);
@@ -3788,6 +3823,7 @@ static void unswitch(Func *fn)
     }
     gvn();
     ir_resolve_all(f);
+    compute_dom();
     if (simplify_cfg()) {
         ir_resolve_all(f);
         gvn();
@@ -4323,6 +4359,90 @@ static void addr_shape(Func *fn)
     }
 }
 
+/* Device code: a load at a known place of a read-only object of this unit is the constant stored there. A table such as
+       __device__ static const float FLW[4][3] = {{0.375f, 0.625f, 0.f}, ...};   ... FLW[RZ0 + dz][k] ...
+   read with indices the unroller and the template arguments made constant was read through mcudahw's table of device
+   globals and a generic load each time (ufsm's fstem_fwd_k: 78 LD.E and 32 more table reads in its MMA loop; nvcc folds them).
+   The object's bytes are those of the unit's read-only section, with no relocation in the bytes read (an address stays a
+   load). MCC_NOCLOAD: off. */
+static int const_loads(void)
+{
+    static int off = -1;
+    u32 b, v, nx, n = 0;
+    if (off < 0)
+        off = getenv("MCC_NOCLOAD") != 0;
+    if (off || !opt_dev_fn || !opt_obj)
+        return 0;
+    for (b = 1; b < f->nblk; b++) {
+        for (v = f->blk[b].first; v; v = nx) {
+            Ins *i = &f->ins[v];
+            u32 a, sz, k, sym;
+            i64 at = 0;
+            u64 c, bits = 0, base;
+            ObjSym *os;
+            const u8 *p;
+            nx = i->next;
+            if (i->op != OP_LOAD || i->mem > M_F64)
+                continue;
+            a = ir_resolve(f, i->a);
+            for (k = 0; k < 8; k++) { /* (address + constant) chains */
+                Ins *ai = &f->ins[a];
+                if (ai->op != OP_ADD || ai->ty != IT_I64)
+                    break;
+                if (ir_is_const(f, ir_resolve(f, ai->b), &c))
+                    a = ir_resolve(f, ai->a);
+                else if (ir_is_const(f, ir_resolve(f, ai->a), &c))
+                    a = ir_resolve(f, ai->b);
+                else
+                    break;
+                at += (i64)c;
+            }
+            if (f->ins[a].op != OP_ADDR)
+                continue;
+            sym = f->ins[a].a;
+            at += (i64)(i32)f->ins[a].b;
+            if (sym >= opt_obj->nsyms)
+                continue;
+            os = &opt_obj->syms[sym];
+            sz = M_SIZE(i->mem);
+            if (os->sec != SEC_CONST || os->kind == 1 || !os->size || at < 0 || (u64)at + sz > os->size)
+                continue;
+            base = os->value + (u64)at;
+            if (base + sz > opt_obj->sec[SEC_CONST].len)
+                continue;
+            for (k = 0; k < opt_obj->nrel[SEC_CONST]; k++) {
+                const ObjReloc *r = &opt_obj->rel[SEC_CONST][k];
+                if (r->off + 8 > base && r->off < base + sz)
+                    break;
+            }
+            if (k < opt_obj->nrel[SEC_CONST])
+                continue;
+            p = opt_obj->sec[SEC_CONST].p + base;
+            for (k = 0; k < sz; k++)
+                bits |= (u64)p[k] << (8 * k);
+            switch (i->mem) {
+            case M_8S: bits = (u64)(i64)(i8)bits; break;
+            case M_16S: bits = (u64)(i64)(i16)bits; break;
+            case M_32: if (i->ty == IT_I64) bits = (u64)(i64)(i32)bits; break;
+            default: break;
+            }
+            if (i->ty == IT_F32 || i->ty == IT_F64) {
+                if ((i->ty == IT_F32) != (i->mem == M_F32) || (i->ty == IT_F64) != (i->mem == M_F64))
+                    continue;
+                ir_replace(f, v, ir_fconst_bits(f, i->ty, bits));
+            } else if (i->ty == IT_I32 || i->ty == IT_I64) {
+                if (i->mem == M_F32 || i->mem == M_F64)
+                    continue;
+                ir_replace(f, v, ir_const(f, i->ty, i->ty == IT_I32 ? (u64)(u32)bits : bits));
+            } else {
+                continue;
+            }
+            n++;
+        }
+    }
+    return n != 0;
+}
+
 static void run_passes(Func *fn)
 {
     int round;
@@ -4347,6 +4467,8 @@ static void run_passes(Func *fn)
         ir_resolve_all(f);
     }
     f = fn;
+    if (const_loads())
+        ir_resolve_all(f);
     gvn();
     if (opt_cuda || (opt_arch == ARCH_X64 && opt_level >= 1 && !opt_nosplit)) {
         /* arrays handed to functions that are now part of this one (x86-64: a decoder's state record whose
@@ -4376,6 +4498,11 @@ static void run_passes(Func *fn)
                 break;
         }
     }
+    if (const_loads()) {
+        ir_resolve_all(f);
+        gvn();
+        ir_resolve_all(f);
+    }
     if (opt_dev_fn && ptx_single_trip(f))
         ir_resolve_all(f);
     if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2)
@@ -4397,7 +4524,11 @@ static void run_passes(Func *fn)
         gvn();
         ir_resolve_all(f);
     }
-    if (!(opt_dev_fn && !opt_dolicm) && !(opt_cuda && opt_nolicm) && licm())
+    if (opt_licm_cost < 0)
+        opt_licm_cost = getenv("MCC_LICMCOST") ? atoi(getenv("MCC_LICMCOST")) : 1;
+    if (opt_licm_phi < 0)
+        opt_licm_phi = getenv("MCC_LICMPHI") ? atoi(getenv("MCC_LICMPHI")) : LICM_PHI_DEFAULT;
+    if (!(opt_dev_fn && !opt_dolicm && !opt_licm_phi) && !(opt_cuda && opt_nolicm) && licm())
         ir_resolve_all(f);
     /* x86-64: the tests of an || / && chain that the loop does not change, now outside it, grouped, so the group
        leaves the loop too */

@@ -3,7 +3,7 @@
 #define MCUDA_FP16_H
 typedef _Float16 __half;
 typedef __half half;
-struct __half2 {
+struct __attribute__((aligned(4))) __half2 {
     __half x, y;
     __half2() {}
     __half2(__half a, __half b) : x(a), y(b) {}

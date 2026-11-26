@@ -20,6 +20,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/file.h>
 
 typedef unsigned long long u64;
 
@@ -574,6 +577,36 @@ static void cache_write(const char *path, const void *p, size_t n)
         rename(tmp, path);
     else
         remove(tmp);
+}
+
+/* One process at a time compiles a given text: a parallel cold test suite started the same 20-90 s kernels in every test
+   process at once. The first takes PATH.lock, the others wait on it and then find the code in the cache. (The lock file
+   goes once the code is there: who comes later reads the cache first; who waited on the old file looks again after it.)
+   -1: no lock (no file system lock here), which compiles as before. */
+static int cache_lock(const char *path)
+{
+    char lk[1200];
+    int fd;
+    sprintf(lk, "%s.lock", path);
+    fd = open(lk, O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+        return -1;
+    while (flock(fd, LOCK_EX) != 0)
+        if (errno != EINTR) {
+            close(fd);
+            return -1;
+        }
+    return fd;
+}
+
+static void cache_unlock(const char *path, int fd)
+{
+    char lk[1200];
+    if (fd < 0)
+        return;
+    sprintf(lk, "%s.lock", path);
+    unlink(lk);
+    close(fd);
 }
 
 /* ---- loading a group ---- */
@@ -1919,6 +1952,26 @@ static int job_dump(Job *J)
 }
 
 /* Kernel `item` of module mod, loaded: K->module and K->f, or K->err. Lock held. */
+/* MCUDA_KLOG=FILE: the name of every kernel a process loads (from the cache or compiled), a line each, appended by one
+   write: parallel processes can share the file. A test suite records which kernels each test runs, and warms just those
+   (MCUDA_PRECOMPILE_ONLY=@FILE). */
+static void klog(const Item *it)
+{
+    static int fd = -2;
+    char line[1100];
+    int n;
+    if (fd == -2) {
+        const char *f = getenv("MCUDA_KLOG");
+        fd = f && f[0] ? open(f, O_WRONLY | O_APPEND | O_CREAT, 0666) : -1;
+    }
+    if (fd < 0 || it->len > 1000)
+        return;
+    memcpy(line, it->name, (size_t)it->len);
+    line[it->len] = '\n';
+    n = write(fd, line, (size_t)it->len + 1);
+    (void)n;
+}
+
 static void kload(Kern *K, int mod, int item)
 {
     Job J;
@@ -1927,9 +1980,10 @@ static void kload(Kern *K, int mod, int item)
     size_t size = 0;
     CUhandle link = 0;
     double t0;
-    int whole;
+    int whole, lockfd = -1;
 
     K->tried = 1;
+    klog(&mods[mod].items[item]);
     job_prep(&J, mod, item);
     r = J.r;
     job_dump(&J);
@@ -1973,8 +2027,11 @@ static void kload(Kern *K, int mod, int item)
             fprintf(stderr, "mcuda: %s: the driver does not compile its PTX as a whole program (error %d)\n%s\n", J.kname, r, log);
         else if (verbose())
             fprintf(stderr, "mcuda: %s: compiled as a whole program (setmaxnreg) in %.2f s\n", J.kname, now() - t0);
-    } else if (!r && J.have_path)
+    } else if (!r && J.have_path) {
         image = cache_read(J.path, &size);
+        if (!image && (lockfd = cache_lock(J.path)) >= 0)
+            image = cache_read(J.path, &size); /* (made while this waited) */
+    }
     if (image) {
         r = hw.ModuleLoadData(&K->module, image);
         if (r) { /* a file that is not what it should be */
@@ -2001,6 +2058,7 @@ static void kload(Kern *K, int mod, int item)
         if (link)
             hw.LinkDestroy(link);
     }
+    cache_unlock(J.path, lockfd);
     free(image);
     if (verbose() && (locals_slots || locals_fwds)) {
         fprintf(stderr, "mcuda: %s: %lu locals in registers, %lu loads taken from the store before\n", J.kname, locals_slots, locals_fwds);
@@ -2061,14 +2119,117 @@ static void kload(Kern *K, int mod, int item)
 
 /* ---- MCUDA_PRECOMPILE=N ----
    The program's first use of the device becomes this instead: every kernel of the program (MCUDA_PRECOMPILE_ONLY=
-   TEXT: those with TEXT in their names) that the cache does not hold goes through the driver's compiler, N at
+   TEXT: those with TEXT in their names; =@FILE: those named in FILE, e.g. a test's MCUDA_KLOG) that the cache does not hold goes through the driver's compiler, N at
    a time, and into the cache; then the program ends. For a build to pay for what the first run would. */
-static int pre_mod, pre_item;
+typedef struct {
+    int mod, item;
+    long size;
+} PreJob;
+static PreJob *pre_list;
+static int pre_n, pre_next;
 static unsigned long pre_seen, pre_made, pre_bad;
+
+/* (largest first: the big conv kernels take 20-90 s each in the driver's compiler and decide the wall time when one
+   of them starts last; MCUDA_PRECOMPILE_FIFO=1: the modules' order as before) */
+static int pre_cmp(const void *a, const void *b)
+{
+    const PreJob *x = (const PreJob *)a, *y = (const PreJob *)b;
+    if (x->size != y->size)
+        return x->size < y->size ? 1 : -1;
+    return x->mod != y->mod ? x->mod - y->mod : x->item - y->item;
+}
+
+/* MCUDA_PRECOMPILE_ONLY=@FILE: the kernels named in FILE, one mangled name a line (as MCUDA_KLOG writes them) */
+static char *only_text;
+static const char **only_names;
+static int only_n;
+
+static int only_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    long n;
+    int cap = 0;
+    char *p, *e;
+    if (!f) {
+        fprintf(stderr, "mcuda: MCUDA_PRECOMPILE_ONLY: cannot read %s\n", path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    only_text = (char *)xrealloc(0, (size_t)(n > 0 ? n : 0) + 1);
+    n = (long)fread(only_text, 1, (size_t)(n > 0 ? n : 0), f);
+    fclose(f);
+    only_text[n > 0 ? n : 0] = 0;
+    for (p = only_text; *p; p = e) {
+        e = strchr(p, '\n');
+        if (e)
+            *e++ = 0;
+        else
+            e = p + strlen(p);
+        while (*p == ' ' || *p == '\t' || *p == '\r')
+            p++;
+        {
+            size_t l = strlen(p);
+            while (l && (p[l - 1] == ' ' || p[l - 1] == '\t' || p[l - 1] == '\r'))
+                p[--l] = 0;
+            if (!l)
+                continue;
+        }
+        if (only_n == cap) {
+            cap = cap ? cap * 2 : 64;
+            only_names = (const char **)xrealloc((void *)only_names, (size_t)cap * sizeof *only_names);
+        }
+        only_names[only_n++] = p;
+    }
+    return 0;
+}
+
+static int only_has(const Item *it)
+{
+    int k;
+    for (k = 0; k < only_n; k++)
+        if ((int)strlen(only_names[k]) == it->len && memcmp(only_names[k], it->name, (size_t)it->len) == 0)
+            return 1;
+    return 0;
+}
+
+static void pre_collect(void)
+{
+    const char *only = getenv("MCUDA_PRECOMPILE_ONLY"), *fifo = getenv("MCUDA_PRECOMPILE_FIFO");
+    int m, k, cap = 0, list = only && only[0] == '@';
+    if (list && only_load(only + 1) != 0)
+        return;
+    for (m = 0; m < nmods; m++) {
+        index_mod(m);
+        for (k = 0; k < mods[m].nitems; k++) {
+            const Item *it = &mods[m].items[k];
+            if (it->kind != IT_ENTRY)
+                continue;
+            if (list) {
+                if (!only_has(it))
+                    continue;
+            } else if (only && only[0]) {
+                char nm[300];
+                sprintf(nm, "%.*s", it->len < 290 ? it->len : 290, it->name);
+                if (!strstr(nm, only))
+                    continue;
+            }
+            if (pre_n == cap) {
+                cap = cap ? cap * 2 : 256;
+                pre_list = (PreJob *)xrealloc(pre_list, (size_t)cap * sizeof *pre_list);
+            }
+            pre_list[pre_n].mod = m;
+            pre_list[pre_n].item = k;
+            pre_list[pre_n++].size = (long)(it->e - it->b);
+        }
+    }
+    if (!(fifo && fifo[0] == '1'))
+        qsort(pre_list, (size_t)pre_n, sizeof *pre_list, pre_cmp);
+}
 
 static void *pre_worker(void *arg)
 {
-    const char *only = getenv("MCUDA_PRECOMPILE_ONLY");
     (void)arg;
     if (hw_enter())
         return 0;
@@ -2076,24 +2237,9 @@ static void *pre_worker(void *arg)
         Job J;
         int have = 0;
         hw_lock();
-        while (!have && pre_mod < nmods) {
-            const Item *it;
-            index_mod(pre_mod);
-            if (pre_item >= mods[pre_mod].nitems) {
-                pre_mod++;
-                pre_item = 0;
-                continue;
-            }
-            it = &mods[pre_mod].items[pre_item++];
-            if (it->kind != IT_ENTRY)
-                continue;
-            if (only && only[0]) {
-                char nm[300];
-                sprintf(nm, "%.*s", it->len < 290 ? it->len : 290, it->name);
-                if (!strstr(nm, only))
-                    continue;
-            }
-            job_prep(&J, pre_mod, pre_item - 1);
+        if (pre_next < pre_n) {
+            job_prep(&J, pre_list[pre_next].mod, pre_list[pre_next].item);
+            pre_next++;
             pre_seen++;
             have = 1;
         }
@@ -2110,10 +2256,18 @@ static void *pre_worker(void *arg)
             CUhandle link = 0;
             void *cubin = 0;
             size_t size = 0;
-            double t0 = now();
-            int r = job_compile(&J, &link, &cubin, &size);
+            double t0;
+            int r, lockfd = cache_lock(J.path);
+            if (access(J.path, R_OK) == 0) { /* (another process made it while this waited) */
+                cache_unlock(J.path, lockfd);
+                job_free(&J);
+                continue;
+            }
+            t0 = now();
+            r = job_compile(&J, &link, &cubin, &size);
             if (!r)
                 cache_write(J.path, cubin, size);
+            cache_unlock(J.path, lockfd);
             if (link)
                 hw.LinkDestroy(link);
             hw_lock();
@@ -2140,6 +2294,7 @@ void hw_precompile(int n)
         n = 64;
     hw_lock();
     take();
+    pre_collect();
     hw_unlock();
     for (i = 0; i < n - 1; i++)
         if (pthread_create(&th[made], 0, pre_worker, 0) == 0)

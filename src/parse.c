@@ -265,6 +265,7 @@ static u32 widen_sum(u32 v, int depth)
     return ir_ins(F, OP_SEXT32, IT_I64, v, 0);
 }
 static int cur_fn_kernel; /* CUDA: and a kernel, whose code is only ever PTX */
+static u32 cur_fn_maxntid; /* (a kernel's launch_bounds: its threads per block at most; 0 unknown) */
 static int launch_stop; /* CUDA: reading the <<<...>>> of a kernel launch, where >> ends an expression */
 static struct Launch {
     int on;
@@ -443,6 +444,7 @@ static int grabbing;
 #define UNROLL_AUTO_N 32      /* a loop unrolled unasked runs at most this often */
 #define UNROLL_AUTO_SIZE 1200 /* and is at most this many tokens when unrolled */
 #define UNROLL_AUTO_INS 600   /* and this many instructions, as the body is first read */
+#define UNROLL_TID_N 8        /* a loop from threadIdx (unroll_var_tid): at most this many guarded copies */
 /* host code at -O3: loops of a few trips (for d < 3 over coordinates), so the loop around them is one block the
    vectoriser takes, and the counter is a constant in each copy */
 #define UNROLL_HOST_N 16      /* (a loop over the 8 corners of a cell, 13 neighbours) */
@@ -7973,13 +7975,15 @@ typedef struct Init {
     u64 max;         /* highest offset written, for incomplete arrays */
     Expr pending;    /* an expression parsed ahead of its use */
     int has_pending;
+    int try_static;  /* automatic, but the bytes are kept in buf too while every element is a constant */
+    int nonconst;    /* try_static: one was not */
 } Init;
 
 static void init_reserve(Init *in, u64 end)
 {
     if (end > in->max)
         in->max = end;
-    if (in->is_static && end > in->buf.len)
+    if ((in->is_static || in->try_static) && end > in->buf.len)
         buf_zero(&in->buf, (size_t)(end - in->buf.len));
 }
 
@@ -8033,13 +8037,23 @@ static void init_scalar(Init *in, Type *ty, u64 off, Field *bf)
     }
     if (!in->is_static) {
         Expr lv;
+        if (!type_is_record(ty))
+            convert(&e, ty);
+        if (in->try_static && !in->nonconst) {
+            Ins *ci = &F->ins[e.v];
+            u32 size = (u32)type_size(ty), k;
+            u64 v = (u64)ci->a | ((u64)ci->b << 32);
+            if (bf || type_is_record(ty) || type_is_128(ty) || (ci->op != OP_CONST && ci->op != OP_FCONST))
+                in->nonconst = 1;
+            else
+                for (k = 0; k < size; k++)
+                    in->buf.p[off + k] = (u8)(v >> (8 * k));
+        }
         set_expr(&lv, ty, ir_slot_addr(F, in->slot, (i64)off), 1);
         if (bf) {
             lv.bitoff = bf->bitoff;
             lv.bitwidth = bf->bitwidth;
         }
-        if (!type_is_record(ty))
-            convert(&e, ty);
         store_expr(&lv, &e);
         return;
     }
@@ -8108,6 +8122,7 @@ static void init_string(Init *in, Type *ty, u64 off)
             n = ty->len; /* the terminator may be dropped */
     }
     init_reserve(in, off + n);
+    in->nonconst = 1;
     if (in->is_static)
         memcpy(in->buf.p + off, b.p, (size_t)n);
     else
@@ -8469,6 +8484,24 @@ static void define_data(Sym *s, Init *in)
     O->syms[sym].kind = (u8)(s->is_tls ? 3 : 2);
     O->syms[sym].size = size;
     s->defined = 1;
+}
+
+/* An automatic array of constant numbers ("const int t[13][3] = {...}" in a function): its initializer, all constant,
+   makes it an object of the program's (each call built its own copy on the stack: ufsm's tol_dir table, 1248 bytes of
+   local memory in loss_stats_k). Its address may differ between two calls at once only for a recursive function that
+   compares them, which no table does. MCC_NOCTAB: off. */
+static int opt_no_const_tables = -1;
+
+static int const_table(Type *ty)
+{
+    Type *e = ty;
+    if (opt_no_const_tables < 0)
+        opt_no_const_tables = getenv("MCC_NOCTAB") != 0;
+    if (ty->kind != TY_ARRAY || !type_complete(ty))
+        return 0;
+    while (e->kind == TY_ARRAY)
+        e = e->base;
+    return (e->quals & Q_CONST) && !(e->quals & Q_VOLATILE) && (type_is_int(e) || type_is_float(e));
 }
 
 static void static_init(Sym *s)
@@ -9724,6 +9757,7 @@ static int declaration(int file_scope)
                     next();
                 memset(&in, 0, sizeof in);
                 in.slot = s->slot;
+                in.try_static = const_table(ty) && tok.kind == T_LBRACE;
                 if (ty->kind == TY_ARRAY || (type_is_record(ty) && tok.kind == T_LBRACE))
                     zero = emit_mem(OP_MEMZERO, ir_slot_addr(F, s->slot, 0), 0, type_size(ty), type_align(ty));
                 initializer(&in, &s->ty);
@@ -9731,6 +9765,20 @@ static int declaration(int file_scope)
                 F->slots[s->slot].size = (u32)type_size(ty);
                 if (zero)
                     F->ins[zero].c = (u32)type_size(ty);
+                if (in.try_static && !in.nonconst && type_complete(ty) && !opt_no_const_tables) {
+                    /* every element a constant: one object of the program's instead of the stack copy made at
+                       each call (whose stores then have no reader and go) */
+                    Sym *t = new_sym(name, SK_VAR, ty);
+                    init_reserve(&in, type_size(ty));
+                    t->is_static = 1;
+                    t->objsym = obj_add_sym(O, 0, SEC_UNDEF, 0, 0);
+                    sym_align(t->objsym, ty);
+                    in.is_static = 1;
+                    define_data(t, &in);
+                    bind(t);
+                }
+                if (in.try_static)
+                    buf_free(&in.buf);
             }
             else if (opt_cxx && tok.kind == T_LPAREN)
                 paren_init(s, ty, loc);
@@ -10155,6 +10203,72 @@ static Sym *unroll_var(const Token *t, u32 n, i64 *val)
     return s;
 }
 
+/* Device code: a counter that starts at the thread's number in its block, for (int i = threadIdx.x; i < N; i += S) with N
+   and S constants (a block's threads staging a tile into shared memory): the counter starts somewhere in 0..1023, so the
+   loop runs at most as often as it does from 0, and that bound K is known. Such a loop becomes K guarded copies of its
+   body (each: the test, the body, the step; a failed test leaves), as nvcc's front end unrolls it: the copies' loads are
+   in flight together instead of one round trip per iteration (ufsm's gemm_ns_k tile loads: 1.9x nvcc's time on sm_86).
+   n tokens at t, the declaration; returns the counter (and *val = 0, the least start) or 0. MCC_NOTIDU: off. */
+static int opt_notidu = -1;
+static u32 id_threadidx, id_dimx, id_dimy, id_dimz;
+static Sym *unroll_var_tid(const Token *t, u32 n, i64 *val)
+{
+    u32 k = 0, eq = 0;
+    Sym *s;
+    if (opt_notidu < 0)
+        opt_notidu = getenv("MCC_NOTIDU") != 0;
+    if (opt_notidu || !cur_fn_dev)
+        return 0;
+    if (!id_threadidx) {
+        id_threadidx = intern_cstr("threadIdx");
+        id_dimx = intern_cstr("x");
+        id_dimy = intern_cstr("y");
+        id_dimz = intern_cstr("z");
+    }
+    for (k = 0; k + 1 < n; k++)
+        if (t[k].kind == T_ASSIGN) {
+            eq = k;
+            break;
+        }
+    if (!eq || t[eq - 1].kind != T_IDENT)
+        return 0;
+    k = eq + 1;
+    /* (int) / (unsigned) / (unsigned int) threadIdx.x */
+    if (k + 2 < n && t[k].kind == T_LPAREN) {
+        u32 j = k + 1;
+        while (j < n && (t[j].kind == KW(KW_INT) || t[j].kind == KW(KW_UNSIGNED)))
+            j++;
+        if (j == k + 1 || j >= n || t[j].kind != T_RPAREN)
+            return 0;
+        k = j + 1;
+    }
+    if (k + 3 > n || t[k].kind != T_IDENT || t[k].v != id_threadidx || t[k + 1].kind != T_DOT || t[k + 2].kind != T_IDENT ||
+        (t[k + 2].v != id_dimx && t[k + 2].v != id_dimy && t[k + 2].v != id_dimz))
+        return 0;
+    if (k + 3 < n && t[k + 3].kind != T_SEMI)
+        return 0;
+    s = lookup(t[eq - 1].v);
+    if (!s || s->kind != SK_VAR || !s->local || s->cv || s->byref || s->real || !type_is_int(s->ty) || type_size(s->ty) < 4 ||
+        type_size(s->ty) > 8)
+        return 0;
+    *val = 0;
+    return s;
+}
+
+/* The condition of such a loop, n tokens at t (the last a semicolon), is s < e or s <= e, e not mentioning s: true for a
+   start of 0 at least as often as for any larger one. */
+static int unroll_tid_cond(Sym *s, const Token *t, u32 n)
+{
+    u32 k;
+    if (n < 4 || t[0].kind != T_IDENT || t[0].v != s->name || (t[1].kind != T_LT && t[1].kind != T_LE))
+        return 0;
+    for (k = 2; k < n; k++)
+        if ((t[k].kind == T_IDENT && t[k].v == s->name) || t[k].kind == T_COMMA || t[k].kind == T_QUESTION ||
+            t[k].kind == T_ANDAND || t[k].kind == T_OROR)
+            return 0;
+    return 1;
+}
+
 /* The step of the loop, n tokens at t (the last a semicolon), is one that is understood: s++, ++s, s--, --s,
    s += c, s -= c, s *= c, s <<= c, s >>= c or s = c, for a c that is constant given s. With val, *val is the
    counter and becomes what the step makes of it. */
@@ -10483,6 +10597,8 @@ static void statement(void)
         /* the condition guards the loop and is tested again after each step */
         u32 ur = unroll_req > 1 && !opt_nounroll ? unroll_req : 0;
         int once = unroll_req == 1; /* #pragma unroll 1 */
+        int tidu = 0;               /* the counter starts at threadIdx (unroll_var_tid): guarded copies */
+        u8 tidg[UNROLL_TID_N] = {1, 1, 1, 1, 1, 1, 1, 1}; /* (which of them need their test) */
         /* device code: a short loop that counts to a constant is unrolled unasked, as nvcc does */
         int au = !ur && !unroll_req && (cur_fn_dev || opt_level >= 3) && !opt_nounroll && !opt_size && !opt_noauto && au_n++ < opt_aumax;
         u32 for_loc = tok.loc;
@@ -10511,6 +10627,10 @@ static void statement(void)
             u32 in;
             Token *itk = grab_done(&in, 0);
             uv = unroll_var(itk, in, &uval);
+            if (!uv && au) {
+                uv = unroll_var_tid(itk, in, &uval);
+                tidu = uv != 0;
+            }
             if (au && opt_autolog && !uv)
                 warn_at(for_loc, "loop %u: no counter", au_n);
         }
@@ -10535,6 +10655,8 @@ static void statement(void)
             btk = grab_done(&bn, 0);
             if (!unroll_step(uv, stk, sn, 0) || unroll_writes(uv->name, btk, bn) || unroll_writes(uv->name, ctk, cn))
                 ur = 0, au = 0; /* not a loop that counts in a way that is understood: an ordinary one */
+            if (tidu && !unroll_tid_cond(uv, ctk, cn))
+                ur = 0, au = 0;
             if (opt_autolog && !au)
                 warn_at(for_loc, "loop %u: step / writes", au_n);
             if (au) {
@@ -10561,7 +10683,8 @@ static void statement(void)
                     if (!cv) {
                         if (opt_autolog && !(k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn)))
                             warn_at(for_loc, "loop %u: %u times %u tokens, or not plain", au_n, k, bn);
-                        if (k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn) && auto_n < opt_automax) {
+                        if (k && (u64)k * bn <= (cur_fn_dev ? UNROLL_AUTO_SIZE : UNROLL_HOST_SIZE) && unroll_plain(btk, bn) && auto_n < opt_automax &&
+                            (!tidu || k <= UNROLL_TID_N)) {
                             /* how much code the body is, the loops inside it unrolled: it is read once, into
                                blocks that are never run */
                             u32 n0 = F->nins, s_break = break_blk, s_cont = cont_blk, grown;
@@ -10581,6 +10704,29 @@ static void statement(void)
                                 (!cur_fn_dev && k >= 4 && (u64)grown * k <= UNROLL_HOST_LINE && unroll_straight(btk, bn))) {
                                 auto_n++;
                                 ur = k + 1;
+                                if (tidu) {
+                                    /* which copies need their test: the counter at its largest (the kernel's
+                                       launch_bounds less one, else 1023) plus j steps may fail it */
+                                    i64 hv = (i64)(cur_fn_maxntid ? cur_fn_maxntid : 1024) - 1;
+                                    u32 q;
+                                    for (q = 0; q < k && q < UNROLL_TID_N; q++) {
+                                        hv = unroll_fit(uv->ty, hv);
+                                        uv->cv = 1;
+                                        uv->val = hv;
+                                        replay(ctk, cn);
+                                        unroll_probe = uv;
+                                        expr(&e);
+                                        unroll_probe = 0;
+                                        rvalue(&e);
+                                        c = to_bool(&e);
+                                        expect(T_SEMI);
+                                        tidg[q] = (u8)!(ir_is_const(F, c, &cv) && cv);
+                                        unroll_quiet = 1;
+                                        if (!unroll_step(uv, stk, sn, &hv))
+                                            tidg[q] = 1;
+                                        unroll_quiet = 0;
+                                    }
+                                }
                                 if (opt_autolog)
                                     warn_at(tok.loc, "loop %u unrolled unasked: %u times %u instructions", auto_n, k, grown);
                             } else if (opt_autolog) {
@@ -10589,10 +10735,13 @@ static void statement(void)
                         }
                         break;
                     }
-                    unroll_quiet = 1;
-                    if (!unroll_step(uv, stk, sn, &v))
-                        k = UNROLL_AUTO_N;
-                    unroll_quiet = 0;
+                    {
+                        i64 pv = v;
+                        unroll_quiet = 1;
+                        if (!unroll_step(uv, stk, sn, &v) || (tidu && v <= pv))
+                            k = UNROLL_AUTO_N;
+                        unroll_quiet = 0;
+                    }
                 }
                 uv->cv = 0;
                 F->cur = keep;
@@ -10630,10 +10779,43 @@ static void statement(void)
                 F->cur = keep;
             }
             end = ir_new_block(F);
+            if (tidu && au && ur > 1) {
+                /* ur - 1 guarded copies (the counter a variable): the test, the body, the step; the loop cannot run more often */
+                for (j = 0; j + 1 < ur; j++) {
+                    if (tidg[j]) { /* (a copy every thread runs has no test: straight-line code, its loads in flight together) */
+                        u32 bb = ir_new_block(F);
+                        replay(ctk, cn);
+                        expr(&e);
+                        rvalue(&e);
+                        c = to_bool(&e);
+                        expect(T_SEMI);
+                        ir_br(F, c, bb, end);
+                        F->cur = bb;
+                    }
+                    cnt = ir_new_block(F);
+                    break_blk = end;
+                    break_level = level;
+                    cont_blk = cnt;
+                    cont_level = level;
+                    replay(btk, bn);
+                    statement();
+                    ir_jmp(F, cnt);
+                    F->cur = cnt;
+                    replay(stk, sn);
+                    if (tok.kind != T_SEMI)
+                        expr(&e);
+                    expect(T_SEMI);
+                }
+                ir_jmp(F, end);
+                F->cur = end;
+                pop_scope();
+                break;
+            }
             for (;;) {
                 /* the counter is a constant while the condition and the body are read (and has its value in memory) */
                 uval = unroll_fit(uv->ty, uval);
-                store_val(uv->ty, ir_slot_addr(F, uv->slot, 0), ir_const(F, type_ir(uv->ty), (u64)uval));
+                if (!tidu) /* (a counter from threadIdx has its value already) */
+                    store_val(uv->ty, ir_slot_addr(F, uv->slot, 0), ir_const(F, type_ir(uv->ty), (u64)uval));
                 uv->cv = (u8)(ur != 0);
                 uv->val = uval;
                 replay(ctk, cn);
@@ -11219,6 +11401,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     cur_fn_avx512 = (s->aflags & AT_AVX512) != 0;
     F->avx = (u8)(opt_avx || cur_fn_avx);
     cur_fn_kernel = cur_fn_dev && (s->aflags & AT_GLOBAL) != 0;
+    cur_fn_maxntid = cur_fn_kernel ? s->maxntid & 0xffff : 0;
     opt_dev_parse = cur_fn_dev && ((s->aflags & AT_GLOBAL) || !(s->aflags & AT_HOST)); /* (not what is host code as well) */
     cur_ret = ty->base;
     labels = 0;

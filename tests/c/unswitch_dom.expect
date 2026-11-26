@@ -1,0 +1,13 @@
+n 0 a 0 b 0: 2 work 0
+n 0 a 0 b 1: 2 work 0
+n 0 a 1 b 0: 2 work 0
+n 0 a 1 b 1: 2 work 1
+n 4 a 0 b 0: 14 work 0
+n 4 a 0 b 1: 14 work 0
+n 4 a 1 b 0: 14 work 0
+n 4 a 1 b 1: 11 work 39
+n 8 a 0 b 0: 10 work 0
+n 8 a 0 b 1: 10 work 0
+n 8 a 1 b 0: 10 work 0
+n 8 a 1 b 1: 10 work 50
+exit 0

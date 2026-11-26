@@ -95,6 +95,8 @@ enum { VM_SQRT, VM_FLOOR, VM_CEIL, VM_TRUNC, VM_RINT, VM_NEARBYINT };
 enum { ATOM_LOAD, ATOM_STORE, ATOM_XCHG, ATOM_ADD, ATOM_SUB, ATOM_AND, ATOM_OR, ATOM_XOR, ATOM_NAND, ATOM_CAS,
        ATOM_FENCE };
 #define IF_NC 0x40 /* OP_LOAD, device code: of global memory the kernel only reads (__ldg: ld.global.nc) */
+#define IF_ALIGN 0x07 /* OP_LOAD, OP_STORE, device code: log2 of the alignment its address has by the type of the object it is part of
+                         (a struct copy of a float4 / uint4 / __half2 through a pointer: opt_split); 0: none. ptx.c vec_find */
 #define IF_SSE0 0x10 /* OP_CALL with IF_SRET and mem, x86-64: the first eight bytes come back in an xmm register, */
 #define IF_SSE1 0x20 /* the second eight; Func.has_sret says the same with 0x40 and 0x80 */
 #define IF_FRESH 0x40 /* OP_CALL, x86-64 host: malloc, calloc, realloc, aligned_alloc: the result is the address of memory nothing
@@ -271,7 +273,7 @@ extern u8 *opt_sym_private;    /* by object symbol, while the unit's functions a
 extern u32 opt_sym_private_n; /* -fwrapv, -fno-strict-overflow */
 extern int opt_inline_once;
 extern int opt_inline_oncelim;
-extern int opt_inline_limit, opt_inline_host;
+extern int opt_inline_limit, opt_inline_host, opt_inline_dev, opt_inline_devblk;
 extern int opt_inline_hint; /* -finline-hint=: the limit for functions declared inline */
 extern int opt_inline_slotarg; /* -finline-slotarg=: the limit at host call sites passing the address of a local */
 extern int opt_level;

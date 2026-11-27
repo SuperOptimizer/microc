@@ -3940,6 +3940,74 @@ static int pure_tree(u32 v, int depth)
     return 1;
 }
 
+/* the header that declares a C library function, for the diagnostic on a call without its declaration; 0 if not known */
+static const char *libc_header(const char *nm)
+{
+    static const char *const math[] = {"acos", "asin", "atan", "atan2", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh",
+        "sinh", "tanh", "exp", "exp2", "expm1", "frexp", "ldexp", "log", "log10", "log1p", "log2", "logb", "ilogb", "modf",
+        "scalbn", "scalbln", "cbrt", "fabs", "hypot", "pow", "sqrt", "erf", "erfc", "lgamma", "tgamma", "ceil", "floor",
+        "nearbyint", "rint", "lrint", "llrint", "round", "lround", "llround", "trunc", "fmod", "remainder", "remquo",
+        "copysign", "nan", "nextafter", "nexttoward", "fdim", "fmax", "fmin", "fma", "isnan", "isinf", "isfinite",
+        "signbit", "fpclassify", "sincos", "exp10", 0};
+    static const struct { const char *h, *names; } t[] = {
+        {"stdlib.h", " malloc calloc realloc free aligned_alloc posix_memalign abort exit _Exit atexit quick_exit getenv setenv "
+                     "unsetenv system atoi atol atoll atof strtol strtoll strtoul strtoull strtod strtof strtold qsort bsearch "
+                     "abs labs llabs div ldiv lldiv rand srand mkstemp realpath "},
+        {"string.h", " memcpy memmove memset memcmp memchr strlen strnlen strcmp strncmp strcpy strncpy strcat strncat strchr "
+                     "strrchr strstr strdup strndup strerror strtok strtok_r strspn strcspn strpbrk strcoll memmem stpcpy "},
+        {"strings.h", " strcasecmp strncasecmp bzero bcmp ffs "},
+        {"stdio.h", " printf fprintf sprintf snprintf vprintf vfprintf vsprintf vsnprintf dprintf asprintf scanf fscanf sscanf "
+                    "puts fputs fputc putc putchar getc getchar fgetc fgets ungetc fopen fdopen freopen fclose fflush fread "
+                    "fwrite fseek fseeko ftell ftello rewind feof ferror clearerr perror remove rename tmpfile setvbuf fileno "
+                    "popen pclose getline "},
+        {"ctype.h", " isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit tolower "
+                    "toupper "},
+        {"time.h", " time clock difftime mktime gmtime localtime gmtime_r localtime_r strftime clock_gettime nanosleep "},
+        {"unistd.h", " read write close lseek pread pwrite unlink access sleep usleep getpid fork execv execvp pipe dup dup2 "
+                     "sysconf ftruncate fsync getcwd chdir isatty "},
+        {"fcntl.h", " open openat fcntl "},
+        {"sys/mman.h", " mmap munmap mprotect madvise "},
+        {"assert.h", " assert "},
+        {"setjmp.h", " setjmp longjmp "},
+        {"signal.h", " signal raise sigaction kill "},
+        {"threads.h", " thrd_create thrd_join mtx_init mtx_lock mtx_unlock cnd_wait cnd_signal "},
+    };
+    char w[64];
+    size_t n = strlen(nm), k;
+    for (k = 0; math[k]; k++) {
+        size_t m = strlen(math[k]);
+        if (strncmp(nm, math[k], m) == 0 && (n == m || (n == m + 1 && (nm[m] == 'f' || nm[m] == 'l'))))
+            return "math.h";
+    }
+    if (strncmp(nm, "pthread_", 8) == 0)
+        return "pthread.h";
+    if (strncmp(nm, "atomic_", 7) == 0)
+        return "stdatomic.h";
+    if (n + 3 > sizeof w)
+        return 0;
+    sprintf(w, " %s ", nm);
+    for (k = 0; k < sizeof t / sizeof t[0]; k++)
+        if (strstr(t[k].names, w))
+            return t[k].h;
+    return 0;
+}
+
+/* a call to the undeclared function NAME at LOC (C): an error from C99 on (C99 removed implicit declarations, C23 has no int
+   f() at all), else a warning; -fpermissive / -Wno-error=implicit-function-declaration ask for the C89 rule back, still with
+   the warning. A known library function names its header: a double function taken as int returns garbage (phasecmp.c) */
+static void implicit_call(u32 loc, u32 name)
+{
+    const char *nm = intern_str(name), *h = libc_header(nm);
+    char hint[64];
+    hint[0] = 0;
+    if (h)
+        sprintf(hint, " (include <%s>)", h);
+    if (opt_c99 && !(opt_permissive & PERM_IMPLICIT_FN))
+        error_at(loc, "call to undeclared function '%s'%s; ISO C99 and later do not support implicit function declarations",
+                 nm, hint);
+    warn_at(loc, "implicit declaration of function '%s' as int %s()%s", nm, nm, hint);
+}
+
 static Sym *implicit_func(u32 name, Type *ret)
 {
     Sym *s;
@@ -5038,6 +5106,9 @@ static int builtin(Expr *e)
         }
         if (opt_cxx)
             error_at(tok.loc, "'%s' is not declared", intern_str(tok.v));
+        names_reserve(tok.v);
+        if (!lookup(tok.v) && !gsyms[tok.v])
+            implicit_call(tok.loc, tok.v); /* a builtin mcc does not know: an undeclared int __builtin_NAME() */
         implicit_func(tok.v, ty_int);
     }
     return 0;
@@ -6279,6 +6350,10 @@ static void primary(Expr *e)
         names_reserve(tok.v);
         s = gsyms[tok.v];
         if (!s) {
+            if (opt_cxx)
+                warn_at(loc, "'%s' undeclared: implicitly int %s() (MCC_IMPLICIT_CXX)", intern_str(tok.v), intern_str(tok.v));
+            else
+                implicit_call(loc, tok.v);
             s = new_sym(tok.v, SK_VAR, type_func(ty_int, 0, 0, 0, 0, 1));
             gsyms[tok.v] = s;
         }
@@ -7623,6 +7698,13 @@ done:
         *storage = 0;
     }
     ds_auto = is_auto;
+    if (!ty && !is_auto && !is_complex && !opt_cxx && opt_c99 &&
+        !(n_void + n_char + n_short + n_int + n_long + n_float + n_double + n_signed + n_unsigned + n_bool + n_128)) {
+        /* "static x;", "f() { }": C99 removed implicit int */
+        if (!(opt_permissive & PERM_IMPLICIT_INT))
+            error_at(loc, "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int");
+        warn_at(loc, "type specifier missing, defaults to 'int' (implicit int)");
+    }
     if (!ty) {
         if (n_void + n_char + n_short + n_float + n_double + n_bool > 1 || n_long > 2 || n_int > 1 ||
             (n_signed && n_unsigned) || ((n_void || n_float || n_double || n_bool) && (n_signed || n_unsigned)) ||
@@ -11366,6 +11448,8 @@ static void cgoto_tree(u32 val, const u32 *blks, u32 lo, u32 hi)
     cgoto_tree(val, blks, mid, hi);
 }
 
+static u8 knr_seen[128]; /* func_def: the names of a K&R identifier list that have their declaration */
+
 static void func_def(Sym *s, Type *ty, u32 loc)
 {
     u32 i, v, dw_fn_save;
@@ -11414,7 +11498,10 @@ static void func_def(Sym *s, Type *ty, u32 loc)
     dw_fn_save = dw_fn_level;
     dw_fn_level = level;
 
-    /* K&R parameter declarations */
+    /* K&R parameter declarations; from C99 on each name of the list needs one (no implicit int), C23 has no identifier lists */
+    if (ty->oldstyle && ty->nparams && !opt_cxx && opt_c23 && !(opt_permissive & PERM_IMPLICIT_INT))
+        error_at(tok.loc, "old-style (K&R) parameter list in the definition of '%s'; C23 has no identifier lists", cur_fn_name);
+    memset(knr_seen, 0, sizeof knr_seen);
     while (ty->oldstyle && tok.kind != T_LBRACE) {
         int storage;
         Type *base = declspec(&storage);
@@ -11426,6 +11513,7 @@ static void func_def(Sym *s, Type *ty, u32 loc)
                     break;
             if (!name || i == ty->nparams)
                 error_at(tok.loc, "declaration for a missing parameter");
+            knr_seen[i] = 1;
             if (pt->kind == TY_ARRAY)
                 pt = type_ptr(pt->base);
             else if (pt->kind == TY_FUNC)
@@ -11436,6 +11524,13 @@ static void func_def(Sym *s, Type *ty, u32 loc)
         }
         expect(T_SEMI);
     }
+    for (i = 0; ty->oldstyle && !opt_cxx && opt_c99 && i < ty->nparams; i++)
+        if (!knr_seen[i]) {
+            if (!(opt_permissive & PERM_IMPLICIT_INT))
+                error_at(tok.loc, "parameter '%s' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int",
+                         intern_str(ty->pnames[i]));
+            warn_at(tok.loc, "parameter '%s' was not declared, defaults to 'int' (implicit int)", intern_str(ty->pnames[i]));
+        }
 
     F->ret_ty = (u8)(vec_mem(cur_ret) ? (vec_ity(vec_mem(cur_ret)))
                      : type_is_record(cur_ret) || type_is_128(cur_ret) ? IT_VOID : type_ir(cur_ret));

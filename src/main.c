@@ -221,7 +221,7 @@ static int unsupported(const char *a)
 }
 
 static int hosted;  /* --hosted: the POSIX flavour of the library on this machine */
-static int std_c99; /* -std names C99 or later: restrict is a keyword */
+/* opt_c99 (lex.c): -std names C99 or later: restrict is a keyword, no implicit int f() or implicit int */
 static int force_cuda; /* -x cuda */
 const char *opt_ptx_out;
 int opt_ptx_raw;
@@ -473,11 +473,11 @@ static void target_macros(void)
         pp_define("__MCC_FP_CONTRACT__"); /* a * b + c may be one rounding (-ffp-contract=fast, -ffast-math): tests/c/vec2.c */
     if (getenv("MCC_NOLDGV"))
         pp_define("__MCC_NOLDGV"); /* mcuda_device.h: __ldg of the vector types field by field (for the GPU A/B) */
-    if (std_c99)
+    if (opt_c99)
         pp_define("restrict=__restrict");
     if (opt_c23)
         pp_define("__STDC_VERSION__=202311L");
-    else if (std_c99)
+    else if (opt_c99)
         pp_define("__STDC_VERSION__=201710L");
     if (hosted) {
         pp_define("__unix__");
@@ -803,7 +803,7 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_gnu = 0;
         else if (strncmp(a, "-std=", 5) == 0) {
             opt_gnu = 1;
-            std_c99 = !strstr(a, "89") && !strstr(a, "90");
+            opt_c99 = !strstr(a, "89") && !strstr(a, "90");
             opt_c23 = strstr(a, "23") || strstr(a, "2x");
         }
         else if (strncmp(a, "-j", 2) == 0 && a[2] >= '0' && a[2] <= '9')
@@ -852,6 +852,15 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_debug = 0;
         else if (strcmp(a, "-fwrapv") == 0 || strcmp(a, "-fno-strict-overflow") == 0)
             opt_wrapv = 1; /* signed sums wrap: nothing is concluded from an int's sum not wrapping */
+        /* C99 removed implicit int f() and implicit int; under -std=c99 and later they are errors (as in clang and gcc 14)
+           unless asked back for, and then each use still gets a warning: ufsm's phasecmp.c called floor / llround without
+           <math.h> under -std=c23, they came back as int and every box mapped to 0,0,0 with no diagnostic */
+        else if (strcmp(a, "-fpermissive") == 0)
+            opt_permissive = PERM_IMPLICIT_FN | PERM_IMPLICIT_INT;
+        else if (strcmp(a, "-Wno-error=implicit-function-declaration") == 0)
+            opt_permissive |= PERM_IMPLICIT_FN;
+        else if (strcmp(a, "-Wno-error=implicit-int") == 0)
+            opt_permissive |= PERM_IMPLICIT_INT;
         else if (strncmp(a, "-W", 2) == 0 || strncmp(a, "-f", 2) == 0 || strncmp(a, "-m", 2) == 0 ||
                  strncmp(a, "-g", 2) == 0 || strncmp(a, "-O", 2) == 0 || strncmp(a, "-Q", 2) == 0 ||
                  strcmp(a, "-pipe") == 0 || strcmp(a, "-w") == 0)

@@ -4718,6 +4718,7 @@ static u8 *sr_in;     /* block in the loop */
 static u8 *sr_lin;    /* value linear in the counter */
 static i64 *sr_k;     /* its factor */
 static u32 *sr_clone; /* its copy in front of the loop (for the root being done) */
+static u32 sr_q[SR_MAX], sr_qst[SR_MAX], sr_nq; /* the counters made so far for this loop and their first values */
 
 static int sr_inv(u32 v)
 {
@@ -4731,6 +4732,9 @@ static u32 sr_copy(u32 v, u32 p, u32 init, u32 pre, u32 nins0)
     v = ir_resolve(f, v);
     if (v == p)
         return init;
+    for (a = 0; a < sr_nq; a++)
+        if (v == sr_q[a])
+            return sr_qst[a]; /* (an earlier root's counter, which a later root's chain now reads: its first value) */
     if (v >= nins0 || sr_inv(v))
         return v;
     if (sr_clone[v])
@@ -4808,9 +4812,10 @@ static void iv_reduce(Func *fn)
             }
         }
         free(stack);
+        sr_nq = 0;
         for (ph = hb->phis; ph && nroot < SR_MAX; ph = f->ins[ph].next) {
             Ins *pi_ = &f->ins[ph], *ni;
-            u32 next, init, x, r;
+            u32 next, init, x, r, r0 = nroot;
             u64 cv;
             i64 c;
             if (pi_->ty != IT_I64 || pi_->b != 2)
@@ -4898,7 +4903,7 @@ static void iv_reduce(Func *fn)
                     }
                 }
             }
-            for (r = 0; r < nroot; r++) {
+            for (r = r0; r < nroot; r++) { /* (this counter's roots: an earlier counter's were done with it) */
                 u32 R = roots[r], q, qn, st, args[2];
                 memset(sr_clone, 0, nins0 * sizeof(u32));
                 st = sr_copy(R, ph, init, pre, nins0);
@@ -4908,6 +4913,8 @@ static void iv_reduce(Func *fn)
                 args[pi] = st;
                 args[li] = qn;
                 ir_phi_set_args(f, q, args, 2);
+                sr_q[sr_nq] = q;
+                sr_qst[sr_nq++] = st;
                 /* the loop's uses of R take q (it is R's value wherever the loop is) */
                 for (j = 0; j < nrpo; j++) {
                     b = rpo[j];

@@ -2836,6 +2836,7 @@ static void profile_layout(void)
    in sixteenths? A guess from the shape of the code; the weights were fitted
    to profiles of mcc compiling itself, where they call 63% of executed
    branches right (a coin calls 45%, the profile itself 81%). */
+static int opt_norotexit = -1; /* MCC_NOROTEXIT: a rotated header's way out to a return stays where it was */
 static int opt_norotkeep = -1; /* MCC_NOROTKEEP: loop rotation moves a header the chains placed (as before) */
 
 /* is t a successor of b? */
@@ -3228,6 +3229,28 @@ static void prepare(void)
         }
         layout[k] = h;
         blk_index[h] = k;
+        if (opt_norotexit < 0)
+            opt_norotexit = getenv("MCC_NOROTEXIT") != 0;
+        if (!opt_norotexit && (k + 1 == nlayout || !is_succ(h, layout[k + 1]))) {
+            /* h's ways are both jumps now: a way out that only h enters and that returns comes next, so the
+               test is one branch back (fib's loop, once its second call is one: jl ret; jmp body) */
+            u32 s, x = 0, xk;
+            for (s = 0; s < 2; s++) {
+                u32 c = f->blk[h].succ[s];
+                if (c != h && f->blk[c].npreds == 1 && f->blk[c].term == TERM_RET && blk_index[c] < k)
+                    x = c;
+            }
+            if (x) {
+                xk = blk_index[x];
+                for (n = xk; n < k; n++) {
+                    layout[n] = layout[n + 1];
+                    blk_index[layout[n]] = n;
+                }
+                layout[k] = x;
+                blk_index[x] = k;
+                k--; /* (h moved down one) */
+            }
+        }
     }
 
     uses = (u32 *)xmalloc(f->nins * sizeof(u32));

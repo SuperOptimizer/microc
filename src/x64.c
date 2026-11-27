@@ -4318,6 +4318,11 @@ static u32 use(u32 r, u32 scratch)
         return l;
     if (spill_cached(l, scratch))
         return scratch;
+    if (l == sp_loc && sp_end == ins_start && text->len == ins_start && sp_reg != scratch && sp_reg < XMM0 && scratch < XMM0) {
+        /* just stored from the other scratch register: a copy of that, not a load of what is on its way to memory */
+        op_rr(0x89, 1, sp_reg, scratch);
+        return scratch;
+    }
     ea_spill(&ea, l);
     load_regw(scratch, &ea, vw_of(r));
     return scratch;
@@ -4395,7 +4400,9 @@ static void mov_locw(u32 dr, u32 l, int vw)
 static void mov_loc(u32 dr, u32 l)
 {
     EA ea;
-    if (is_spill(l)) {
+    if (is_spill(l) && l == sp_loc && sp_end == ins_start && text->len == ins_start && sp_reg < XMM0 && dr < XMM0) {
+        mov_rr(dr, sp_reg); /* (just stored from that register, see use()) */
+    } else if (is_spill(l)) {
         ea_spill(&ea, l);
         load_reg(dr, &ea);
     } else {

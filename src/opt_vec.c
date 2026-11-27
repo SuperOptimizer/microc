@@ -57,6 +57,7 @@ static u32 *base, *cnt, *map, *lpos;
 static u32 *ioff; /* an index or address (K_IDX, K_ADDR): the value from outside the loop added to the counter before it
                      was widened (bit 31: taken away), as in a[i + k]; 0 if none */
 #define IOFF_ZX 0x20000000U /* in ioff: the value is added 32 bits wide and the sum zero-extended (guarded against wrapping) */
+static int vec_twoinv; /* ((k + i) + c) << s indexes (MCC_NOVECTWOINV: not) */
 static int zext_guard; /* such indexes are taken (MCC_NOVECZX: not) */
 static u32 idx_off, walk_off;
 static u32 gth[MAX_GATH], ngth; /* the gathering loads */ /* that of the index is_idx and the access walks found */
@@ -1226,6 +1227,16 @@ static int try_loop(u32 l, u32 n0)
                 /* (i + k) << s with i + k 64 bits wide (size_t indexes): k folded into where the array starts */
                 kind[v] = K_IDX;
                 ioff[v] = base[i->a] | 0x40000000U;
+                shift[v] = (u8)f->ins[i->b].a;
+                break;
+            }
+            if (!INV(i->a) && kind[i->a] == K_ADDR && !shift[i->a] && (ioff[i->a] & 0xe0000000U) == 0x40000000U &&
+                f->ins[i->b].op == OP_CONST && f->ins[i->b].a <= 3 && f->ins[i->b].a && vec_twoinv &&
+                f->ins[base[i->a]].blk != L && f->ins[ioff[i->a] & 0x1fffffffU].blk != L) {
+                /* ((k + i) + c) << s, both k and c fixed for the loop (a[y * w + x - 1]): k + c is added in the
+                   preheader, and that is folded into where the array starts as above */
+                kind[v] = K_IDX;
+                ioff[v] = mk(P, OP_ADD, IT_I64, ioff[i->a] & 0x1fffffffU, base[i->a]) | 0x40000000U;
                 shift[v] = (u8)f->ins[i->b].a;
                 break;
             }
@@ -2552,6 +2563,7 @@ int opt_vectorise(Func *fn)
     vty = vw == 32 ? IT_V256 : IT_V128;
     ir_resolve_all(f);
     zext_guard = opt_arch == ARCH_X64 && !getenv("MCC_NOVECZX");
+    vec_twoinv = opt_arch == ARCH_X64 && !getenv("MCC_NOVECTWOINV");
     if (opt_arch == ARCH_X64 && !getenv("MCC_NOVECNARROW")) {
         narrow_loops();
         n0 = fn->nins;

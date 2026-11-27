@@ -48,6 +48,9 @@ typedef struct X {
     u32 pend; /* instructions of the current run not yet added to r13 */
     s32 cs[16]; /* the slot whose value a register of the pool also holds (NOCS: none) */
     u32 cur;    /* the instruction being translated */
+    s32 fslot;  /* the predicate whose comparison the flags hold, if the code ends at fat */
+    u32 fat;
+    int fcc, noimm, noflags;
     u32 rr;     /* the pool's next victim */
     int nocache;
     u32 epi;  /* where the way out is */
@@ -322,9 +325,31 @@ static void leave(X *x, u32 i)
 }
 
 /* d = a op b, integer, 32 or 64 bits (op: the "op r/m, reg" opcode: add 01, sub 29, and 21, or 09, xor 31) */
+/* is the slot a constant that an instruction can take as its 32-bit immediate (sign-extended for 64 bits)? */
+static int immok(X *x, s32 slot, int w, u32 *imm)
+{
+    u64 v;
+    if (x->noimm || !kc(x, slot, &v))
+        return 0;
+    if (w && (u64)(s64)(s32)v != v)
+        return 0;
+    *imm = (u32)v;
+    return 1;
+}
+
 static void ibin(X *x, Ins *ip, int w, u32 op)
 {
+    u32 imm;
     ld(x, RAX, ip->a, w);
+    if (immok(x, ip->b, w, &imm)) {
+        int ext = op == 0x01 ? 0 : op == 0x09 ? 1 : op == 0x21 ? 4 : op == 0x29 ? 5 : 6;
+        rex(x, w, 0, RAX, 0);
+        b1(x, 0x81); /* op eax, imm32 */
+        b1(x, 0xc0 | ext << 3);
+        b4(x, imm);
+        stv(x, RAX, ip->d);
+        return;
+    }
     ld(x, RCX, ip->b, w);
     rr(x, 0, w, op, RCX, RAX);
     stv(x, RAX, ip->d);
@@ -332,9 +357,15 @@ static void ibin(X *x, Ins *ip, int w, u32 op)
 
 static void imul(X *x, Ins *ip, int w, int add)
 {
+    u32 imm;
     ld(x, RAX, ip->a, w);
-    ld(x, RCX, ip->b, w);
-    rr(x, 0, w, 0x0faf, RAX, RCX);
+    if (immok(x, ip->b, w, &imm)) {
+        rr(x, 0, w, 0x69, RAX, RAX); /* imul eax, eax, imm32 */
+        b4(x, imm);
+    } else {
+        ld(x, RCX, ip->b, w);
+        rr(x, 0, w, 0x0faf, RAX, RCX);
+    }
     if (add) {
         ld(x, RCX, ip->c, w);
         rr(x, 0, w, 0x01, RCX, RAX);
@@ -411,10 +442,23 @@ static void setcc(X *x, int cc, s32 d)
 static void icmp(X *x, Ins *ip, int w, int sgn, int cmp)
 {
     static const u8 ucc[6] = {CC_E, CC_NE, CC_B, CC_BE, CC_A, CC_AE}, scc[6] = {CC_E, CC_NE, CC_L, CC_LE, CC_G, CC_GE};
+    u32 imm;
+    int cc = sgn ? scc[cmp] : ucc[cmp];
     ld(x, RCX, ip->a, w);
-    ld(x, RDX, ip->b, w);
-    rr(x, 0, w, 0x39, RDX, RCX); /* cmp rcx, rdx */
-    setcc(x, sgn ? scc[cmp] : ucc[cmp], ip->d);
+    if (immok(x, ip->b, w, &imm)) {
+        rex(x, w, 0, RCX, 0);
+        b1(x, 0x81); /* cmp ecx, imm32 */
+        b1(x, 0xf9);
+        b4(x, imm);
+    } else {
+        ld(x, RDX, ip->b, w);
+        rr(x, 0, w, 0x39, RDX, RCX); /* cmp rcx, rdx */
+    }
+    setcc(x, cc, ip->d);
+    /* the flags still say it where nothing else is written before a branch on it */
+    x->fslot = ip->d;
+    x->fcc = cc;
+    x->fat = x->n;
 }
 
 /* setp with floats: ucomiss in the order that makes the condition one flag test (or two) */
@@ -997,6 +1041,9 @@ void mc_jit_compile(McFunc *f)
     x->f = fn;
     forget(x);
     x->nocache = getenv("MCUDA_JIT_NOCACHE") != 0;
+    x->noimm = getenv("MCUDA_JIT_NOIMM") != 0;
+    x->noflags = getenv("MCUDA_JIT_NOFLAGS") != 0;
+    x->fslot = NOCS;
     x->off = (u32 *)malloc((size_t)f->ncode * 4);
     x->lead = (u8 *)calloc(f->ncode + 1, 1);
     x->fixed = (u8 *)calloc(f->nconst + 1, 1);
@@ -1087,11 +1134,20 @@ void mc_jit_compile(McFunc *f)
         case OP_SKIPF:
         case OP_SKIPT: {
             s32 t = ip->op == OP_BRT || ip->op == OP_BRF ? (s32)i + ip->b : (s32)i + 1 + ip->b;
+            int taken = ip->op == OP_BRT || ip->op == OP_SKIPT;
+            if (!x->noflags && x->fslot == ip->a && x->fat == x->n) {
+                /* the setp just before: its flags (lea and the stores keep them) */
+                x->pend++;
+                count(x);
+                jto(x, taken ? x->fcc : x->fcc ^ 1, (u32)t);
+                ntr++;
+                continue;
+            }
             ld(x, RAX, ip->a, 0);
             rr(x, 0, 0, 0x85, RAX, RAX); /* test eax, eax */
             x->pend++;
             count(x);
-            jto(x, ip->op == OP_BRT || ip->op == OP_SKIPT ? CC_NE : CC_E, (u32)t);
+            jto(x, taken ? CC_NE : CC_E, (u32)t);
             ntr++;
             continue;
         }
@@ -1141,7 +1197,7 @@ void mc_jit_compile(McFunc *f)
         FILE *o;
         sprintf(nm, "jit_%.80s.bin", f->name);
         if ((o = fopen(nm, "wb")) != 0) {
-            fwrite(mem, 1, x->n, o);
+            fwrite(jt->code, 1, x->n, o);
             fclose(o);
         }
         sprintf(nm, "jit_%.80s.off", f->name);

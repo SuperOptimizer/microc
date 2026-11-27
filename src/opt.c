@@ -4546,6 +4546,239 @@ static void inc_sink(Func *fn)
     }
 }
 
+/* Several sums p + constant of one p, and from some place on nothing else reads p: one of them (one that is a value
+   anyway, not only an address) is made there, and the others from it, (p + k) + (c - k), so that p ends where p + k
+   begins and the two share a register (p a phi: a value that goes round a loop). The folding of (p + 4) + 4 into p + 8 kept an interpreter's pc alive beside
+   pc + 4 through every case of its switch (a second register, and a copy back at the end of each case), and its
+   sp beside sp - 8 in each case. Within a block when p is not read after it; else every reader of p outside the
+   block has to be such a sum in a block this one dominates. MCC_NOADDCHAIN: off. */
+static int ac_sum(u32 v, u32 p)
+{
+    const Ins *i = &f->ins[v];
+    return i->op == OP_ADD && (i->ty == IT_I32 || i->ty == IT_I64) && f->ins[ir_resolve(f, i->b)].op == OP_CONST &&
+           (p ? ir_resolve(f, i->a) == p : f->ins[ir_resolve(f, i->a)].op != OP_CONST);
+}
+
+static int add_chain(Func *fn)
+{
+    static int off = -1;
+    u32 b, v, w, k, n, *ops, *start, *list, *ustart, *ulist, *pos, *livein, *stack, nins, nu = 0, p, made = 0;
+    u8 *isval;
+    if (off < 0)
+        off = getenv("MCC_NOADDCHAIN") != 0;
+    if (off)
+        return 0;
+    f = fn;
+    nins = f->nins;
+    /* the sums p + constant of each p that goes round a loop (a phi: its register is the one its next value wants);
+       list[start[p] .. start[p + 1] - 1] once filled, block by block in the blocks' order */
+    start = (u32 *)xmalloc((nins + 2) * sizeof(u32));
+    memset(start, 0, (nins + 2) * sizeof(u32));
+    n = 0;
+#define AC_P(v) (ac_sum(v, 0) && f->ins[ir_resolve(f, f->ins[v].a)].op == OP_PHI)
+    for (b = 1; b < f->nblk; b++)
+        if (f->blk[b].term != TERM_NONE)
+            for (v = f->blk[b].first; v; v = f->ins[v].next)
+                if (AC_P(v)) {
+                    start[ir_resolve(f, f->ins[v].a) + 2]++;
+                    n++;
+                }
+    for (v = 0, k = 0; v < nins; v++)
+        k |= start[v + 2] > 1;
+    if (!k) {
+        free(start);
+        return 0;
+    }
+    for (v = 1; v < nins + 2; v++)
+        start[v] += start[v - 1];
+    list = (u32 *)xmalloc((n + 1) * sizeof(u32));
+    for (b = 1; b < f->nblk; b++)
+        if (f->blk[b].term != TERM_NONE)
+            for (v = f->blk[b].first; v; v = f->ins[v].next)
+                if (AC_P(v))
+                    list[start[ir_resolve(f, f->ins[v].a) + 1]++] = v;
+#undef AC_P
+    /* where each of those p is read: the block, or with the top bit the block a phi takes it from; and which
+       values are read as values (1: not only as the address of a load or store, or by such a sum), or in another
+       block than their own (2) */
+    ustart = (u32 *)xmalloc((nins + 2) * sizeof(u32));
+    isval = (u8 *)xmalloc(nins);
+    ulist = 0;
+    for (k = 0; k < 2; k++) { /* count, then fill */
+        u32 j;
+        if (k == 0) {
+            memset(ustart, 0, (nins + 2) * sizeof(u32));
+            memset(isval, 0, nins);
+        } else {
+            for (v = 1; v < nins + 2; v++)
+                ustart[v] += ustart[v - 1];
+            ulist = (u32 *)xmalloc((nu + 1) * sizeof(u32));
+        }
+#define AC_USE(x, at) \
+    if ((x) < nins && start[(x) + 1] - start[x] > 1) { \
+        if (k == 0) { \
+            ustart[(x) + 2]++; \
+            nu++; \
+        } else { \
+            ulist[ustart[(x) + 1]++] = (at); \
+        } \
+    }
+        for (b = 1; b < f->nblk; b++) {
+            Block *ub = &f->blk[b];
+            if (ub->term == TERM_NONE)
+                continue;
+            for (v = ub->phis; v; v = f->ins[v].next)
+                for (j = 0; j < f->ins[v].b; j++) {
+                    u32 x = ir_resolve(f, f->xargs[f->ins[v].a + j]);
+                    AC_USE(x, ub->preds[j] | 0x80000000U)
+                    if (x < nins)
+                        isval[x] |= 1;
+                }
+            for (v = ub->first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                int addr = i->op == OP_LOAD || i->op == OP_STORE, sum = k == 0 && ac_sum(v, 0);
+                IR_OPS(f, i, ops, n);
+                for (j = 0; j < n; j++) {
+                    u32 x = ir_resolve(f, ops[j]);
+                    AC_USE(x, b)
+                    if (k == 0 && x < nins)
+                        isval[x] |= (u8)((!(j == 0 && addr) && !sum) | (f->ins[x].blk != b) << 1);
+                }
+                if (i->op == OP_CALL) {
+                    u32 x = ir_resolve(f, i->c);
+                    AC_USE(x, b)
+                    if (x < nins)
+                        isval[x] |= 1;
+                }
+            }
+            if (ub->arg) {
+                u32 x = ir_resolve(f, ub->arg);
+                AC_USE(x, b)
+                if (x < nins)
+                    isval[x] |= 1;
+            }
+        }
+#undef AC_USE
+    }
+    compute_dom();
+    pos = (u32 *)xmalloc(nins * sizeof(u32));
+    livein = (u32 *)xmalloc(f->nblk * 2 * sizeof(u32)); /* [b] == p: p is live into b; [nblk + b] == p: out of it */
+    memset(livein, 0, f->nblk * 2 * sizeof(u32));
+    stack = (u32 *)xmalloc(f->nblk * sizeof(u32));
+    for (p = 1; p < nins; p++) {
+        u32 pb = f->ins[p].blk, sp = 0, nuse = ustart[p + 1] - ustart[p], lastb = 0, kb;
+        int ty;
+        if (start[p + 1] - start[p] < 2)
+            continue;
+        ty = f->ins[list[start[p]]].ty;
+        for (k = start[p]; k < start[p + 1] && f->ins[list[k]].ty == ty; k++)
+            ;
+        if (k < start[p + 1])
+            continue;
+        /* where p is alive: from each place it is read, back to where it is made */
+        for (k = ustart[p]; k < ustart[p + 1]; k++) {
+            u32 x = ulist[k] & 0x7fffffffU;
+            if (ulist[k] & 0x80000000U)
+                livein[f->nblk + x] = p;
+            if (x != pb && livein[x] != p) {
+                livein[x] = p;
+                stack[sp++] = x;
+            }
+        }
+        while (sp) {
+            u32 x = stack[--sp];
+            for (k = 0; k < f->blk[x].npreds; k++) {
+                u32 q = f->blk[x].preds[k];
+                livein[f->nblk + q] = p;
+                if (q != pb && livein[q] != p) {
+                    livein[q] = p;
+                    stack[sp++] = q;
+                }
+            }
+        }
+        for (kb = start[p]; kb < start[p + 1]; kb++) {
+            Block *bb;
+            u32 lastx = 0, np = 0, base = 0, nsum = 0, inblock = 0, u, outside = 0;
+            int liveout, ok = 1;
+            b = f->ins[list[kb]].blk;
+            if (b == lastb || !ac_sum(list[kb], p))
+                continue;
+            lastb = b;
+            bb = &f->blk[b];
+            if (bb->term == TERM_NONE || rpo_num[b] == 0xffffffffU || (bb->arg && ir_resolve(f, bb->arg) == p))
+                continue;
+            liveout = livein[f->nblk + b] == p;
+            /* the block: the last place where something other than such a sum reads p */
+            for (u = bb->first; u; u = f->ins[u].next) {
+                Ins *ui = &f->ins[u];
+                u32 r = 0;
+                np++;
+                if (u < nins)
+                    pos[u] = np;
+                IR_OPS(f, ui, ops, n);
+                for (k = 0; k < n; k++)
+                    r += ir_resolve(f, ops[k]) == p;
+                if (ui->op == OP_CALL)
+                    r += ir_resolve(f, ui->c) == p;
+                inblock += r;
+                if (r && !(u < nins && ac_sum(u, p) && r == 1))
+                    lastx = np;
+            }
+            /* the sums after that place; one elsewhere has to be in a block this one dominates when p lives on */
+            for (k = start[p]; k < start[p + 1] && ok; k++) {
+                w = list[k];
+                if (!ac_sum(w, p))
+                    continue; /* (made from another sum by now) */
+                if (f->ins[w].blk == b)
+                    nsum += pos[w] > lastx;
+                else if (rpo_num[f->ins[w].blk] == 0xffffffffU || !dominates(b, f->ins[w].blk))
+                    ok = !liveout;
+                else
+                    outside++;
+            }
+            if (!ok || !nsum || nsum + (liveout ? outside : 0) < 2 || (liveout && nuse != inblock + outside))
+                continue;
+            /* the one the others are made from: the first that is a value anyway */
+            for (u = bb->first; u && !base; u = f->ins[u].next)
+                if (u < nins && pos[u] > lastx && ac_sum(u, p) && (isval[u] & (liveout ? 1 : 3)))
+                    base = u;
+            if (!base)
+                continue;
+            /* it goes in front of the first of the sums after that place */
+            for (u = bb->first; u; u = f->ins[u].next)
+                if (u < nins && pos[u] > lastx && ac_sum(u, p))
+                    break;
+            if (u != base) {
+                ir_remove(f, base);
+                ir_insert_before(f, u, base);
+            }
+            for (k = start[p]; k < start[p + 1]; k++) {
+                u64 cv = 0, cw = 0;
+                u32 nc;
+                w = list[k];
+                if (w == base || !ac_sum(w, p) || (f->ins[w].blk == b ? pos[w] <= lastx : !liveout))
+                    continue;
+                ir_is_const(f, ir_resolve(f, f->ins[base].b), &cv);
+                ir_is_const(f, ir_resolve(f, f->ins[w].b), &cw);
+                nc = ir_const(f, ty, cw - cv);
+                f->ins[w].a = base;
+                f->ins[w].b = nc;
+                nuse--;
+                made = 1;
+            }
+        }
+    }
+    free(stack);
+    free(livein);
+    free(pos);
+    free(isval);
+    free(ulist);
+    free(ustart);
+    free(list);
+    free(start);
+    return (int)made;
+}
+
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
@@ -4557,8 +4790,11 @@ void opt_finish(Func *fn)
         addr_shape(fn);
         br_bools(fn);
     }
-    if (!opt_dev_fn && !opt_cuda && opt_level >= 2)
+    if (!opt_dev_fn && !opt_cuda && opt_level >= 2) {
         inc_sink(fn);
+        if (add_chain(fn))
+            inc_sink(fn); /* (the sums made over: (p + 4) + 4 after the last read of p + 4) */
+    }
     ir_loc = saved;
 }
 

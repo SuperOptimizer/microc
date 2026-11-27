@@ -14,7 +14,9 @@ compiler, assembler, linker, archiver and C library. Target: arm64 macOS.
     build/stage0/mcc -fno-strict-aliasing file.c   see "Aliasing" below
     build/stage0/mcc -flto a.c b.c -o prog         see "Link-time optimisation" below
     build/stage0/mcc -finline-limit=N file.c       inline functions of up to N instructions (default 12; 0 turns it off)
-    build/stage0/mcc -Os file.c                    prefer small code: less inlining, loops tested once at the top
+    build/stage0/mcc -O0 / -O1 / -O2 file.c        no optimisation / the basic passes (also -O, -Og) / everything (-O2 = -O3 = the default)
+    build/stage0/mcc -Os file.c                    prefer small code: less inlining, loops tested once at the top (also -Oz)
+    build/stage0/mcc -Ofast file.c                 -O3 -ffast-math, as gcc's
     build/stage0/mcc -fno-jump-tables file.c       a switch stays a tree of comparisons
     build/stage0/mcc -ffp-contract=fast file.c     a * b + c is rounded once (fmadd); off by default
     build/stage0/mcc -jN a.c b.c c.c               compile up to N files at once (default: one per processor; -j1 for none)
@@ -184,7 +186,9 @@ build ran ~32x slower. ufsm keeps both off under mcc.
 
 ## -O3
 
-The default pipeline is tuned for compile speed. `-O3` spends more:
+`-O2`, `-O3` and no option at all are one level: everything that makes code faster (`-O1` and `-Og`: the basic
+passes; `-Os` / `-Oz`: what does not make code bigger; `-Ofast`: this with `-ffast-math`). Against the basic
+pipeline it spends more:
 
 - the value-numbering and control-flow passes repeat until nothing changes
   (3.5% more compile work for 0.4% less code on mcc itself);

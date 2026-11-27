@@ -6,7 +6,7 @@
 #include <string.h>
 
 int opt_size;
-int opt_level = 2; /* 3: spend compile time freely */
+int opt_level = 3; /* the default and -O2 and -O3 alike; 1: -O1, -Og; 0: -O0 */
 int opt_inline_limit = 12; /* instructions, beyond one per parameter */
 int opt_inline_host = 20;  /* the same for host code: a helper of two library calls and a little arithmetic goes into its
                               callers, where what it computes is often already there (ufsm's CPU tests: -1.3 % instructions,

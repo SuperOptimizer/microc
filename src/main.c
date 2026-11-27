@@ -699,10 +699,15 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_inline_hot = atoi(a + 13);
         else if (strncmp(a, "-fhot-shift=", 12) == 0)
             opt_hot_shift = atoi(a + 12);
-        else if (strcmp(a, "-O0") == 0 || strcmp(a, "-O1") == 0 || strcmp(a, "-O2") == 0 || strcmp(a, "-O") == 0)
-            opt_level = a[2] ? a[2] - '0' : 1; /* (-O1: the default passes without the -O2 extras; -O2 the default) */
-        else if (strcmp(a, "-O3") == 0)
-            opt_level = 3;
+        else if (strcmp(a, "-O0") == 0)
+            opt_level = 0, opt_size = 0;
+        else if (strcmp(a, "-O1") == 0 || strcmp(a, "-O") == 0 || strcmp(a, "-Og") == 0)
+            opt_level = 1, opt_size = 0; /* (the default passes without the extras) */
+        else if (a[0] == '-' && a[1] == 'O' && a[2] >= '2' && a[2] <= '9' && !a[3])
+            opt_level = 3, opt_size = 0; /* -O2 is -O3, the default: everything that makes code faster */
+        else if (strcmp(a, "-Ofast") == 0)
+            opt_level = 3, opt_size = 0, opt_fast_math = 1, opt_math_errno = 0, opt_finite_math = 1, opt_no_signed_zeros = 1,
+            opt_reciprocal_math = 1, opt_fp_contract = 1; /* -O3 -ffast-math, as gcc's and clang's */
         else if (strcmp(a, "-fvec-report") == 0)
             opt_vec_report = 1;
         else if (strcmp(a, "-fvec-gather") == 0)
@@ -736,8 +741,8 @@ static int cc_main(const char *argv0, int argc, char **argv)
             opt_math_errno = 0;
         else if (strcmp(a, "-fmath-errno") == 0)
             opt_math_errno = 1;
-        else if (strcmp(a, "-Os") == 0)
-            opt_size = 1;
+        else if (strcmp(a, "-Os") == 0 || strcmp(a, "-Oz") == 0)
+            opt_level = 3, opt_size = 1; /* what does not make code bigger */
         else if (strncmp(a, "--target=", 9) == 0)
         {
             opt_target = strstr(a, "linux") ? TARGET_LINUX : TARGET_MACOS;

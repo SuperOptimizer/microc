@@ -438,6 +438,7 @@ static u8 *cn_s; /* the value is an address in the .const space (cn_find) */
 static u8 *ause;
 static u8 *wuse; /* reads of a 32-bit number made wider by products that take it as it was (wide_mul) */
 static int opt_nowuse = -1; /* MCC_NOWUSE: the widening is written all the same */
+static int opt_noshmask = -1; /* MCC_NOSHMASK: a shift count is copied, then masked */
 static u8 *xlate; /* a 32-bit number made wider that a wide product reads as it was, where the product is */
 
 /* The address of a local or a global object, in a register of its own for this one reader: held in one
@@ -2081,6 +2082,19 @@ static void emit_ins(u32 v)
         a = ropnd(i->a);
         if (ir_is_const(PF, cv, &c)) {
             P("\t%s.%s %s, %s, %u;\n", op, tt, reg(v), a, (unsigned)(c & (ty == IT_I64 ? 63 : 31)));
+            return;
+        }
+        if (opt_noshmask < 0)
+            opt_noshmask = getenv("MCC_NOSHMASK") != 0;
+        if (!opt_noshmask && PF->ins[cv].ty == IT_I32) {
+            /* the count masked where it is (no copy first), or not at all when it is known to be below the width */
+            if (ir_umax32(PF, cv) <= (u64)(ty == IT_I64 ? 63 : 31)) {
+                P("\t%s.%s %s, %s, %s;\n", op, tt, reg(v), a, reg(cv));
+                return;
+            }
+            t = temp(0);
+            P("\tand.b32 %s, %s, %d;\n", t, reg(cv), ty == IT_I64 ? 63 : 31);
+            P("\t%s.%s %s, %s, %s;\n", op, tt, reg(v), a, t);
             return;
         }
         t = temp(0);

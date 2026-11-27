@@ -4179,6 +4179,8 @@ static void unswitch(Func *fn)
     }
 }
 
+static void iv_reduce(Func *fn);
+
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
@@ -4186,6 +4188,7 @@ void opt_finish(Func *fn)
     finish_passes(fn);
     if (opt_arch == ARCH_X64 && !opt_dev_fn && !opt_cuda && opt_level >= 2) {
         iv_widen(fn);
+        iv_reduce(fn);
         addr_shape(fn);
         br_bools(fn);
     }
@@ -4464,6 +4467,249 @@ static void iv_widen(Func *fn)
         unlink_phi(cand[k].h, nx, cand[k].pre);
     }
     free(role);
+    if (done) {
+        ir_resolve_all(f);
+        opt_dce(f);
+    }
+}
+
+/* x86-64 host, after iv_widen: strength reduction. In a loop with a 64-bit counter p (p, p + c, ...), a value made
+   from p by additions, subtractions, constant shifts and constant products with values fixed for the loop is
+   K * p + B; where K is not a scale the selector folds into an address (+-1, 2, 4, 8), the loop's uses of it take a
+   counter of its own instead: worked out once in front of the loop (the same instructions, the first p in place of p)
+   and advanced by K * c each time round. Exact, as all of it is arithmetic mod 2^64. matmul's b[k][j] was
+   k * 960 (shl, sub, shl, add) every trip. MCC_NOIVSR: off. */
+#define SR_MAX 4
+static u8 *sr_in;     /* block in the loop */
+static u8 *sr_lin;    /* value linear in the counter */
+static i64 *sr_k;     /* its factor */
+static u32 *sr_clone; /* its copy in front of the loop (for the root being done) */
+
+static int sr_inv(u32 v)
+{
+    return !f->ins[v].blk || !sr_in[f->ins[v].blk];
+}
+
+static u32 sr_copy(u32 v, u32 p, u32 init, u32 pre, u32 nins0)
+{
+    Ins *i;
+    u32 a, b, n;
+    v = ir_resolve(f, v);
+    if (v == p)
+        return init;
+    if (v >= nins0 || sr_inv(v))
+        return v;
+    if (sr_clone[v])
+        return sr_clone[v];
+    i = &f->ins[v];
+    a = sr_copy(i->a, p, init, pre, nins0);
+    b = sr_copy(i->b, p, init, pre, nins0);
+    {
+        u32 cur = f->cur;
+        f->cur = pre;
+        n = ir_ins(f, i->op, i->ty, a, b); /* (folded where it can be: the first p is often 0) */
+        f->cur = cur;
+    }
+    sr_clone[v] = n;
+    return n;
+}
+
+/* the instructions of the loop that make v from the counter (at most 8 counted) */
+static u32 sr_cost(u32 v, u32 p, u32 nins0, int depth)
+{
+    Ins *i;
+    u32 n;
+    v = ir_resolve(f, v);
+    if (v == p || v >= nins0 || sr_inv(v) || depth > 8)
+        return 0;
+    i = &f->ins[v];
+    n = 1 + sr_cost(i->a, p, nins0, depth + 1);
+    if (i->op == OP_ADD || i->op == OP_SUB)
+        n += sr_cost(i->b, p, nins0, depth + 1);
+    return n;
+}
+
+static void iv_reduce(Func *fn)
+{
+    static int off = -1, log;
+    u32 k, h, nins0, done = 0;
+    if (off < 0) {
+        off = getenv("MCC_NOIVSR") != 0;
+        log = getenv("MCC_IVSRLOG") != 0;
+    }
+    if (off || fn->nins > 400000)
+        return;
+    f = fn;
+    compute_dom();
+    nins0 = f->nins;
+    sr_in = (u8 *)xmalloc(f->nblk + nins0);
+    sr_lin = sr_in + f->nblk;
+    sr_k = (i64 *)xmalloc(nins0 * sizeof(i64));
+    sr_clone = (u32 *)xmalloc(nins0 * sizeof(u32));
+    for (k = 0; k < nrpo; k++) {
+        u32 pi, li, pre, lat, ph, *stack, sp = 0, b, v, j, nroot = 0, roots[SR_MAX];
+        Block *hb;
+        h = rpo[k];
+        hb = &f->blk[h];
+        if (hb->npreds != 2 || rpo_num[hb->preds[0]] == 0xffffffffU || rpo_num[hb->preds[1]] == 0xffffffffU)
+            continue;
+        li = dominates(h, hb->preds[0]) ? 0 : 1;
+        pi = 1 - li;
+        lat = hb->preds[li];
+        pre = hb->preds[pi];
+        if (!dominates(h, lat) || dominates(h, pre))
+            continue;
+        /* the loop: what reaches the way back without passing h */
+        memset(sr_in, 0, f->nblk);
+        sr_in[h] = 1;
+        stack = (u32 *)xmalloc(f->nblk * sizeof(u32));
+        if (!sr_in[lat])
+            sr_in[lat] = 1, stack[sp++] = lat;
+        while (sp) {
+            b = stack[--sp];
+            for (j = 0; j < f->blk[b].npreds; j++) {
+                u32 q = f->blk[b].preds[j];
+                if (!sr_in[q] && rpo_num[q] != 0xffffffffU)
+                    sr_in[q] = 1, stack[sp++] = q;
+            }
+        }
+        free(stack);
+        for (ph = hb->phis; ph && nroot < SR_MAX; ph = f->ins[ph].next) {
+            Ins *pi_ = &f->ins[ph], *ni;
+            u32 next, init, x, r;
+            u64 cv;
+            i64 c;
+            if (pi_->ty != IT_I64 || pi_->b != 2)
+                continue;
+            next = ir_resolve(f, f->xargs[pi_->a + li]);
+            init = ir_resolve(f, f->xargs[pi_->a + pi]);
+            ni = &f->ins[next];
+            if (next >= nins0 || ni->op != OP_ADD || ni->ty != IT_I64 || !ni->blk || !sr_in[ni->blk])
+                continue;
+            x = ir_resolve(f, ni->a) == ph ? ir_resolve(f, ni->b) : ir_resolve(f, ni->b) == ph ? ir_resolve(f, ni->a) : 0;
+            if (!x || !ir_is_const(f, x, &cv) || !cv)
+                continue;
+            c = (i64)cv;
+            /* the linear values, in order (an operand is made before its use, except through phis) */
+            memset(sr_lin, 0, nins0);
+            sr_lin[ph] = 1;
+            sr_k[ph] = 1;
+            for (j = 0; j < nrpo; j++) {
+                b = rpo[j];
+                if (!sr_in[b])
+                    continue;
+                for (v = f->blk[b].first; v; v = f->ins[v].next) {
+                    Ins *i = &f->ins[v];
+                    u32 a, bb;
+                    u64 kc;
+                    if (v >= nins0 || i->ty != IT_I64)
+                        continue;
+                    if (i->op == OP_ADD || i->op == OP_SUB) {
+                        a = ir_resolve(f, i->a);
+                        bb = ir_resolve(f, i->b);
+                        if (a >= nins0 || bb >= nins0 || (!sr_lin[a] && !sr_inv(a)) || (!sr_lin[bb] && !sr_inv(bb)) ||
+                            (!sr_lin[a] && !sr_lin[bb]))
+                            continue;
+                        sr_k[v] = (i64)((u64)(sr_lin[a] ? sr_k[a] : 0) +
+                                        (i->op == OP_ADD ? 1 : (u64)-1) * (u64)(sr_lin[bb] ? sr_k[bb] : 0));
+                        sr_lin[v] = 1;
+                    } else if ((i->op == OP_SHL || i->op == OP_MUL) && (a = ir_resolve(f, i->a)) < nins0 && sr_lin[a] &&
+                               ir_is_const(f, ir_resolve(f, i->b), &kc) && (i->op == OP_MUL || kc < 64)) {
+                        sr_k[v] = (i64)(i->op == OP_SHL ? (u64)sr_k[a] << kc : (u64)sr_k[a] * kc);
+                        sr_lin[v] = 1;
+                    }
+                }
+            }
+            /* the roots: linear values with a factor no address takes, used in the loop by what is not linear */
+            for (j = 0; j < nrpo && nroot < SR_MAX; j++) {
+                b = rpo[j];
+                if (!sr_in[b])
+                    continue;
+                for (v = f->blk[b].first; v && nroot < SR_MAX; v = f->ins[v].next) {
+                    Ins *i = &f->ins[v];
+                    u32 *ops, nops, o;
+                    if (v >= nins0 || sr_lin[v] || i->op == OP_PHI)
+                        continue;
+                    IR_OPS(f, i, ops, nops);
+                    for (o = 0; o < nops && nroot < SR_MAX; o++) {
+                        u32 q = ir_resolve(f, ops[o]), z;
+                        u64 kk;
+                        if (q >= nins0 || !sr_lin[q] || q == ph || q == next)
+                            continue;
+                        /* (x + 4, x + 8, ...: the fields of one record) x is the root, and the additions stay */
+                        while (f->ins[q].op == OP_ADD) {
+                            u32 a0 = ir_resolve(f, f->ins[q].a), b0 = ir_resolve(f, f->ins[q].b), o2;
+                            u64 kc;
+                            if (ir_is_const(f, b0, &kc))
+                                o2 = a0;
+                            else if (ir_is_const(f, a0, &kc))
+                                o2 = b0;
+                            else
+                                break;
+                            if (o2 >= nins0 || !sr_lin[o2] || o2 == ph || o2 == next)
+                                break;
+                            q = o2;
+                        }
+                        kk = (u64)sr_k[q];
+                        if ((i64)kk < 0)
+                            kk = (u64)0 - kk; /* (b - p * 4 is a subtraction and an address: queens' diagonals) */
+                        if (!kk || kk == 1 || kk == 2 || kk == 4 || kk == 8)
+                            continue;
+                        if (f->ins[q].op != OP_MUL && sr_cost(q, ph, nins0, 0) < 2)
+                            continue; /* (one shift for one addition and a register) */
+                        for (z = 0; z < nroot && roots[z] != q; z++)
+                            ;
+                        if (z == nroot)
+                            roots[nroot++] = q;
+                    }
+                }
+            }
+            for (r = 0; r < nroot; r++) {
+                u32 R = roots[r], q, qn, st, args[2];
+                memset(sr_clone, 0, nins0 * sizeof(u32));
+                st = sr_copy(R, ph, init, pre, nins0);
+                q = ir_phi(f, h, IT_I64);
+                qn = ir_raw(f, OP_ADD, IT_I64, q, ir_const(f, IT_I64, (u64)sr_k[R] * (u64)c));
+                ir_append(f, lat, qn);
+                args[pi] = st;
+                args[li] = qn;
+                ir_phi_set_args(f, q, args, 2);
+                /* the loop's uses of R take q (it is R's value wherever the loop is) */
+                for (j = 0; j < nrpo; j++) {
+                    b = rpo[j];
+                    if (!sr_in[b])
+                        continue;
+                    for (v = f->blk[b].first; v; v = f->ins[v].next) {
+                        Ins *i = &f->ins[v];
+                        u32 *ops, nops, o;
+                        if (v >= nins0)
+                            continue;
+                        IR_OPS(f, i, ops, nops);
+                        for (o = 0; o < nops; o++)
+                            if (ir_resolve(f, ops[o]) == R)
+                                ops[o] = q;
+                    }
+                    for (v = f->blk[b].phis; v; v = f->ins[v].next) {
+                        Ins *i = &f->ins[v];
+                        u32 o;
+                        if (v >= nins0 || v == q)
+                            continue;
+                        for (o = 0; o < i->b; o++)
+                            if (ir_resolve(f, f->xargs[i->a + o]) == R)
+                                f->xargs[i->a + o] = q;
+                    }
+                }
+                done++;
+                if (log)
+                    fprintf(stderr, "ivsr: %s block %u: factor %ld step %ld\n", f->name ? f->name : "?", h,
+                            (long)sr_k[R], (long)c);
+            }
+            sr_k[0] = 0;
+        }
+    }
+    free(sr_in);
+    free(sr_k);
+    free(sr_clone);
     if (done) {
         ir_resolve_all(f);
         opt_dce(f);

@@ -2585,10 +2585,12 @@ static void narrow_sums(void)
    block, made by one instruction that writes its result last, and every reader of P is an instruction of
    that block at or before X that reads its operands where it stands (a comparison is done over again where
    its result is wanted, and a fused product where its sum is). */
+static int opt_nocotl = -1;
+
 static void coalesce(const u8 *live)
 {
     Func *f = PF;
-    u32 nb = f->nblk, b, v, k, n, *p, at = 0;
+    u32 nb = f->nblk, b, v, k, n, *p, at = 0, *wh, *tl;
     u32 *pos = (u32 *)xmalloc(2 * (size_t)(f->nins + 1) * sizeof(u32)), *last = pos + f->nins + 1;
     memset(pos, 0, 2 * (size_t)(f->nins + 1) * sizeof(u32));
 #define NOSHARE 0xffffffffU
@@ -2598,6 +2600,66 @@ static void coalesce(const u8 *live)
         if (x_ && f->ins[x_].op == OP_PHI && last[x_] < (where)) \
             last[x_] = (where); \
     } while (0)
+    /* A value that is not worked out where it stands but again where it is read (a comparison, a fused product,
+       a widening that its readers take as it was, ...) reads its operands where its readers are: tl, the last of
+       them in its block (NOSHARE if one is elsewhere, or is a phi or a block's test). MCC_NOCOTL: such a value
+       reads its operands nowhere in particular (NOSHARE), as before. */
+    if (opt_nocotl < 0)
+        opt_nocotl = getenv("MCC_NOCOTL") != 0;
+    wh = (u32 *)xmalloc(2 * (size_t)(f->nins + 1) * sizeof(u32));
+    tl = wh + f->nins + 1;
+    memset(wh, 0, 2 * (size_t)(f->nins + 1) * sizeof(u32));
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            int redone = is_compare(i->op) || ptree[v] || (xrem && xrem[v]) || fused[v] || i->op == OP_SELECT || (sh_s && sh_t32[v] && sh_ext(v)) || xlate[v];
+            wh[v] = redone ? 0 : ++at; /* 0: what tl[v] says */
+            if (redone && opt_nocotl)
+                wh[v] = NOSHARE;
+            pos[v] = ++at;
+        }
+    }
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                tl[RV(f->xargs[f->ins[v].a + k])] = NOSHARE;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++) {
+                u32 x = RV(p[k]);
+                if (x && f->ins[x].blk != b)
+                    tl[x] = NOSHARE;
+            }
+            if (i->op == OP_CALL)
+                tl[RV(i->c)] = NOSHARE;
+        }
+        if (bb->arg)
+            tl[RV(bb->arg)] = NOSHARE;
+    }
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->last; v; v = f->ins[v].prev) {
+            Ins *i = &f->ins[v];
+            u32 w = wh[v] ? wh[v] : tl[v];
+            if (special_load(v))
+                continue;
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++) {
+                u32 x = RV(p[k]);
+                if (x && f->ins[x].blk == b && tl[x] != NOSHARE && (w == NOSHARE || tl[x] < w))
+                    tl[x] = w;
+            }
+        }
+    }
     for (b = 1; b < nb; b++) {
         Block *bb = &f->blk[b];
         if (!live[b])
@@ -2607,8 +2669,7 @@ static void coalesce(const u8 *live)
                 READ_BY(f->xargs[f->ins[v].a + k], NOSHARE);
         for (v = bb->first; v; v = f->ins[v].next) {
             Ins *i = &f->ins[v];
-            u32 where = is_compare(i->op) || ptree[v] || (xrem && xrem[v]) || fused[v] || i->op == OP_SELECT || (sh_s && sh_t32[v] && sh_ext(v)) || xlate[v] ? NOSHARE : ++at;
-            pos[v] = ++at;
+            u32 where = wh[v] ? wh[v] : tl[v] ? tl[v] : NOSHARE;
             if (special_load(v))
                 continue;
             IR_OPS(f, i, p, n);
@@ -2622,6 +2683,7 @@ static void coalesce(const u8 *live)
         if (bb->arg)
             READ_BY(bb->arg, NOSHARE);
     }
+    free(wh);
     for (b = 1; b < nb; b++) {
         Block *bb = &f->blk[b];
         if (!live[b])

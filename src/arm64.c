@@ -1977,6 +1977,25 @@ static void find_switches(void)
     free(nodes);
 }
 
+
+/* Do all the loads and stores that use address a access size bytes? The index of a folded base + index << k is
+   scaled by the access's size: an access of another size through the same address would scale it wrongly (a 4-byte
+   load through an address made for an 8-byte one, once -O3's hoisting gave both arms one address). */
+static int same_size_uses(u32 a, u32 size)
+{
+    u32 v;
+    for (v = 1; v < f->nins; v++) {
+        Ins *i = &f->ins[v];
+        u32 sz;
+        if (!i->blk || (i->op != OP_LOAD && i->op != OP_STORE) || i->a != a)
+            continue;
+        sz = i->mem <= M_8U ? 1 : i->mem <= M_16U ? 2 : i->mem == M_32 || i->mem == M_F32 ? 4 : 8;
+        if (sz != size)
+            return 0;
+    }
+    return 1;
+}
+
 static void prepare(void)
 {
     u32 b, v, k, n;
@@ -2168,7 +2187,7 @@ static void prepare(void)
                         y = a->a;
                     sh = y;
                     if (f->ins[y].op == OP_SHL && uses[y] == 1 && !fused[y] && ir_is_const(f, f->ins[y].b, &k) &&
-                        ((u64)1 << k) == size && size > 1)
+                        ((u64)1 << k) == size && size > 1 && same_size_uses(i->a, size))
                         y = f->ins[y].a;
                     else
                         sh = 0;

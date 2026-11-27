@@ -1042,17 +1042,40 @@ static int carve_one(Func *f, u32 s)
 
 static void slot_carve(Func *f)
 {
-    u32 s, n = f->nslots;
-    int any = 0;
+    u32 s, n = f->nslots, b, v;
+    int any = 0, log = getenv("MCC_CARVELOG") != 0;
+    u8 *cand;
+    if (!n)
+        return;
+    /* carve_one walks the whole function for its slot, and finds nothing to do unless some sum of the slot's
+       address has an array's extent: one walk here tells which slots have one (a function of many locals was
+       walked once per local, most of mcc's own compile time in its largest functions) */
+    cand = (u8 *)xmalloc(n);
+    memset(cand, 0, n);
+    for (b = 1; b < f->nblk; b++) {
+        if (f->blk[b].term == TERM_NONE)
+            continue;
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            if (i->op == OP_ADD && i->c && i->ty == IT_I64) {
+                u32 x = ir_resolve(f, i->a);
+                if (f->ins[x].op == OP_SLOT && f->ins[x].a < n)
+                    cand[f->ins[x].a] = 1;
+            }
+        }
+    }
     for (s = 0; s < n; s++) {
         int r;
+        if (!cand[s] && !log)
+            continue;
         r = carve_one(f, s);
-        if (getenv("MCC_CARVELOG") && f->slots[s].size >= 16)
+        if (log && f->slots[s].size >= 16)
             fprintf(stderr, "carve %s slot %lu size %lu: %d\n", f->name ? f->name : "?", (unsigned long)s, (unsigned long)f->slots[s].size, r * 10000 + (r ? 0 : carve_why));
         if (r < 0)
             die("slot_carve: an access across an array of slot %lu", (unsigned long)s);
         any |= r;
     }
+    free(cand);
     if (any)
         ir_resolve_all(f);
 }

@@ -20,7 +20,7 @@ void mc_fault(Blk *b, Thr *t, const char *fmt, const char *arg, u64 val)
     (void)fxnames;
     if (b->failed)
         return;
-    b->failed = 1;
+    b->failed = strncmp(fmt, "call of the undefined function", 30) == 0 ? 2 : 1; /* (2: a build error, mc_launch stops the program) */
     if (arg && strlen(arg) > 300)
         arg = "(long name)";
     sprintf(why, fmt, arg ? arg : "", val);
@@ -2294,7 +2294,7 @@ static void job_run(void *arg, int w)
             b->cta[1] = (u32)(k / L->grid[0] % L->grid[1]);
             b->cta[2] = (u32)(k / L->grid[0] / L->grid[1]);
             if (run_block(b, j->sync) < 0) {
-                job_fail(j, 719, b->msg);
+                job_fail(j, b->failed == 2 ? 218 : 719, b->msg);
                 break;
             }
         }
@@ -2441,9 +2441,21 @@ int mc_launch_buf(McFunc *f, const u32 grid[3], const u32 block[3], u64 shared_b
     mcuda_par(nw, job_run, j);
     rc = j->rc;
     if (rc) {
-        if (rc == 719)
+        if (rc == 719 || rc == 218)
             fprintf(stderr, "%s\n", j->msg);
         mc_set_error(j->msg);
+    }
+    if (rc == 218) {
+        /* a call of a function nothing defines: a build error, not a fault of this launch's data (as mcudahw's load_fatal: the GPU's run
+           time stops at the first launch too). MCUDA_LOAD_SOFT=1: return the error instead */
+        const char *v = getenv("MCUDA_LOAD_SOFT");
+        if (!(v && v[0] && v[0] != '0')) {
+            fprintf(stderr, "mcuda: fatal: kernel %s calls a function nothing defines; stopping (MCUDA_LOAD_SOFT=1: return the error)\n", f->name);
+            fflush(stderr);
+            abort();
+        }
+        fprintf(stderr, "mcuda: warning: MCUDA_LOAD_SOFT: the launch returns the error\n");
+        rc = 719; /* (what it returned before: a fault of the launch) */
     }
     mcuda_lock(MC_LOCK_MODULE);
     total_instructions += j->icount;

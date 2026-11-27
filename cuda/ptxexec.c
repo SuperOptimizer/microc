@@ -1943,6 +1943,8 @@ static u32 ws_mask(Thr *t)
 }
 
 /* Run the threads of one warp as far as they go. 1: something ran; 0: nothing could; -1: a fault. */
+static int nobarfast = -1; /* MCUDA_NOBARFAST: a barrier the translated code stopped at is run()'s */
+
 static int run_warp(Blk *b, u32 warp)
 {
     u32 base = warp * 32, nl = b->nthr - base < 32 ? b->nthr - base : 32, i, j;
@@ -1950,6 +1952,8 @@ static int run_warp(Blk *b, u32 warp)
     Thr *grp[32];
     Thr *all[32];
     McJitCtx jc;
+    if (nobarfast < 0)
+        nobarfast = getenv("MCUDA_NOBARFAST") != 0;
     jc.sh = b->shared;
     jc.shsz = b->shared_size;
     jc.h2f = mc_h2f_tab;
@@ -2016,6 +2020,16 @@ static int run_warp(Blk *b, u32 warp)
                     t->ip = ip;
                     if (mc_stats_on)
                         jit_exits[ip->op < OP_COUNT ? ip->op : 0]++;
+                    if (ip->op == OP_BAR && !nobarfast) {
+                        /* what run() would do with it, without run(): the thread waits, or goes on after it */
+                        int through;
+                        b->icount++;
+                        t->ip = ip; /* (bar_release reads the barrier of the thread that completes it there) */
+                        through = bar_op(b, t, ip);
+                        t->ip = ip + 1;
+                        if (!through)
+                            continue;
+                    }
                 }
             }
             switch (run(b, t)) {

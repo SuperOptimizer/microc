@@ -880,7 +880,7 @@ static int bound_of(Func *f, u32 c, int below, u32 *x, u64 *k, int *uns)
 static u32 fold(Func *f, int op, int ty, u32 a, u32 b)
 {
     Ins *ia = &f->ins[a], *ib = &f->ins[b];
-    u64 x, y, r;
+    u64 x, y = 0, r;
     double dx, dy;
     int ca, cb;
 

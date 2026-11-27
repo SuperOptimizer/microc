@@ -6095,6 +6095,27 @@ static u32 fx_len(const Fixup *fx)
 }
 
 static int opt_nojj = -1; /* MCC_NOJJ: jumps to a jump stay */
+static int opt_nojccj = -1;
+
+/* Where control that comes to offset off ends up after the unconditional jumps (long forms, as written) there. */
+static u32 jmp_lands(const u32 *blk_off, u32 off)
+{
+    u32 hops;
+    for (hops = 0; hops < 8; hops++) {
+        u32 lo = 0, hi = nfixups;
+        while (lo < hi) {
+            u32 mid = (lo + hi) / 2;
+            if (fx_start(&fixups[mid]) < off)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == nfixups || fx_start(&fixups[lo]) != off || fixups[lo].kind != FK_JMP)
+            break;
+        off = blk_off[fixups[lo].target];
+    }
+    return off;
+}
 
 /* The jumps between blocks were all written in their long forms. Here "jcc A; jmp B; A:" becomes
    "jncc B" (when the two are in one block), jumps to the next instruction go, and the rest become short where the distance allows; the
@@ -6102,7 +6123,8 @@ static int opt_nojj = -1; /* MCC_NOJJ: jumps to a jump stay */
    in the function: the assembler keeps places in its text.) */
 static void relax(u32 *blk_off, u32 first_rel, int fixed)
 {
-    u32 k, bi, removed = 0, src, dst, *cut, *nb;
+    u32 k, j, bi, removed = 0, src, dst, *cut, *nb;
+    u8 *tgt;
     int changed;
     if (opt_nojj < 0)
         opt_nojj = getenv("MCC_NOJJ") != 0;
@@ -6133,18 +6155,32 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
         }
         free(jf);
     }
+    /* which blocks a jump still goes to, now that jumps to jumps go past them (MCC_NOJCCJ: any block start stops
+       the swap below, as before) */
+    if (opt_nojccj < 0)
+        opt_nojccj = getenv("MCC_NOJCCJ") != 0;
+    tgt = (u8 *)xmalloc(mf.nblk + 1);
+    memset(tgt, opt_nojccj, mf.nblk + 1);
+    for (k = 0; k < nfixups; k++)
+        tgt[fixups[k].target] = 1;
     for (k = 0, bi = 0; k + 1 < nfixups; k++) {
         Fixup *a = &fixups[k], *b = &fixups[k + 1];
+        int reached = 0;
         while (bi < mf.nblk && blk_off[bi] < b->off - 1)
             bi++;
-        if (bi < mf.nblk && blk_off[bi] == b->off - 1)
+        for (j = bi; j < mf.nblk && blk_off[j] == b->off - 1; j++)
+            reached |= tgt[j];
+        if (reached)
             continue; /* the second jump starts a block: others come to it */
-        if (a->kind == FK_JCC && b->kind == FK_JMP && a->off + 5 == b->off && blk_off[a->target] == b->off + 4) {
+        if (a->kind == FK_JCC && b->kind == FK_JMP && a->off + 5 == b->off &&
+            (blk_off[a->target] == b->off + 4 ||
+             (!opt_nojccj && jmp_lands(blk_off, blk_off[a->target]) == jmp_lands(blk_off, b->off + 4)))) {
             text->p[a->off - 1] ^= 1;
             a->target = b->target;
             b->state = 2;
         }
     }
+    free(tgt);
     cut = (u32 *)xmalloc((nfixups + 1) * sizeof(u32)); /* bytes taken out before each jump */
     nb = (u32 *)xmalloc((mf.nblk + 1) * sizeof(u32));  /* where the blocks start now */
     do {

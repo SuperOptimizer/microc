@@ -2854,6 +2854,69 @@ static void coalesce_join(const u8 *live)
     free(mine);
 }
 
+/* y + (an object's address + k), k not 0 (an unrolled loop's a[k][tx]: bs + 64 * k + ...): (y + the address) + k, the
+   first part one value for the whole block, which every such sum of the block shares, and k where the address is
+   read ([%r32+64]) rather than mov bs, add 64, add y each time. MCC_NOADDRSPLIT: off. */
+static void addr_split(Func *f)
+{
+    static int off = -1;
+    u32 b, v;
+    if (off < 0)
+        off = getenv("MCC_NOADDRSPLIT") != 0;
+    if (off)
+        return;
+    for (b = 1; b < f->nblk; b++) {
+        u32 my[16], ms[16], mb[16], nm = 0;
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 a, c, y, k, base, sym;
+            i32 o;
+            if (i->op != OP_ADD || i->ty != IT_I64)
+                continue;
+            a = RV(i->a);
+            c = RV(i->b);
+            if (f->ins[a].op == OP_ADDR) {
+                u32 t = a;
+                a = c;
+                c = t;
+            }
+            if (f->ins[c].op != OP_ADDR || f->ins[a].op == OP_CONST || f->ins[a].op == OP_ADDR)
+                continue;
+            y = a;
+            sym = f->ins[c].a;
+            o = (i32)f->ins[c].b;
+            for (k = 0; k < nm && !(my[k] == y && ms[k] == sym); k++)
+                ;
+            if (!o) {
+                /* y + the address itself: the base, if there is none yet */
+                if (k == nm && nm < 16) {
+                    my[nm] = y;
+                    ms[nm] = sym;
+                    mb[nm++] = v;
+                } else if (k < nm) {
+                    i->a = mb[k];
+                    i->b = ir_const(f, IT_I64, 0);
+                }
+                continue;
+            }
+            if (k == nm) {
+                if (nm == 16)
+                    continue;
+                base = ir_raw(f, OP_ADD, IT_I64, y, ir_addr(f, sym, 0));
+                ir_insert_before(f, v, base);
+                my[nm] = y;
+                ms[nm] = sym;
+                mb[nm++] = base;
+            } else {
+                base = mb[k];
+            }
+            i = &f->ins[v];
+            i->a = base;
+            i->b = ir_const(f, IT_I64, (u64)(i64)o);
+        }
+    }
+}
+
 /* An assembly statement's operand that is read and written ("+f": a tensor product's running sums) is
    given its value by a move before the statement. Where the value read is itself such a result or a phi, of
    the statement's own block, and nothing else reads it, the result takes its register and there is no move;
@@ -4362,6 +4425,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     if (entry && opt_nospecial1)
         special_once(f);
     range_fold(f);
+    addr_split(f);
     if (ld_combine(f)) {
         /* (twice: a pair of halves made of pairs of bytes) */
         f->copies = 1;

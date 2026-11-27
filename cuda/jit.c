@@ -33,8 +33,10 @@ void sys_icache_invalidate(void *start, size_t len);
 #endif
 
 #ifndef MC_JIT
+#if !(defined(__x86_64__) && defined(__linux__)) /* (x86-64 Linux: jitx64.c) */
 void mc_jit_compile(McFunc *f) { (void)f; }
 void mc_jit_free(McFunc *f) { (void)f; }
+#endif
 #else
 
 typedef struct Stub {

@@ -143,7 +143,12 @@ typedef struct McJitCtx {
 #define MC_JIT_FAULT 0x40000000U /* in the result of the code: the instruction of that index has failed, mc_fault() is done */
 /* run from the code at word `at` until an instruction that the interpreter has to do; its index is the result
    (ctx->lane and ctx->nl have to be set) */
+#if defined(__x86_64__) && defined(__linux__)
+/* (jitx64.c: off is in bytes) */
+#define mc_jit_enter(jt, R, ctx, at) ((*(u32 (*)(Slot *, McJitCtx *, u8 *))(void *)(jt)->code)(R, ctx, (u8 *)(jt)->code + (at)))
+#else
 #define mc_jit_enter(jt, R, ctx, at) ((*(u32 (*)(Slot *, McJitCtx *, u32 *))(jt)->code)(R, ctx, (jt)->code + (at)))
+#endif
 
 typedef struct Gvar {
     struct Gvar *next;

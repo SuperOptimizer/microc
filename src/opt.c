@@ -4480,6 +4480,72 @@ static void unswitch(Func *fn)
 
 static void iv_reduce(Func *fn);
 
+/* p + k (or p - k) made before the block's last reads of p, and read only after them (*pc++: the next pc, then *pc):
+   made after them instead, so that p is dead where p + k is born and the two can share a register (the switch of
+   an interpreter: every case copied the next pc into pc's register on its way back). MCC_NOINCSINK: off. */
+static void inc_sink(Func *fn)
+{
+    static int off = -1;
+    u32 b, v, nx;
+    if (off < 0)
+        off = getenv("MCC_NOINCSINK") != 0;
+    if (off)
+        return;
+    f = fn;
+    for (v = 1; v < f->nins; v++)
+        f->ins[v].aux = 0;
+    for (b = 1; b < f->nblk; b++) {
+        Block *bb = &f->blk[b];
+        if (bb->term == TERM_NONE)
+            continue;
+        for (v = bb->first; v; v = nx) {
+            Ins *i = &f->ins[v];
+            u32 p, u, last = 0, *ops, n, k;
+            u64 c;
+            int used_before = 0;
+            nx = i->next;
+            if (i->aux)
+                continue; /* moved once already (two increments of one p would leap over each other for ever) */
+            if ((i->op != OP_ADD && i->op != OP_SUB) || (i->ty != IT_I32 && i->ty != IT_I64) || !ir_is_const(f, i->b, &c))
+                continue;
+            p = ir_resolve(f, i->a);
+            if (f->ins[p].op == OP_CONST)
+                continue;
+            /* the last instruction of the block that reads p, and whether one before it reads v */
+            for (u = i->next; u; u = f->ins[u].next) {
+                Ins *ui = &f->ins[u];
+                int rp = 0, rv = 0;
+                IR_OPS(f, ui, ops, n);
+                for (k = 0; k < n; k++) {
+                    u32 o = ir_resolve(f, ops[k]);
+                    rp |= o == p;
+                    rv |= o == v;
+                }
+                if (ui->op == OP_CALL) {
+                    u32 o = ir_resolve(f, ui->c);
+                    rp |= o == p;
+                    rv |= o == v;
+                }
+                if (rv && !rp)
+                    used_before = 1;
+                if (rp) {
+                    if (used_before || rv)
+                        break;
+                    last = u;
+                }
+            }
+            if (!last || used_before || u)
+                continue;
+            ir_remove(f, v);
+            if (f->ins[last].next)
+                ir_insert_before(f, f->ins[last].next, v);
+            else
+                ir_append(f, b, v);
+            f->ins[v].aux = 1;
+        }
+    }
+}
+
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
@@ -4491,6 +4557,8 @@ void opt_finish(Func *fn)
         addr_shape(fn);
         br_bools(fn);
     }
+    if (!opt_dev_fn && !opt_cuda && opt_level >= 2)
+        inc_sink(fn);
     ir_loc = saved;
 }
 

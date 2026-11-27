@@ -2336,6 +2336,240 @@ static int phis_under(u32 b, u32 p)
     return res;
 }
 
+/* x86-64 host, -O2: a call of the function to itself whose result is returned, or added to something and the sum
+   returned, with nothing done after it but arithmetic, becomes a jump back to the start: the parameters take the
+   call's arguments, and what would have been added is added to a running sum that every other return adds to its
+   value (clang's tail recursion elimination with an accumulator). fib (n - 1) + fib (n - 2): the second call is a
+   loop. Integer addition only, mod 2^n, so the order of the sums does not matter. Not in a function with stack
+   slots in use, alloca, variadic arguments or a returned record. MCC_NOTRE: off. */
+#define TRE_MAX 8
+static int tail_recursion(void)
+{
+    static int off = -1;
+    u32 site[TRE_MAX], scall[TRE_MAX], sadd[TRE_MAX], sret[TRE_MAX], nsite = 0;
+    u32 *uses, nuses, b, v, k, j, H, acc = 0, *pphi, *ophi, *args, nfirst;
+    int ty = f->ret_ty, isint = ty == IT_I32 || ty == IT_I64;
+    if (off < 0)
+        off = getenv("MCC_NOTRE") != 0;
+    if (off || f->variadic || f->has_sret || (!isint && ty != IT_VOID) || f->nparams > 16)
+        return 0;
+    for (b = 1; b < f->nblk; b++) {
+        if (f->blk[b].term == TERM_NONE)
+            continue;
+        for (v = f->blk[b].first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            u32 *ops, n;
+            if (i->op == OP_VASTART || i->op == OP_FRAMEADDR || (i->op == OP_CALL && (i->flags & (IF_ALLOCA | IF_ASM))))
+                return 0;
+            IR_OPS(f, i, ops, n);
+            for (j = 0; j < n; j++)
+                if (f->ins[ir_resolve(f, ops[j])].op == OP_SLOT)
+                    return 0;
+        }
+    }
+    uses = count_uses(&nuses);
+    for (b = 1; b < f->nblk && nsite < TRE_MAX; b++) {
+        Block *bb = &f->blk[b];
+        u32 r, c, R = 0, x;
+        Ins *ci;
+        if (bb->term == TERM_RET) {
+            r = bb->arg ? ir_resolve(f, bb->arg) : 0;
+        } else if (bb->term == TERM_JMP && f->blk[bb->succ[0]].term == TERM_RET && !f->blk[bb->succ[0]].first && bb->succ[0] != b) {
+            /* to a block that only returns (the value a phi of it) */
+            Block *rb = &f->blk[bb->succ[0]];
+            R = bb->succ[0];
+            if (isint) {
+                u32 ph = rb->arg ? ir_resolve(f, rb->arg) : 0;
+                if (!ph || f->ins[ph].op != OP_PHI || f->ins[ph].blk != R || rb->phis != ph || f->ins[ph].next || uses[ph] != 1)
+                    continue;
+                r = ir_resolve(f, f->xargs[f->ins[ph].a + pred_index(R, b)]);
+            } else {
+                if (rb->phis)
+                    continue;
+                r = 0;
+            }
+        } else {
+            continue;
+        }
+        /* the call: the last thing in the block but arithmetic */
+        for (c = bb->last; c && f->ins[c].op != OP_CALL; c = f->ins[c].prev)
+            if (!is_pure(f->ins[c].op) || f->ins[c].op == OP_ASMOUT)
+                break;
+        if (!c || f->ins[c].op != OP_CALL)
+            continue;
+        ci = &f->ins[c];
+        x = ir_resolve(f, ci->c);
+        if (ci->flags || f->ins[x].op != OP_ADDR || f->ins[x].a != f->sym || f->ins[x].b || ci->b != f->nparams ||
+            ci->ty != ty || (f->xargs[ci->a - 1] != f->nparams && f->xargs[ci->a - 1] != 0xffffffffU))
+            continue;
+        if (isint) {
+            Ins *ri = &f->ins[r];
+            if (r != c) {
+                u32 a;
+                if (!r || ri->op != OP_ADD || ri->ty != ty || ri->blk != b || uses[c] != 1 || uses[r] != 1)
+                    continue;
+                a = ir_resolve(f, ri->a) == c ? ir_resolve(f, ri->b) : ir_resolve(f, ri->b) == c ? ir_resolve(f, ri->a) : 0;
+                if (!a || a == c)
+                    continue;
+                if (f->ins[a].blk == b) { /* made before the call (so not from its result) */
+                    for (v = f->ins[c].next; v && v != a; v = f->ins[v].next)
+                        ;
+                    if (v)
+                        continue;
+                }
+                sadd[nsite] = a;
+            } else {
+                if (uses[c] != 1)
+                    continue;
+                sadd[nsite] = 0;
+            }
+        } else {
+            if (uses[c])
+                continue;
+            sadd[nsite] = 0;
+        }
+        site[nsite] = b;
+        scall[nsite] = c;
+        sret[nsite] = R;
+        nsite++;
+    }
+    free(uses);
+    if (!nsite)
+        return 0;
+    /* the start moves to a block of its own, H, which the sites jump back to */
+    H = ir_new_block(f);
+    f->blk[H].term = f->blk[1].term;
+    f->blk[H].arg = f->blk[1].arg;
+    f->blk[H].succ[0] = f->blk[1].succ[0];
+    f->blk[H].succ[1] = f->blk[1].succ[1];
+    for (k = 0; k < 2; k++) {
+        u32 sb = f->blk[H].succ[k];
+        if ((f->blk[H].term == TERM_BR || (k == 0 && f->blk[H].term == TERM_JMP)) && sb)
+            for (j = 0; j < f->blk[sb].npreds; j++)
+                if (f->blk[sb].preds[j] == 1)
+                    f->blk[sb].preds[j] = H;
+        if (f->blk[H].term == TERM_BR && f->blk[H].succ[0] == f->blk[H].succ[1])
+            break; /* (both ways to one block: its one entry was renamed) */
+    }
+    for (v = f->blk[1].first; v; v = nfirst) {
+        nfirst = f->ins[v].next;
+        if (f->ins[v].op == OP_PARAM)
+            continue;
+        ir_remove(f, v);
+        ir_append(f, H, v);
+    }
+    f->blk[1].term = TERM_JMP;
+    f->blk[1].arg = 0;
+    f->blk[1].succ[0] = H;
+    f->blk[1].succ[1] = 0;
+    ir_add_pred(f, H, 1);
+    for (k = 0; k < nsite; k++) {
+        if (site[k] == 1)
+            site[k] = H; /* (its instructions are H's now) */
+        ir_add_pred(f, H, site[k]);
+    }
+    /* the parameters' phis */
+    pphi = (u32 *)xmalloc((f->nparams + 1) * sizeof(u32));
+    args = (u32 *)xmalloc((nsite + 1) * sizeof(u32));
+    memset(pphi, 0, (f->nparams + 1) * sizeof(u32));
+    for (v = f->blk[1].first; v; v = f->ins[v].next)
+        if (f->ins[v].op == OP_PARAM && f->ins[v].a < f->nparams)
+            pphi[f->ins[v].a] = v;
+    ophi = (u32 *)xmalloc((f->nparams + 1) * sizeof(u32));
+    for (k = 0; k < f->nparams; k++) {
+        u32 p = pphi[k], ph;
+        ophi[k] = 0;
+        if (!p)
+            continue;
+        ph = ir_phi(f, H, f->ins[p].ty);
+        args[0] = p;
+        for (j = 0; j < nsite; j++)
+            args[j + 1] = ir_resolve(f, f->xargs[f->ins[scall[j]].a + k]);
+        ir_phi_set_args(f, ph, args, nsite + 1);
+        ophi[k] = ph;
+    }
+    /* every use of a parameter but the way in takes its phi (the calls' arguments and the sums' terms too) */
+    for (k = 0; k < f->nparams; k++) {
+        u32 p = pphi[k], ph = ophi[k];
+        if (!p)
+            continue;
+        for (b = 1; b < f->nblk; b++) {
+            if (f->blk[b].term == TERM_NONE)
+                continue;
+            for (v = f->blk[b].phis; v; v = f->ins[v].next)
+                for (j = b == H ? 1 : 0; j < f->ins[v].b; j++)
+                    if (ir_resolve(f, f->xargs[f->ins[v].a + j]) == p)
+                        f->xargs[f->ins[v].a + j] = ph;
+            for (v = f->blk[b].first; v; v = f->ins[v].next) {
+                Ins *i = &f->ins[v];
+                u32 *ops, n;
+                if (i->op == OP_PARAM)
+                    continue;
+                IR_OPS(f, i, ops, n);
+                for (j = 0; j < n; j++)
+                    if (ir_resolve(f, ops[j]) == p)
+                        ops[j] = ph;
+            }
+            if (f->blk[b].arg && ir_resolve(f, f->blk[b].arg) == p)
+                f->blk[b].arg = ph;
+        }
+        for (j = 0; j < nsite; j++)
+            if (sadd[j] == p)
+                sadd[j] = ph;
+    }
+    free(ophi);
+    if (isint) {
+        acc = ir_phi(f, H, ty);
+        args[0] = ir_const(f, ty, 0);
+        for (j = 0; j < nsite; j++) {
+            u32 a = sadd[j];
+            if (a) {
+                a = ir_raw(f, OP_ADD, ty, acc, a);
+                ir_append(f, site[j], a);
+            } else {
+                a = acc;
+            }
+            args[j + 1] = a;
+        }
+        ir_phi_set_args(f, acc, args, nsite + 1);
+    }
+    /* the sites jump back; the call and its sum go */
+    for (k = 0; k < nsite; k++) {
+        u32 sb = site[k], c = scall[k];
+        if (sret[k])
+            remove_pred(sret[k], pred_index(sret[k], sb));
+        if (isint) {
+            u32 r = c;
+            for (v = f->ins[c].next; v; v = f->ins[v].next)
+                if (f->ins[v].op == OP_ADD && (ir_resolve(f, f->ins[v].a) == c || ir_resolve(f, f->ins[v].b) == c))
+                    r = v;
+            if (r != c)
+                ir_remove(f, r);
+        }
+        ir_remove(f, c);
+        f->blk[sb].term = TERM_JMP;
+        f->blk[sb].arg = 0;
+        f->blk[sb].succ[0] = H;
+        f->blk[sb].succ[1] = 0;
+    }
+    /* every other return adds the sum */
+    for (b = 1; isint && b < f->nblk; b++) {
+        u32 t;
+        if (f->blk[b].term != TERM_RET || !f->blk[b].arg || (b != H && !f->blk[b].npreds))
+            continue;
+        t = ir_raw(f, OP_ADD, ty, acc, f->blk[b].arg);
+        ir_append(f, b, t);
+        f->blk[b].arg = t;
+    }
+    free(pphi);
+    free(args);
+    f->copies = 1;
+    compute_dom(); /* (simplify_cfg starts from the dominators as they are: H dominates the old start's ways now) */
+    if (getenv("MCC_TRELOG"))
+        fprintf(stderr, "tre: %s, %u calls\n", f->name ? f->name : "?", nsite);
+    return 1;
+}
+
 static int simplify_cfg(void)
 {
     u32 b, v, k;
@@ -5076,6 +5310,8 @@ static void run_passes(Func *fn)
         ir_resolve_all(f);
     if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2)
         sink_calls();
+    if (!opt_dev_fn && !opt_cuda && opt_arch == ARCH_X64 && opt_level >= 2 && tail_recursion())
+        ir_resolve_all(f);
     if (simplify_cfg()) {
         int rounds = opt_level >= 3 ? 6 : 1;
         do {

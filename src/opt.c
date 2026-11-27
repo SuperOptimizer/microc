@@ -2570,6 +2570,67 @@ static int tail_recursion(void)
     return 1;
 }
 
+/* *p = a; ...; if (c) { cheap; *p = b; }: *p = c ? b : a, the arm's cheap values worked out before the test (clang:
+   speculating a store into a select). B stores to p, then does nothing to memory up to its branch; one way is a
+   block that only B enters, works out at most four pure values and stores to the same p, and goes on where the
+   other way goes. Not in C++ (a volatile object there is read and written plainly). MCC_NOSTSEL: off. */
+extern int opt_cxx;
+static int opt_nostsel = -1;
+
+static int store_select(u32 b)
+{
+    Block *bb = &f->blk[b];
+    int side;
+    if (opt_nostsel < 0)
+        opt_nostsel = getenv("MCC_NOSTSEL") != 0;
+    if (opt_nostsel || opt_cxx || bb->term != TERM_BR || bb->succ[0] == bb->succ[1])
+        return 0;
+    for (side = 0; side < 2; side++) {
+        u32 t = bb->succ[side], j = bb->succ[!side], v, st, sb, n = 0, sel, nst, x;
+        Block *tb = &f->blk[t];
+        Ins *ti, *bi;
+        if (t == b || t == 1 || tb->npreds != 1 || tb->term != TERM_JMP || tb->succ[0] != j || tb->phis || !tb->last)
+            continue;
+        st = tb->last;
+        ti = &f->ins[st];
+        if (ti->op != OP_STORE || ti->flags)
+            continue;
+        for (v = tb->first; v != st; v = f->ins[v].next) {
+            int op = f->ins[v].op;
+            if (!is_pure(op) || op == OP_FDIV || ++n > 4)
+                break;
+        }
+        if (v != st)
+            continue;
+        /* B's last effect on memory: a store to the same place */
+        for (sb = bb->last; sb && is_pure(f->ins[sb].op); sb = f->ins[sb].prev)
+            ;
+        if (!sb)
+            continue;
+        bi = &f->ins[sb];
+        if (bi->op != OP_STORE || bi->flags || bi->mem != ti->mem || ir_resolve(f, bi->a) != ir_resolve(f, ti->a) ||
+            f->ins[ir_resolve(f, bi->b)].ty != f->ins[ir_resolve(f, ti->b)].ty)
+            continue;
+        /* the arm's values go to B, then one store of the choice */
+        for (v = tb->first; v != st; v = x) {
+            x = f->ins[v].next;
+            ir_remove(f, v);
+            ir_append(f, b, v);
+        }
+        ir_remove(f, st);
+        ir_remove(f, sb);
+        bb = &f->blk[b];
+        sel = ir_raw(f, OP_SELECT, f->ins[ir_resolve(f, ti->b)].ty, bb->arg, side == 0 ? ti->b : bi->b);
+        f->ins[sel].c = side == 0 ? bi->b : ti->b;
+        ir_append(f, b, sel);
+        nst = ir_raw(f, OP_STORE, IT_VOID, bi->a, sel);
+        f->ins[nst].mem = bi->mem;
+        ir_append(f, b, nst);
+        return 1;
+    }
+    return 0;
+}
+
 static int simplify_cfg(void)
 {
     u32 b, v, k;
@@ -2816,6 +2877,10 @@ static int simplify_cfg(void)
                     }
                     bb->arg = ir_resolve(f, bb->arg);
                 }
+            }
+            if (bb->term == TERM_BR && opt_level >= 2 && !opt_size && !opt_dev_fn && !opt_cuda && store_select(b)) {
+                bb = &f->blk[b];
+                changed = 1;
             }
             /* if-conversion: a branch around nothing, or to two empty arms,
                that only chooses values for phis becomes selects */

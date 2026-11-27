@@ -17,7 +17,7 @@
    and its size; rax, rcx, rdx, xmm0..xmm2 are scratch. Within a run, a result that a later instruction of the run
    names is also kept in one of rsi, rdi, r8..r11, rbp, and read from there (the frame is written all the same, so
    leaving needs nothing; MCUDA_JIT_NOCACHE=1: not). fma is the processor's (FMA3) where it has one
-   (MCUDA_JIT_NOFMA=1: the interpreter's function). MCUDA_JIT=0 turns it off; =2 says what was translated. */
+   (MCUDA_JIT_NOFMA=1: the interpreter's function). MCUDA_JIT=0 turns it off; =2 says what was translated; =3 writes the code to files as well. */
 #include "ptx.h"
 
 #if defined(__x86_64__) && defined(__linux__)
@@ -1134,6 +1134,23 @@ void mc_jit_compile(McFunc *f)
     mem = MAP_FAILED;
     if (mode >= 2)
         fprintf(stderr, "mcuda: %s: %u of %u instructions translated, %u bytes\n", f->name, ntr, f->ncode, x->n);
+    if (mode >= 3) {
+        /* MCUDA_JIT=3: the code in jit_NAME.bin (objdump -D -b binary -m i386:x86-64), where each instruction
+           starts in jit_NAME.off */
+        char nm[200];
+        FILE *o;
+        sprintf(nm, "jit_%.80s.bin", f->name);
+        if ((o = fopen(nm, "wb")) != 0) {
+            fwrite(mem, 1, x->n, o);
+            fclose(o);
+        }
+        sprintf(nm, "jit_%.80s.off", f->name);
+        if ((o = fopen(nm, "w")) != 0) {
+            for (i = 0; i < f->ncode; i++)
+                fprintf(o, "%u %x op %u line %u\n", i, jt->off[i] & ~MC_JIT_NOENTER, f->code[i].op, f->lines ? f->lines[i] : 0);
+            fclose(o);
+        }
+    }
 done:
     if (mem != MAP_FAILED)
         munmap(mem, size);

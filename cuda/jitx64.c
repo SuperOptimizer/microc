@@ -14,7 +14,10 @@
    it did: each run adds its length to r13 where it leaves or branches.
 
    Registers: rbx the frame, r12 the McJitCtx, r13 instructions executed, r14 and r15 the block's shared memory
-   and its size; rax, rcx, rdx, xmm0..xmm2 are scratch. MCUDA_JIT=0 turns it off; =2 says what was translated. */
+   and its size; rax, rcx, rdx, xmm0..xmm2 are scratch. Within a run, a result that a later instruction of the run
+   names is also kept in one of rsi, rdi, r8..r11, rbp, and read from there (the frame is written all the same, so
+   leaving needs nothing; MCUDA_JIT_NOCACHE=1: not). fma is the processor's (FMA3) where it has one
+   (MCUDA_JIT_NOFMA=1: the interpreter's function). MCUDA_JIT=0 turns it off; =2 says what was translated. */
 #include "ptx.h"
 
 #if defined(__x86_64__) && defined(__linux__)
@@ -43,10 +46,18 @@ typedef struct X {
     XFix *fx;
     u32 nfx, capfx;
     u32 pend; /* instructions of the current run not yet added to r13 */
+    s32 cs[16]; /* the slot whose value a register of the pool also holds (NOCS: none) */
+    u32 cur;    /* the instruction being translated */
+    u32 rr;     /* the pool's next victim */
+    int nocache;
     u32 epi;  /* where the way out is */
 } X;
 
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+#define NOCS 0x7fffffff
+/* registers that keep copies of slots within a run (every result is stored in the frame all the same) */
+static const u8 pool[7] = {RSI, RDI, R8, R9, R10, R11, RBP};
+
 enum { CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A, CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G };
 
 static void b1(X *x, u32 v)
@@ -155,25 +166,93 @@ static void movi(X *x, int r, u64 v, int w)
     }
 }
 
+static void forget(X *x)
+{
+    int k;
+    for (k = 0; k < 16; k++)
+        x->cs[k] = NOCS;
+}
+
+/* register r is about to be overwritten */
+static void clobber(X *x, int r)
+{
+    x->cs[r] = NOCS;
+}
+
+static int cached(X *x, s32 slot)
+{
+    int k;
+    for (k = 0; k < 7; k++)
+        if (x->cs[pool[k]] == slot)
+            return pool[k];
+    return -1;
+}
+
 /* r = the slot, 64 bits (w) or its low 32 zero-extended */
 static void ld(X *x, int r, s32 slot, int w)
 {
     u64 v;
+    int c;
     if (kc(x, slot, &v))
         movi(x, r, w ? v : (u32)v, w);
-    else
+    else if ((c = cached(x, slot)) >= 0) {
+        if (c != r || !w)
+            rr(x, 0, w, 0x8b, r, c);
+    } else
         rm(x, 0, w, 0x8b, r, RBX, sdisp(slot));
 }
 
-/* the slot = r, all 64 bits (a 32-bit result is in r zero-extended) */
+/* does an instruction after the current one, in its run, name the slot (before setting it)? */
+static int wanted(X *x, s32 slot)
+{
+    McFunc *f = x->f;
+    u32 j;
+    for (j = x->cur + 1; j < f->ncode && !x->lead[j] && j < x->cur + 64; j++) {
+        Ins *q = &f->code[j];
+        if (q->a == slot || q->b == slot || q->c == slot)
+            return 1;
+        if (q->op == OP_STV || q->op == OP_STV_S) {
+            s32 *xs = f->xtra + q->e;
+            u32 e;
+            for (e = 0; e < (q->aux & 15u) && e < 4; e++)
+                if (xs[e] == slot)
+                    return 1;
+        }
+        if (q->d == slot && q->op != OP_STV && q->op != OP_STV_S && !(q->op >= OP_ST8 && q->op <= OP_ST64) &&
+            !(q->op >= OP_ST8_S && q->op <= OP_ST64_S))
+            return 0;
+    }
+    return 0;
+}
+
+/* the slot = r, all 64 bits (a 32-bit result is in r zero-extended); a register of the pool keeps a copy */
 static void stv(X *x, int r, s32 slot)
 {
+    int k, v;
     rm(x, 0, 1, 0x89, r, RBX, sdisp(slot));
+    for (k = 0; k < 7; k++)
+        if (x->cs[pool[k]] == slot)
+            x->cs[pool[k]] = NOCS;
+    if (x->nocache || !wanted(x, slot))
+        return;
+    for (k = 0; k < 7 && pool[k] != r; k++)
+        ;
+    if (k < 7) {
+        x->cs[r] = slot;
+        return;
+    }
+    v = pool[x->rr++ % 7];
+    rr(x, 0, 1, 0x8b, v, r); /* mov v, r */
+    x->cs[v] = slot;
 }
 
 static void ldx(X *x, int xr, s32 slot, int dbl)
 {
-    rm(x, dbl ? 0xf2 : 0xf3, 0, 0x0f10, xr, RBX, sdisp(slot)); /* movss / movsd (constants are in the frame too) */
+    int c = cached(x, slot);
+    if (c >= 0)
+        rr(x, 0x66, dbl, 0x0f6e, xr, c); /* movd / movq xmm, c */
+    else
+        rm(x, dbl ? 0xf2 : 0xf3, 0, 0x0f10, xr, RBX, sdisp(slot)); /* movss / movsd (constants are in the frame too) */
 }
 
 /* to stub of instruction i, if condition cc */
@@ -409,8 +488,76 @@ static void fcall3(X *x, Ins *ip, int dbl, void *fn, u32 i)
     movi(x, RAX, (u64)fn, 1);
     b1(x, 0xff); /* call rax */
     b1(x, 0xd0);
+    forget(x); /* (the call keeps none of the pool but rbp: simpler to forget all) */
     nan_leaves(x, dbl, i);
     stx(x, dbl, ip->d);
+}
+
+/* the processor's fused multiply-add (FMA3, with the operating system saving the ymm state) */
+static int has_fma(void)
+{
+    static int known = -1;
+    unsigned a = 1, b, c = 0, d, lo, hi;
+    if (known >= 0)
+        return known;
+    known = 0;
+    if (getenv("MCUDA_JIT_NOFMA"))
+        return 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    if (!(c >> 12 & 1) || !(c >> 27 & 1) || !(c >> 28 & 1))
+        return 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    (void)b;
+    (void)d;
+    (void)hi;
+    known = (lo & 6) == 6;
+    return known;
+}
+
+/* d = a * b + c by vfmadd231: the same as the interpreter's correctly rounded mc_fmaf / mc_fma where the result
+   is a normal number or a zero; a subnormal, an infinity or a NaN (where the interpreter's rounding is its own
+   affair) leaves for the interpreter */
+static void hwfma(X *x, Ins *ip, int dbl, u32 i)
+{
+    u32 zj;
+    ldx(x, 0, ip->c, dbl);
+    ldx(x, 1, ip->a, dbl);
+    ldx(x, 2, ip->b, dbl);
+    b1(x, 0xc4); /* vfmadd231ss / sd xmm0, xmm1, xmm2 */
+    b1(x, 0xe2);
+    b1(x, dbl ? 0xf1 : 0x71);
+    b1(x, 0xb9);
+    b1(x, 0xc2);
+    rr(x, 0x66, dbl, 0x0f7e, 0, RAX); /* movd / movq rax, xmm0 */
+    if (dbl) {
+        movi(x, RCX, 0x7fffffffffffffffUL, 1);
+        rr(x, 0, 1, 0x21, RAX, RCX); /* and rcx, rax */
+        b1(x, 0x74); /* jz done: a zero is the same either way */
+        zj = x->n;
+        b1(x, 0);
+        movi(x, RDX, 0x0010000000000000UL, 1);
+        rr(x, 0, 1, 0x29, RDX, RCX); /* sub rcx, rdx */
+        movi(x, RDX, 0x7fe0000000000000UL, 1);
+        rr(x, 0, 1, 0x39, RDX, RCX); /* cmp rcx, rdx */
+    } else {
+        rr(x, 0, 0, 0x89, RAX, RCX); /* mov ecx, eax */
+        b1(x, 0x81); /* and ecx, 0x7fffffff */
+        b1(x, 0xe1);
+        b4(x, 0x7fffffffU);
+        b1(x, 0x74); /* jz done */
+        zj = x->n;
+        b1(x, 0);
+        b1(x, 0x81); /* sub ecx, 0x800000 */
+        b1(x, 0xe9);
+        b4(x, 0x800000U);
+        b1(x, 0x81); /* cmp ecx, 0x7f000000 */
+        b1(x, 0xf9);
+        b4(x, 0x7f000000U);
+    }
+    jcc_stub(x, CC_AE, i);
+    if (zj < x->cap)
+        x->p[zj] = (u8)(x->n - (zj + 1));
+    stv(x, RAX, ip->d);
 }
 
 /* int to float: from a, 32 bits signed (sx) or unsigned (taken as 64 bits signed) */
@@ -616,8 +763,13 @@ static int one(X *x, u32 i)
     case OP_FADD64: fbin(x, ip, 1, 0x58, i); return 1;
     case OP_FMUL64: fbin(x, ip, 1, 0x59, i); return 1;
     case OP_FSUB64: fbin(x, ip, 1, 0x5c, i); return 1;
-    case OP_FMA32: fcall3(x, ip, 0, (void *)mc_fmaf, i); return 1;
-    case OP_FMA64: fcall3(x, ip, 1, (void *)mc_fma, i); return 1;
+    case OP_FMA32:
+    case OP_FMA64:
+        if (has_fma())
+            hwfma(x, ip, op == OP_FMA64, i);
+        else
+            fcall3(x, ip, op == OP_FMA64, op == OP_FMA64 ? (void *)mc_fma : (void *)mc_fmaf, i);
+        return 1;
     case OP_CVT_F32_S32: i2f(x, ip, 0, 1); return 1;
     case OP_CVT_F32_U32: i2f(x, ip, 0, 0); return 1;
     case OP_CVT_F64_S32: i2f(x, ip, 1, 1); return 1;
@@ -629,6 +781,136 @@ static int one(X *x, u32 i)
         rr(x, to_d ? 0xf3 : 0xf2, 0, 0x0f5a, 0, 0); /* cvtss2sd / cvtsd2ss xmm0, xmm0 */
         nan_leaves(x, to_d, i);
         stx(x, to_d, ip->d);
+        return 1;
+    }
+    case OP_MULHIU64:
+    case OP_MULHIS64:
+        ld(x, RAX, ip->a, 1);
+        ld(x, RCX, ip->b, 1);
+        rr(x, 0, 1, 0xf7, op == OP_MULHIU64 ? 4 : 5, RCX); /* mul / imul rcx: rdx the high half */
+        stv(x, RDX, ip->d);
+        return 1;
+    case OP_DIVU32: case OP_DIVS32: case OP_REMU32: case OP_REMS32:
+    case OP_DIVU64: case OP_DIVS64: case OP_REMU64: case OP_REMS64: {
+        int w = op >= OP_DIVU64, sg = op == OP_DIVS32 || op == OP_REMS32 || op == OP_DIVS64 || op == OP_REMS64;
+        int rem = op == OP_REMU32 || op == OP_REMS32 || op == OP_REMU64 || op == OP_REMS64;
+        ld(x, RAX, ip->a, w);
+        ld(x, RCX, ip->b, w);
+        rr(x, 0, w, 0x85, RCX, RCX); /* test: a divisor 0 (or -1) is the interpreter's */
+        jcc_stub(x, CC_E, i);
+        if (sg) {
+            rex(x, w, 0, RCX, 0);
+            b1(x, 0x83); /* cmp rcx, -1 */
+            b1(x, 0xf9);
+            b1(x, 0xff);
+            jcc_stub(x, CC_E, i);
+            if (w)
+                b1(x, 0x48);
+            b1(x, 0x99); /* cdq / cqo */
+        } else {
+            rr(x, 0, 0, 0x31, RDX, RDX);
+        }
+        rr(x, 0, w, 0xf7, sg ? 7 : 6, RCX); /* idiv / div */
+        stv(x, rem ? RDX : RAX, ip->d); /* (32 bits: div wrote eax and edx, zero-extended) */
+        return 1;
+    }
+    case OP_CVT_F32_F16:
+        b1(x, 0x49); /* mov rcx, [r12 + h2f] (r12: with a SIB byte) */
+        b1(x, 0x8b);
+        b1(x, 0x4c);
+        b1(x, 0x24);
+        b1(x, (u32)offsetof(McJitCtx, h2f));
+        rm(x, 0, 0, 0x0fb7, RAX, RBX, sdisp(ip->a)); /* movzx eax, word [a] */
+        b1(x, 0x8b); /* mov eax, [rcx + rax * 4] */
+        b1(x, 0x04);
+        b1(x, 0x81);
+        stv(x, RAX, ip->d);
+        return 1;
+    case OP_CVT_F16_F32:
+        ldx(x, 0, ip->a, 0);
+        rr(x, 0xf3, 0, 0x0f5a, 0, 0); /* cvtss2sd: (double) RA.f */
+        forget(x);
+        movi(x, RDI, (u64)&mc_fmt_f16, 1);
+        movi(x, RSI, MC_RN, 0);
+        rr(x, 0, 0, 0x31, RDX, RDX);
+        movi(x, RAX, (u64)mc_enc, 1);
+        b1(x, 0xff);
+        b1(x, 0xd0);
+        forget(x);
+        rr(x, 0, 0, 0x89, RAX, RAX); /* (u32) */
+        stv(x, RAX, ip->d);
+        return 1;
+    case OP_CVT_F32_S64:
+    case OP_CVT_F64_S64:
+        ld(x, RAX, ip->a, 1);
+        rr(x, 0, 0, 0x0f57, 0, 0);
+        rr(x, op == OP_CVT_F64_S64 ? 0xf2 : 0xf3, 1, 0x0f2a, 0, RAX);
+        stx(x, op == OP_CVT_F64_S64, ip->d);
+        return 1;
+    case OP_FSQRT32:
+    case OP_FSQRT64: {
+        int dbl = op == OP_FSQRT64;
+        ldx(x, 0, ip->a, dbl);
+        rr(x, dbl ? 0xf2 : 0xf3, 0, 0x0f51, 0, 0); /* sqrtss / sqrtsd: correctly rounded, as mc_sqrtf / mc_sqrt */
+        nan_leaves(x, dbl, i);
+        stx(x, dbl, ip->d);
+        return 1;
+    }
+    case OP_CVT_S32_F32Z:
+    case OP_CVT_S32_F64Z:
+    case OP_CVT_U32_F32Z: {
+        /* truncated to 64 bits: what does not fit (a NaN, out of range) is the interpreter's */
+        rm(x, op == OP_CVT_S32_F64Z ? 0xf2 : 0xf3, 1, 0x0f2c, RAX, RBX, sdisp(ip->a)); /* cvttss2si rax, [a] */
+        if (op == OP_CVT_U32_F32Z) {
+            rr(x, 0, 1, 0x89, RAX, RCX);
+            rex(x, 1, 0, RCX, 0);
+            b1(x, 0xc1); /* shr rcx, 32 */
+            b1(x, 0xe9);
+            b1(x, 32);
+            jcc_stub(x, CC_NE, i);
+        } else {
+            rr(x, 0, 1, 0x63, RCX, RAX); /* movsxd rcx, eax */
+            rr(x, 0, 1, 0x39, RAX, RCX); /* cmp rcx, rax */
+            jcc_stub(x, CC_NE, i);
+            rr(x, 0, 0, 0x89, RAX, RAX); /* mov eax, eax */
+        }
+        stv(x, RAX, ip->d);
+        return 1;
+    }
+    case OP_LDV:
+    case OP_LDV_S:
+    case OP_STV:
+    case OP_STV_S: {
+        static const u8 esz[9] = {1, 1, 1, 2, 2, 2, 4, 4, 8};
+        static const u32 lop[9] = {0x0fb6, 0x0fbe, 0x0fbe, 0x0fb7, 0x0fbf, 0x0fbf, 0x8b, 0x63, 0x8b};
+        static const u8 lw[9] = {0, 0, 1, 0, 0, 1, 0, 1, 1};
+        u32 vn = ip->aux & 15, kk = ip->aux >> 4, e;
+        s32 *xs = x->f->xtra + ip->e;
+        int st = op == OP_STV || op == OP_STV_S;
+        if (vn < 1 || vn > 4 || (st ? kk > 3 : kk > 8))
+            return 0;
+        addr(x, ip, op == OP_LDV_S || op == OP_STV_S, i);
+        if (st) {
+            for (e = 0; e < vn; e++) {
+                s32 dsp = (s32)(e << kk);
+                ld(x, RCX, xs[e], kk == 3);
+                if (kk == 0)
+                    rm(x, 0, 0, 0x88, RCX, RAX, dsp);
+                else if (kk == 1)
+                    rm(x, 0x66, 0, 0x89, RCX, RAX, dsp);
+                else
+                    rm(x, 0, kk == 3, 0x89, RCX, RAX, dsp);
+            }
+        } else {
+            /* all read first, then written (the address may be in one of the slots) */
+            static const int tmp[4] = {RCX, RDX, RSI, RDI};
+            clobber(x, RSI);
+            clobber(x, RDI);
+            for (e = 0; e < vn; e++)
+                rm(x, 0, lw[kk], lop[kk], tmp[e], RAX, (s32)(e * esz[kk]));
+            for (e = vn; e-- > 0;)
+                stv(x, tmp[e], xs[e]); /* (rdi and rsi first: the copies of rcx and rdx may take their places) */
+        }
         return 1;
     }
     case OP_LD8: case OP_LD8S32: case OP_LD8S64: case OP_LD16: case OP_LD16S32: case OP_LD16S64:
@@ -713,6 +995,8 @@ void mc_jit_compile(McFunc *f)
         return;
     memset(x, 0, sizeof *x);
     x->f = fn;
+    forget(x);
+    x->nocache = getenv("MCUDA_JIT_NOCACHE") != 0;
     x->off = (u32 *)malloc((size_t)f->ncode * 4);
     x->lead = (u8 *)calloc(f->ncode + 1, 1);
     x->fixed = (u8 *)calloc(f->nconst + 1, 1);
@@ -784,8 +1068,11 @@ void mc_jit_compile(McFunc *f)
     for (i = 0; i < f->ncode && !x->over; i++) {
         Ins *ip = &f->code[i];
         u32 at;
-        if (x->lead[i])
+        x->cur = i;
+        if (x->lead[i]) {
             count(x);
+            forget(x);
+        }
         at = x->n;
         x->off[i] = x->lead[i] ? at : at | MC_JIT_NOENTER;
         switch (ip->op) {

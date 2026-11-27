@@ -2722,6 +2722,124 @@ static void coalesce(const u8 *live)
     free(pos);
 }
 
+/* A value X that only the phi P of block s reads, on the edge from p, is written into P's register in the first
+   place where P's register is not live in p: s cannot reach p again (the join after an if, a loop's way in), and
+   whatever else holds that register is in what s reaches, or is another such X of another way into s. X is an
+   instruction written where it stands that writes its result last. MCC_NOJOINCO: off. */
+static int opt_nojoinco = -1;
+
+static void coalesce_join(const u8 *live)
+{
+    Func *f = PF;
+    u32 nb = f->nblk, b, v, k, n, *p, *stack, sp, u, stamp = 0;
+    u32 *reach, *cnt, *mine;
+    if (opt_nojoinco < 0)
+        opt_nojoinco = getenv("MCC_NOJOINCO") != 0;
+    if (opt_nojoinco)
+        return;
+    reach = (u32 *)xmalloc((nb + 1) * sizeof(u32));
+    stack = (u32 *)xmalloc((nb + 1) * sizeof(u32));
+    cnt = (u32 *)xmalloc((f->nins + 1) * sizeof(u32));
+    mine = (u32 *)xmalloc((f->nins + 1) * sizeof(u32)); /* X given P's register here: the block s of P */
+    memset(reach, 0, (nb + 1) * sizeof(u32));
+    memset(cnt, 0, (f->nins + 1) * sizeof(u32));
+    memset(mine, 0, (f->nins + 1) * sizeof(u32));
+    /* every read, phis' included */
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b])
+            continue;
+        for (v = bb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                cnt[RV(f->xargs[f->ins[v].a + k])]++;
+        for (v = bb->first; v; v = f->ins[v].next) {
+            Ins *i = &f->ins[v];
+            IR_OPS(f, i, p, n);
+            for (k = 0; k < n; k++)
+                cnt[RV(p[k])]++;
+            if (i->op == OP_CALL)
+                cnt[RV(i->c)]++;
+        }
+        if (bb->arg)
+            cnt[RV(bb->arg)] += 2;
+    }
+    for (b = 1; b < nb; b++) {
+        Block *bb = &f->blk[b];
+        if (!live[b] || !bb->phis)
+            continue;
+        /* what b reaches */
+        stamp++;
+        sp = 0;
+        stack[sp++] = b;
+        reach[b] = stamp;
+        while (sp) {
+            Block *cb = &f->blk[stack[--sp]];
+            u32 ns = cb->term == TERM_BR ? 2 : cb->term == TERM_JMP ? 1 : 0;
+            for (k = 0; k < ns; k++) {
+                u32 t = cb->succ[k];
+                if (live[t] && reach[t] != stamp)
+                    reach[t] = stamp, stack[sp++] = t;
+            }
+        }
+        for (v = bb->phis; v; v = f->ins[v].next) {
+            Ins *pi = &f->ins[v];
+            if (!used[v])
+                continue;
+            for (k = 0; k < pi->b; k++) {
+                u32 x = RV(f->xargs[pi->a + k]), pb = bb->preds[k], r, j;
+                Ins *xi = &f->ins[x];
+                int ok = 0;
+                if (!x || x == v || !live[pb] || reach[pb] == stamp || xi->blk != pb || cnt[x] != 1 || !used[x] || regno[x] ||
+                    cls_of(xi->ty) != cls_of(pi->ty) || is_compare(xi->op) || ptree[x] || (xrem && xrem[x]) || fused[x] ||
+                    (sh_s && sh_t32[x] && sh_ext(x)) || xlate[x] || (vg_skip && vg_skip[x]) || special_load(x))
+                    continue;
+                for (j = 0; j < k; j++)
+                    if (bb->preds[j] == pb)
+                        break;
+                if (j < k)
+                    continue; /* (two ways from pb) */
+                switch (xi->op) {
+                case OP_ADD: case OP_SUB: case OP_MUL: case OP_AND: case OP_OR: case OP_XOR:
+                case OP_SHL: case OP_SHR: case OP_SAR: case OP_FADD: case OP_FSUB: case OP_FDIV:
+                    ok = !(xi->op == OP_ADD && nuse[x] < 255 && nuse[x] == ause[x]);
+                    break;
+                case OP_FMUL:
+                    ok = 1;
+                    break;
+                case OP_LOAD:
+                    ok = xi->mem <= M_F64 && !(xi->flags & ~(IF_NC | IF_ALIGN));
+                    break;
+                default:
+                    break;
+                }
+                if (!ok)
+                    continue;
+                (void)reg(v);
+                r = regno[v];
+                /* who else holds the register */
+                for (u = 1; u < f->nins && ok; u++) {
+                    Ins *ui = &f->ins[u];
+                    if (u == v || regno[u] != r || !ui->blk || cls_of(ui->ty) != cls_of(pi->ty))
+                        continue;
+                    if (reach[ui->blk] == stamp)
+                        continue; /* in what b reaches */
+                    if (mine[u] == b && ui->blk != pb)
+                        continue; /* another way's value */
+                    ok = 0;
+                }
+                if (!ok)
+                    continue;
+                regno[x] = r;
+                mine[x] = b;
+            }
+        }
+    }
+    free(reach);
+    free(stack);
+    free(cnt);
+    free(mine);
+}
+
 /* An assembly statement's operand that is read and written ("+f": a tensor product's running sums) is
    given its value by a move before the statement. Where the value read is itself such a result or a phi, of
    the statement's own block, and nothing else reads it, the result takes its register and there is no move;
@@ -4449,6 +4567,7 @@ void ptx_gen(Func *f, Obj *o, int entry)
     }
     coalesce(live);
     coalesce_asm(live);
+    coalesce_join(live);
     vec_find(f);
     opt_dom(f); /* (moves_early asks which edges are ways back) */
 

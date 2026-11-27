@@ -119,6 +119,14 @@ test-lto: $(MCC) $(LIBC)
 test-cerr: $(MCC) $(LIBC)
 	@sh tests/cerr.sh build/stage$(STAGE)
 
+# mcudahw's device library: every C library function mcuda_device.h declares is defined on the device (tests/devlib.sh); sinpi / cospi
+# against a long double reference (tests/sinpi.sh)
+# (needs mcudahw built: HWCC="build/stage$(STAGE)/mcc -mglibc" sh mkcuda.sh build/stage$(STAGE)/mcc build/stage$(STAGE) hw, as install_mcc.sh)
+test-devlib: $(MCC)
+	@sh tests/devlib.sh build/stage$(STAGE)
+test-sinpi: $(MCC) $(LIBC)
+	@sh tests/sinpi.sh build/stage$(STAGE)
+
 # CUDA / C++ diagnostics and C++17 inline variables (tests/cuerr.sh)
 test-cuerr: $(MCC) $(LIBC)
 	@sh tests/cuerr.sh build/stage$(STAGE)

@@ -2836,6 +2836,15 @@ static void profile_layout(void)
    in sixteenths? A guess from the shape of the code; the weights were fitted
    to profiles of mcc compiling itself, where they call 63% of executed
    branches right (a coin calls 45%, the profile itself 81%). */
+static int opt_norotkeep = -1; /* MCC_NOROTKEEP: loop rotation moves a header the chains placed (as before) */
+
+/* is t a successor of b? */
+static int is_succ(u32 b, u32 t)
+{
+    const Block *bb = &f->blk[b];
+    return (bb->term == TERM_JMP && bb->succ[0] == t) || (bb->term == TERM_BR && (bb->succ[0] == t || bb->succ[1] == t));
+}
+
 static u32 branch_chance(u32 b)
 {
     Block *bb = &f->blk[b];
@@ -3144,6 +3153,7 @@ static u32 div_pair(u32 v, int first)
 static void prepare(void)
 {
     u32 b, v, k, n;
+    int profiled = 0;
     split_critical_edges();
     fn_avx = f->avx;
     for (v = 1; v < f->nins && !fn_avx; v++)
@@ -3183,9 +3193,15 @@ static void prepare(void)
         for (k = 0; sw && k < f->nblk; k++)
             f->blk[k].freq = sw[k];
         free(sw);
+        profiled = 1;
     } else if (f->blk[1].freq > 1) {
         profile_layout();
+        profiled = 1;
     }
+    if (opt_norotkeep < 0)
+        opt_norotkeep = getenv("MCC_NOROTKEEP") != 0;
+    if (opt_norotkeep)
+        profiled = 0;
     for (k = 0; k < nlayout; k++)
         blk_index[layout[k]] = k;
     /* Loop rotation: a loop header that only tests the condition moves below
@@ -3199,6 +3215,12 @@ static void prepare(void)
         hk = blk_index[h];
         if (hk == 0 || hk >= k || f->blk[h].term != TERM_BR || f->blk[h].flag == 3)
             continue;
+        if (profiled && ((is_succ(h, layout[hk + 1]) && (k + 1 == nlayout || !is_succ(h, layout[k + 1]))) ||
+                         (is_succ(layout[hk - 1], h) && COUNT(layout[hk - 1]) >= COUNT(layout[k])))) {
+            /* the chains put h where it falls into one of its ways (or a block at least as busy falls into it):
+               below lb it would need a jump of its own (a jump more for every character of bench's str) */
+            continue;
+        }
         f->blk[h].flag = 3; /* rotate each header once */
         for (n = hk; n < k; n++) {
             layout[n] = layout[n + 1];

@@ -4779,6 +4779,146 @@ static int add_chain(Func *fn)
     return (int)made;
 }
 
+/* A run of steps y = (x >> 1) ^ (K & -(x & 1)), each fed by the one before (a crc taken bit by bit, its loop of 8
+   unrolled): every step is linear over GF(2), so n of them are (x >> n) ^ the sum over the low n bits of x of
+   (-(x >> i & 1) & T[i]), T[i] what the steps make of bit i alone. The terms do not wait for each other: the chain
+   of 4 n operations in a row becomes n short ones side by side and a tree of xors (the count stays about the
+   same). MCC_NOLFSR: off. */
+#define LF_MAX 64
+static int lf_step(u32 v, const u32 *uses, u32 nuses, u32 *x, u64 *kk, u32 *part)
+{
+    const Ins *i = &f->ins[v];
+    int s;
+    if (i->op != OP_XOR || (i->ty != IT_I32 && i->ty != IT_I64) || !i->blk)
+        return 0;
+    for (s = 0; s < 2; s++) {
+        u32 sh = ir_resolve(f, s ? i->b : i->a), m = ir_resolve(f, s ? i->a : i->b), ng, bit, xx;
+        const Ins *si = &f->ins[sh], *mi = &f->ins[m], *ni, *bi;
+        u64 c;
+        if (sh >= nuses || m >= nuses)
+            continue;
+        if (si->op != OP_SHR || si->ty != i->ty || !ir_is_const(f, ir_resolve(f, si->b), &c) || c != 1 || uses[sh] != 1 ||
+            mi->op != OP_AND || mi->ty != i->ty || uses[m] != 1 || si->blk != i->blk || mi->blk != i->blk)
+            continue;
+        if (ir_is_const(f, ir_resolve(f, mi->b), kk))
+            ng = ir_resolve(f, mi->a);
+        else if (ir_is_const(f, ir_resolve(f, mi->a), kk))
+            ng = ir_resolve(f, mi->b);
+        else
+            continue;
+        ni = &f->ins[ng];
+        if (ng >= nuses || ni->ty != i->ty || uses[ng] != 1 || ni->blk != i->blk)
+            continue;
+        if (ni->op == OP_NEG)
+            bit = ir_resolve(f, ni->a);
+        else if (ni->op == OP_SUB && ir_is_const(f, ir_resolve(f, ni->a), &c) && c == 0)
+            bit = ir_resolve(f, ni->b);
+        else
+            continue;
+        bi = &f->ins[bit];
+        if (bit >= nuses || bi->op != OP_AND || bi->ty != i->ty || uses[bit] != 1 || bi->blk != i->blk)
+            continue;
+        if (ir_is_const(f, ir_resolve(f, bi->b), &c) && c == 1)
+            xx = ir_resolve(f, bi->a);
+        else if (ir_is_const(f, ir_resolve(f, bi->a), &c) && c == 1)
+            xx = ir_resolve(f, bi->b);
+        else
+            continue;
+        if (xx != ir_resolve(f, si->a))
+            continue;
+        *x = xx;
+        part[0] = sh;
+        part[1] = m;
+        part[2] = ng;
+        part[3] = bit;
+        return 1;
+    }
+    return 0;
+}
+
+static void lfsr_chain(Func *fn)
+{
+    static int off = -1;
+    u32 b, v, pv, nuses, *uses = 0;
+    if (off < 0)
+        off = getenv("MCC_NOLFSR") != 0;
+    if (off)
+        return;
+    f = fn;
+    for (b = 1; b < f->nblk; b++) {
+        Block *bb = &f->blk[b];
+        if (bb->term == TERM_NONE)
+            continue;
+        for (v = bb->last; v; v = pv) {
+            u32 step[LF_MAX], part[LF_MAX][4], x, n = 0, k, j, cur, term[LF_MAX + 1], nt = 0, x0;
+            u64 K[LF_MAX], T, mask;
+            int ty = f->ins[v].ty, bits = ty == IT_I32 ? 32 : 64;
+            pv = f->ins[v].prev;
+            if (f->ins[v].op != OP_XOR || (ty != IT_I32 && ty != IT_I64))
+                continue;
+            {
+                int oa = f->ins[ir_resolve(f, f->ins[v].a)].op, ob = f->ins[ir_resolve(f, f->ins[v].b)].op;
+                if (!((oa == OP_SHR && ob == OP_AND) || (oa == OP_AND && ob == OP_SHR)))
+                    continue;
+            }
+            if (!uses)
+                uses = count_uses(&nuses);
+            if (v >= nuses)
+                continue;
+            /* the steps, last first: each but the last read by the next one's shift and its low bit only */
+            for (cur = v; n < LF_MAX && cur < nuses && f->ins[cur].ty == ty && f->ins[cur].blk == b &&
+                          (n == 0 || uses[cur] == 2) && lf_step(cur, uses, nuses, &x, &K[n], part[n]); cur = x)
+                step[n++] = cur;
+            if (n < 3 || n >= (u32)bits)
+                continue;
+            x0 = ir_resolve(f, f->ins[part[n - 1][0]].a);
+            mask = ty == IT_I32 ? 0xffffffffUL : ~(u64)0;
+            /* the instruction the walk goes on from: the one before the whole run */
+            for (pv = f->ins[v].prev; pv; pv = f->ins[pv].prev) {
+                for (k = 0; k < n; k++)
+                    if (pv == step[k] || pv == part[k][0] || pv == part[k][1] || pv == part[k][2] || pv == part[k][3])
+                        break;
+                if (k == n)
+                    break;
+            }
+            for (k = 0; k < n; k++) {
+                for (j = 0; j < 4; j++)
+                    ir_remove(f, part[k][j]);
+                if (k)
+                    ir_remove(f, step[k]);
+            }
+#define LF_NEW(op, a, bv) (cur = ir_raw(f, op, ty, a, bv), ir_insert_before(f, v, cur), cur)
+            term[nt++] = LF_NEW(OP_SHR, x0, ir_const(f, ty, n));
+            for (k = 0; k < n; k++) {
+                u32 t;
+                T = (u64)1 << k;
+                for (j = n; j-- > 0;) /* (step[n - 1] is the first to run) */
+                    T = ((T >> 1) ^ (K[j] & (0 - (T & 1)))) & mask;
+                if (!T)
+                    continue;
+                t = k ? LF_NEW(OP_SHR, x0, ir_const(f, ty, k)) : x0;
+                t = LF_NEW(OP_AND, t, ir_const(f, ty, 1));
+                t = LF_NEW(OP_NEG, t, 0);
+                t = LF_NEW(OP_AND, t, ir_const(f, ty, T));
+                term[nt++] = t;
+            }
+            /* the xors, as a tree; the last is v itself */
+            while (nt > 2) {
+                u32 m = 0;
+                for (k = 0; k + 1 < nt; k += 2)
+                    term[m++] = LF_NEW(OP_XOR, term[k], term[k + 1]);
+                if (k < nt)
+                    term[m++] = term[k];
+                nt = m;
+            }
+#undef LF_NEW
+            f->ins[v].a = term[0];
+            f->ins[v].b = nt > 1 ? term[1] : ir_const(f, ty, 0);
+        }
+    }
+    free(uses);
+}
+
 void opt_finish(Func *fn)
 {
     u32 saved = ir_loc;
@@ -4791,6 +4931,7 @@ void opt_finish(Func *fn)
         br_bools(fn);
     }
     if (!opt_dev_fn && !opt_cuda && opt_level >= 2) {
+        lfsr_chain(fn);
         inc_sink(fn);
         if (add_chain(fn))
             inc_sink(fn); /* (the sums made over: (p + 4) + 4 after the last read of p + 4) */

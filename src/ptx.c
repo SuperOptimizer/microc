@@ -2086,6 +2086,8 @@ static void emit_ins(u32 v)
         }
         if (opt_noshmask < 0)
             opt_noshmask = getenv("MCC_NOSHMASK") != 0;
+        if (!opt_noshmask && (PF->ins[cv].op == OP_ZEXT32 || PF->ins[cv].op == OP_SEXT32) && !(xrem && xrem[cv]))
+            cv = RV(PF->ins[cv].a); /* a count made wider: its low 32 bits are the number it was made of */
         if (!opt_noshmask && PF->ins[cv].ty == IT_I32) {
             /* the count masked where it is (no copy first), or not at all when it is known to be below the width */
             if (ir_umax32(PF, cv) <= (u64)(ty == IT_I64 ? 63 : 31)) {
@@ -4505,6 +4507,8 @@ void ptx_gen(Func *f, Obj *o, int entry)
     if (!opt_noifcall)
         round_once();
     /* the values that are read */
+    if (opt_noshmask < 0)
+        opt_noshmask = getenv("MCC_NOSHMASK") != 0;
     for (b = 1; b < nb; b++) {
         Block *bb = &f->blk[b];
         if (!live[b])
@@ -4527,6 +4531,12 @@ void ptx_gen(Func *f, Obj *o, int entry)
                 u32 x = RV(i->a);
                 if (addr_sum(x, &off) && ause[x] < 255)
                     ause[x]++;
+            }
+            if ((i->op == OP_SHL || i->op == OP_SHR || i->op == OP_SAR) && !opt_noshmask) {
+                /* a shift reads a count made wider as it was (the shift's case in emit_ins) */
+                u32 r = RV(i->b);
+                if ((f->ins[r].op == OP_ZEXT32 || f->ins[r].op == OP_SEXT32) && wuse[r] < 255)
+                    wuse[r]++;
             }
             if ((i->op == OP_MUL || i->op == OP_SHL) && i->ty == IT_I64) {
                 u32 wx, wy;

@@ -115,6 +115,10 @@ test-x64-cuda: x64 cuda
 test-lto: $(MCC) $(LIBC)
 	@sh tests/ltoglibc.sh build/stage$(STAGE)
 
+# C diagnostics (tests/cerr.sh): no implicit function declarations or implicit int from C99 on
+test-cerr: $(MCC) $(LIBC)
+	@sh tests/cerr.sh build/stage$(STAGE)
+
 # CUDA / C++ diagnostics and C++17 inline variables (tests/cuerr.sh)
 test-cuerr: $(MCC) $(LIBC)
 	@sh tests/cuerr.sh build/stage$(STAGE)

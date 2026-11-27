@@ -18,6 +18,7 @@ const char *const tok_names[] = {
 };
 
 int opt_gnu = 1, opt_syntax_only, opt_skip_asm, opt_c23, opt_cxx, opt_cuda;
+int opt_c99, opt_permissive;
 Buf *opt_asm_text;
 
 /* Other spellings of keywords; those marked 1 are identifiers in strict C89,

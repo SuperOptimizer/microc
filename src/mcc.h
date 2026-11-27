@@ -224,6 +224,9 @@ enum {
 extern int opt_cuda;           /* CUDA: device code goes to PTX */
 extern int opt_c23, opt_cxx;   /* C23 keywords and syntax; C++ subset */
 extern int opt_gnu;         /* 0: strict C89, so inline, asm and typeof are plain identifiers */
+extern int opt_c99;         /* -std=c99 or later (C or C++): no implicit function declarations, no implicit int */
+extern int opt_permissive;  /* PERM_*: what C99 removed, accepted again on request (with a warning at each use) */
+enum { PERM_IMPLICIT_FN = 1, PERM_IMPLICIT_INT = 2 };
 extern int opt_syntax_only; /* parse and check, generate nothing */
 extern int opt_skip_asm;    /* debugging aid: inline assembly generates nothing */
 int lex_keyword(u32 name);  /* token kind of a keyword or one of its aliases, else 0 */

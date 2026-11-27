@@ -436,6 +436,8 @@ static int is_constsym(u32 sym);
 static void host_ref(u32 sym);
 static u8 *cn_s; /* the value is an address in the .const space (cn_find) */
 static u8 *ause;
+static u8 *wuse; /* reads of a 32-bit number made wider by products that take it as it was (wide_mul) */
+static int opt_nowuse = -1; /* MCC_NOWUSE: the widening is written all the same */
 static u8 *xlate; /* a 32-bit number made wider that a wide product reads as it was, where the product is */
 
 /* The address of a local or a global object, in a register of its own for this one reader: held in one
@@ -2120,6 +2122,10 @@ static void emit_ins(u32 v)
     case OP_SEXT32: case OP_ZEXT32:
         if (xrem && xrem[v])
             return;
+        if (opt_nowuse < 0)
+            opt_nowuse = getenv("MCC_NOWUSE") != 0;
+        if (!opt_nowuse && nuse[v] < 255 && nuse[v] == wuse[v])
+            return; /* every reader is a wide product, which reads the 32 bits (mul.wide) */
         P("\tcvt.%s %s, %s;\n", i->op == OP_SEXT32 ? "s64.s32" : "u64.u32", reg(v), ropnd(i->a));
         return;
     case OP_TRUNC: P("\tcvt.u32.u64 %s, %s;\n", reg(v), ropnd(i->a)); return;
@@ -4184,8 +4190,9 @@ void ptx_gen(Func *f, Obj *o, int entry)
     memset(regno, 0, (f->nins + 1) * sizeof(u32));
     used = (u8 *)xmalloc(f->nins + 1);
     memset(used, 0, f->nins + 1);
-    nuse = (u8 *)xmalloc(7 * (size_t)(f->nins + 1));
-    memset(nuse, 0, 7 * (size_t)(f->nins + 1));
+    nuse = (u8 *)xmalloc(8 * (size_t)(f->nins + 1));
+    memset(nuse, 0, 8 * (size_t)(f->nins + 1));
+    wuse = nuse + 7 * (size_t)(f->nins + 1);
     fuse = nuse + f->nins + 1;
     fused = fuse + f->nins + 1;
     cuse = fused + f->nins + 1;
@@ -4262,6 +4269,16 @@ void ptx_gen(Func *f, Obj *o, int entry)
                 u32 x = RV(i->a);
                 if (addr_sum(x, &off) && ause[x] < 255)
                     ause[x]++;
+            }
+            if ((i->op == OP_MUL || i->op == OP_SHL) && i->ty == IT_I64) {
+                u32 wx, wy;
+                if (wide_kind(v, &wx, &wy)) {
+                    u32 r = RV(i->a);
+                    if (wuse[r] < 255)
+                        wuse[r]++;
+                    if (wy && (r = RV(i->b)) != 0 && wuse[r] < 255)
+                        wuse[r]++;
+                }
             }
             if (i->op == OP_CALL && !(i->flags & (IF_ASM | IF_ALLOCA)) && f->ins[RV(i->c)].op != OP_ADDR)
                 mark(i->c);

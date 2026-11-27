@@ -32,6 +32,7 @@ typedef struct XStub {
 typedef struct XFix {
     u32 at;     /* a rel32 */
     u32 target; /* instruction index */
+    int warm;   /* to the loop head's warm entry */
 } XFix;
 
 typedef struct X {
@@ -48,6 +49,12 @@ typedef struct X {
     u32 pend; /* instructions of the current run not yet added to r13 */
     s32 cs[16]; /* the slot whose value a register of the pool also holds (NOCS: none) */
     u32 cur;    /* the instruction being translated */
+    s32 *ls;    /* a loop head's slots kept in pool[0 ..) on the way back: ls[7 * i ..], lsn[i] of them */
+    u8 *lsn;
+    u32 *warm;  /* where a loop head's code goes on with them in place */
+    int noloop, jwarm;
+    u32 *lend;  /* a loop head's last way back */
+    s32 ph;     /* the loop head whose registers are kept (while cur <= lend[ph]), or -1 */
     s32 fslot;  /* the predicate whose comparison the flags hold, if the code ends at fat */
     u32 fat;
     int fcc, noimm, noflags;
@@ -205,11 +212,14 @@ static void ld(X *x, int r, s32 slot, int w)
         rm(x, 0, w, 0x8b, r, RBX, sdisp(slot));
 }
 
+static int is_branch(u32 op);
+
 /* does an instruction after the current one, in its run, name the slot (before setting it)? */
 static int wanted(X *x, s32 slot)
 {
     McFunc *f = x->f;
     u32 j;
+    int endbr = 0;
     for (j = x->cur + 1; j < f->ncode && !x->lead[j] && j < x->cur + 64; j++) {
         Ins *q = &f->code[j];
         if (q->a == slot || q->b == slot || q->c == slot)
@@ -224,6 +234,20 @@ static int wanted(X *x, s32 slot)
         if (q->d == slot && q->op != OP_STV && q->op != OP_STV_S && !(q->op >= OP_ST8 && q->op <= OP_ST64) &&
             !(q->op >= OP_ST8_S && q->op <= OP_ST64_S))
             return 0;
+        if (is_branch(q->op)) {
+            endbr = 1;
+            break;
+        }
+    }
+    /* the run ends in a jump back to a loop head that keeps the slot in a register */
+    if (endbr && x->lsn) {
+        Ins *q = &f->code[j];
+        s32 t = q->op == OP_BRA ? (s32)j + q->a : q->op == OP_BRT || q->op == OP_BRF ? (s32)j + q->b : (s32)j + 1 + q->b;
+        u32 k;
+        if (t >= 0 && (u32)t <= j)
+            for (k = 0; k < x->lsn[t]; k++)
+                if (x->ls[7 * t + k] == slot)
+                    return 1;
     }
     return 0;
 }
@@ -231,20 +255,31 @@ static int wanted(X *x, s32 slot)
 /* the slot = r, all 64 bits (a 32-bit result is in r zero-extended); a register of the pool keeps a copy */
 static void stv(X *x, int r, s32 slot)
 {
-    int k, v;
+    int k, v, np;
     rm(x, 0, 1, 0x89, r, RBX, sdisp(slot));
     for (k = 0; k < 7; k++)
         if (x->cs[pool[k]] == slot)
             x->cs[pool[k]] = NOCS;
-    if (x->nocache || !wanted(x, slot))
+    if (x->nocache)
         return;
-    for (k = 0; k < 7 && pool[k] != r; k++)
+    np = x->ph >= 0 && x->cur <= x->lend[x->ph] ? x->lsn[x->ph] : 0;
+    for (k = 0; k < np; k++)
+        if (x->ls[7 * x->ph + k] == slot) {
+            /* a slot the loop keeps: in its own register */
+            if (r != pool[k])
+                rr(x, 0, 1, 0x8b, pool[k], r);
+            x->cs[pool[k]] = slot;
+            return;
+        }
+    if (!wanted(x, slot))
+        return;
+    for (k = np; k < 7 && pool[k] != r; k++)
         ;
     if (k < 7) {
         x->cs[r] = slot;
         return;
     }
-    v = pool[x->rr++ % 7];
+    v = np < 7 ? pool[np + x->rr++ % (7 - np)] : pool[x->rr++ % 7];
     rr(x, 0, 1, 0x8b, v, r); /* mov v, r */
     x->cs[v] = slot;
 }
@@ -279,6 +314,29 @@ static void jcc_stub(X *x, int cc, u32 ins)
     b4(x, 0);
 }
 
+static void jto(X *x, int cc, u32 t);
+
+/* before a jump back to loop head t: pool[k] holds slot ls[k] (from where it is, or the frame), as t's warm entry wants */
+static int conform(X *x, u32 t)
+{
+    u32 k, n = x->lsn ? x->lsn[t] : 0;
+    for (k = 0; k < n; k++) {
+        s32 sl = x->ls[7 * t + k];
+        int r = pool[k], c;
+        if (x->cs[r] == sl)
+            continue;
+        c = cached(x, sl);
+        if (c >= 0)
+            rr(x, 0, 1, 0x8b, r, c);
+        else
+            rm(x, 0, 1, 0x8b, r, RBX, sdisp(sl));
+        x->cs[r] = sl;
+        if (c >= 0)
+            x->cs[c] = NOCS; /* (one copy is enough) */
+    }
+    return n != 0;
+}
+
 /* jump (cc < 0: always) to the code of instruction t */
 static void jto(X *x, int cc, u32 t)
 {
@@ -299,6 +357,7 @@ static void jto(X *x, int cc, u32 t)
     }
     x->fx[x->nfx].at = x->n;
     x->fx[x->nfx].target = t;
+    x->fx[x->nfx].warm = x->jwarm;
     x->nfx++;
     b4(x, 0);
 }
@@ -1044,6 +1103,7 @@ void mc_jit_compile(McFunc *f)
     x->noimm = getenv("MCUDA_JIT_NOIMM") != 0;
     x->noflags = getenv("MCUDA_JIT_NOFLAGS") != 0;
     x->fslot = NOCS;
+    x->ph = -1;
     x->off = (u32 *)malloc((size_t)f->ncode * 4);
     x->lead = (u8 *)calloc(f->ncode + 1, 1);
     x->fixed = (u8 *)calloc(f->nconst + 1, 1);
@@ -1078,6 +1138,58 @@ void mc_jit_compile(McFunc *f)
             goto done; /* (a branch out of the function: left to the interpreter) */
         if (is_branch(ip->op) || ip->op == OP_BRX)
             x->lead[i + 1] = 1;
+    }
+    /* loop heads (targets of a branch at or after them): the registers their first run reads before writing them */
+    x->noloop = getenv("MCUDA_JIT_NOLOOP") != 0;
+    if (!x->noloop) {
+        x->ls = (s32 *)malloc((size_t)f->ncode * 7 * sizeof(s32));
+        x->lsn = (u8 *)calloc(f->ncode + 1, 1);
+        x->warm = (u32 *)calloc(f->ncode + 1, sizeof(u32));
+        x->lend = (u32 *)calloc(f->ncode + 1, sizeof(u32));
+        if (!x->ls || !x->lsn || !x->warm || !x->lend)
+            goto done;
+        for (i = 0; i < f->ncode; i++) {
+            Ins *ip = &f->code[i];
+            s64 t = ip->op == OP_BRA ? (s64)i + ip->a : ip->op == OP_BRT || ip->op == OP_BRF ? (s64)i + ip->b :
+                    ip->op == OP_SKIPF || ip->op == OP_SKIPT ? (s64)i + 1 + ip->b : -1;
+            u32 h, j, n = 0, nw = 0;
+            s32 wr[64];
+            if (t >= 0 && t <= (s64)i && x->lend[t] < i)
+                x->lend[t] = i;
+            if (t < 0 || t > (s64)i || x->lsn[t])
+                continue;
+            h = (u32)t;
+            for (j = h; j < f->ncode && (j == h || !x->lead[j]) && n < 7 && j < h + 64; j++) {
+                Ins *q = &f->code[j];
+                s32 rd[3 + 4];
+                u32 m = 0, e, z;
+                rd[m++] = q->a;
+                rd[m++] = q->b;
+                rd[m++] = q->c;
+                if (q->op == OP_STV || q->op == OP_STV_S)
+                    for (e = 0; e < (q->aux & 15u) && e < 4; e++)
+                        rd[m++] = f->xtra[q->e + e];
+                for (e = 0; e < m && n < 7; e++) {
+                    s32 sl = rd[e];
+                    if (sl < 0 || (u32)sl >= f->nreg)
+                        continue;
+                    for (z = 0; z < nw && wr[z] != sl; z++)
+                        ;
+                    if (z < nw)
+                        continue;
+                    for (z = 0; z < n && x->ls[7 * h + z] != sl; z++)
+                        ;
+                    if (z == n)
+                        x->ls[7 * h + n++] = sl;
+                }
+                if (q->d >= 0 && (u32)q->d < f->nreg && nw < 64 && !(q->op >= OP_ST8 && q->op <= OP_ST64) &&
+                    !(q->op >= OP_ST8_S && q->op <= OP_ST64_S) && q->op != OP_STV && q->op != OP_STV_S)
+                    wr[nw++] = q->d;
+                if (is_branch(q->op))
+                    break;
+            }
+            x->lsn[h] = (u8)n;
+        }
     }
     x->cap = f->ncode * 96 + 4096;
     size = (x->cap + 4095) & ~4095U;
@@ -1122,11 +1234,22 @@ void mc_jit_compile(McFunc *f)
         }
         at = x->n;
         x->off[i] = x->lead[i] ? at : at | MC_JIT_NOENTER;
+        if (x->lsn && x->lsn[i]) {
+            /* a loop head: the way in loads what the way back brings in registers */
+            for (k = 0; k < x->lsn[i]; k++) {
+                rm(x, 0, 1, 0x8b, pool[k], RBX, sdisp(x->ls[7 * i + k]));
+                x->cs[pool[k]] = x->ls[7 * i + k];
+            }
+            x->warm[i] = x->n;
+            x->ph = (s32)i;
+        }
         switch (ip->op) {
         case OP_BRA:
             x->pend++;
+            x->jwarm = i + ip->a <= i && conform(x, i + ip->a);
             count(x);
             jto(x, -1, i + ip->a);
+            x->jwarm = 0;
             ntr++;
             continue;
         case OP_BRT:
@@ -1136,18 +1259,22 @@ void mc_jit_compile(McFunc *f)
             s32 t = ip->op == OP_BRT || ip->op == OP_BRF ? (s32)i + ip->b : (s32)i + 1 + ip->b;
             int taken = ip->op == OP_BRT || ip->op == OP_SKIPT;
             if (!x->noflags && x->fslot == ip->a && x->fat == x->n) {
-                /* the setp just before: its flags (lea and the stores keep them) */
+                /* the setp just before: its flags (lea, mov and the stores keep them) */
                 x->pend++;
+                x->jwarm = (u32)t <= i && conform(x, (u32)t);
                 count(x);
                 jto(x, taken ? x->fcc : x->fcc ^ 1, (u32)t);
+                x->jwarm = 0;
                 ntr++;
                 continue;
             }
             ld(x, RAX, ip->a, 0);
             rr(x, 0, 0, 0x85, RAX, RAX); /* test eax, eax */
             x->pend++;
+            x->jwarm = (u32)t <= i && conform(x, (u32)t);
             count(x);
             jto(x, taken ? CC_NE : CC_E, (u32)t);
+            x->jwarm = 0;
             ntr++;
             continue;
         }
@@ -1174,7 +1301,7 @@ void mc_jit_compile(McFunc *f)
         leave(x, x->st[k].ins);
     }
     for (k = 0; k < x->nfx && !x->over; k++)
-        put4(x, x->fx[k].at, (x->off[x->fx[k].target] & ~MC_JIT_NOENTER) - (x->fx[k].at + 4));
+        put4(x, x->fx[k].at, (x->fx[k].warm ? x->warm[x->fx[k].target] : x->off[x->fx[k].target] & ~MC_JIT_NOENTER) - (x->fx[k].at + 4));
     if (x->over || !ntr)
         goto done;
     if (mprotect(mem, size, PROT_READ | PROT_EXEC) != 0)
@@ -1215,5 +1342,9 @@ done:
     free(x->fixed);
     free(x->st);
     free(x->fx);
+    free(x->ls);
+    free(x->lsn);
+    free(x->warm);
+    free(x->lend);
 }
 #endif

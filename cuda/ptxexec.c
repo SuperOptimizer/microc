@@ -1981,6 +1981,9 @@ static int run_warp(Blk *b, u32 warp)
                        warp instruction, one after the other as they would here */
                     jc.R[0] = t->R;
                     jc.thrs[0] = t;
+#if defined(__x86_64__) && defined(__linux__)
+                    k = i + 1; /* (jitx64.c: one thread at a time, no lanes) */
+#else
                     for (k = i + 1; k < nl; k++) {
                         Thr *o = &b->thr[base + k];
                         if (o->state != TS_RUN || o->ip != t->ip || o->f != t->f)
@@ -1988,6 +1991,7 @@ static int run_warp(Blk *b, u32 warp)
                         jc.R[k - i] = o->R;
                         jc.thrs[k - i] = o;
                     }
+#endif
                     cnt = k - i;
                     jc.lane = 0;
                     jc.nl = cnt;

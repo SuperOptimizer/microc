@@ -4,7 +4,7 @@
    mcdw_NAME, of which mklib makes the piece __mcuda_NAME (see mathf.cu). */
 #define MCDD(X) X(frexp) X(ldexp) X(modf) X(fmod) X(exp) X(exp2) X(exp10) X(expm1) X(log) X(log2) X(log10) X(log1p) \
     X(pow) X(cbrt) X(hypot) X(sin) X(cos) X(tan) X(asin) X(acos) X(atan) X(atan2) X(sinh) X(cosh) X(tanh) X(asinh) \
-    X(acosh) X(atanh) X(erf) X(erfc) X(tgamma) X(lgamma) X(lgamma_r) X(sincos)
+    X(acosh) X(atanh) X(erf) X(erfc) X(tgamma) X(lgamma) X(lgamma_r) X(sincos) X(sinpi) X(cospi)
 #define frexp mcdd_frexp
 #define ldexp mcdd_ldexp
 #define modf mcdd_modf
@@ -39,6 +39,9 @@
 #define lgamma mcdd_lgamma
 #define lgamma_r mcdd_lgamma_r
 #define sincos mcdd_sincos
+#define sinpi mcdd_sinpi
+#define cospi mcdd_cospi
+#define __mcc_sincospi mcdd_sincospi
 #define scalbn mcdd_scalbn
 #define copysign mcdd_copysign
 #define signgam mcdd_signgam
@@ -62,7 +65,7 @@ __host__ __device__ double mcdd_copysign(double x, double y) { return u2d((d2u(x
 
 #define OUT __device__ __attribute__((noinline))
 #define D1(X) X(exp) X(exp2) X(exp10) X(expm1) X(log) X(log2) X(log10) X(log1p) X(cbrt) X(sin) X(cos) X(tan) X(asin) \
-    X(acos) X(atan) X(sinh) X(cosh) X(tanh) X(asinh) X(acosh) X(atanh) X(erf) X(erfc) X(tgamma)
+    X(acos) X(atan) X(sinh) X(cosh) X(tanh) X(asinh) X(acosh) X(atanh) X(erf) X(erfc) X(tgamma) X(sinpi) X(cospi)
 #define D2(X) X(pow) X(hypot) X(atan2) X(fmod)
 #define X(n) OUT double mcdw_##n(double x) { return mcdd_##n(x); }
 D1(X)

@@ -202,6 +202,49 @@ void sincos(double x, double *sp, double *cp)
     }
 }
 
+/* sin(pi x) and cos(pi x) (C23 sinpi / cospi; CUDA's sincospi): the reduction is exact, a = |x| - 2 floor(|x| / 2) in [0, 2) and
+   f = a - n / 2 in [-1/4, 1/4] with n = the nearest multiple of 1/2, so no pi-sized rounding enters; then the kernels on pi f in
+   double-double. Integers give sin +-0 (the sign of x) and cos +-1, half-integers cos +0 (IEEE 754 sinPi / cosPi). The device library
+   had no double sinpi / cospi until 11-27 (mcuda_device.h's sincospi calls them: ufsm's FFT twiddle table four_tab_k) */
+void __mcc_sincospi(double x, double *sp, double *cp)
+{
+    double a = fabs(x), r, f, h, l, lo, s, c;
+    int n;
+    if ((d2u(x) & ~SIGN64) >= INF64) {
+        *sp = *cp = x - x;
+        return;
+    }
+    r = a - 2.0 * floor(a * 0.5);
+    n = (int)floor(2.0 * r + 0.5);
+    f = r - 0.5 * n;
+    TWOPROD(h, l, f, PI_H);
+    l += f * PI_L;
+    s = f == 0.0 ? 0.0 : sin_k(h, l, &lo);
+    c = cos_k(h, l, &lo);
+    switch (n & 3) {
+    case 0: break;
+    case 1: h = s; s = c; c = f == 0.0 ? 0.0 : -h; break;
+    case 2: s = f == 0.0 ? 0.0 : -s; c = -c; break;
+    default: h = s; s = -c; c = f == 0.0 ? 0.0 : h; break;
+    }
+    *sp = d2u(x) >> 63 ? -s : s;
+    *cp = c;
+}
+
+double sinpi(double x)
+{
+    double s, c;
+    __mcc_sincospi(x, &s, &c);
+    return s;
+}
+
+double cospi(double x)
+{
+    double s, c;
+    __mcc_sincospi(x, &s, &c);
+    return c;
+}
+
 /* ================= roots ================= */
 
 double cbrt(double x)
@@ -408,7 +451,7 @@ static void shift_up(double xh, double xl, double *ph, double *pl, double *yh, d
 }
 
 /* sin(pi a) for a > 0 not an integer as hi + lo; *odd tells whether floor(a) is odd */
-static double sinpi(double a, double *lo, int *odd)
+static double sinpi_dd(double a, double *lo, int *odd)
 {
     double n = floor(a), f = a - n, h, l;
     *odd = n < 0x1p53 && (n * 0.5 != floor(n * 0.5));
@@ -464,7 +507,7 @@ double tgamma(double x)
     if (a > 186.0)
         return (floor(a) * 0.5 == floor(floor(a) * 0.5)) ? -0.0 : 0.0;
     /* pi / (sin(pi x) gamma(1 - x)) */
-    sh = sinpi(a, &sl, &odd);
+    sh = sinpi_dd(a, &sl, &odd);
     TWOSUM(yh, yl, 1.0, a);
     h = gamma_pos(yh, yl, &l, &e);
     TWOPROD(dh, dl, sh, h);
@@ -541,7 +584,7 @@ double lgamma_r(double x, int *sign)
     if (a == floor(a))
         return 1.0 / 0.0;
     /* log(pi) - log|sin(pi x)| - log(gamma(1 - x)) */
-    sh = sinpi(a, &sl, &odd);
+    sh = sinpi_dd(a, &sl, &odd);
     if (!odd)
         *sign = -1;
     lh = log_dd(sh, &ll, 0);

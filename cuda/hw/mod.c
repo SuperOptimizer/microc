@@ -1972,6 +1972,24 @@ static void klog(const Item *it)
     (void)n;
 }
 
+/* A kernel whose PTX cannot be made or compiled (a device function that nothing defines, PTX the driver rejects) is a build error,
+   not a run-time condition: the launch fails every time, and a program that only latches launch errors (ufsm's KCHECK, read at the
+   next nn_check) went on with unwritten buffers (11-27: four_tab_k's sincospi with no double sinpi in the device library; the
+   message was on stderr, the test failed on garbage). So the process stops here, with the kernel's name. MCUDA_LOAD_SOFT=1 keeps
+   CUDA's rule instead (the launch returns the error; a warning says so). Out of memory while loading is not this case. */
+static void load_fatal(const char *kname, int r)
+{
+    const char *v = getenv("MCUDA_LOAD_SOFT");
+    if (v && v[0] && v[0] != '0') {
+        fprintf(stderr, "mcuda: warning: %s cannot be loaded (error %d); MCUDA_LOAD_SOFT: its launches return the error\n", kname, r);
+        return;
+    }
+    fprintf(stderr, "mcuda: fatal: kernel %s cannot be loaded (error %d, the reason above); stopping (MCUDA_LOAD_SOFT=1: return the error)\n",
+            kname, r);
+    fflush(stderr);
+    abort();
+}
+
 static void kload(Kern *K, int mod, int item)
 {
     Job J;
@@ -1980,12 +1998,13 @@ static void kload(Kern *K, int mod, int item)
     size_t size = 0;
     CUhandle link = 0;
     double t0;
-    int whole, lockfd = -1;
+    int whole, lockfd = -1, built;
 
     K->tried = 1;
     klog(&mods[mod].items[item]);
     job_prep(&J, mod, item);
     r = J.r;
+    built = r; /* (the kernel's text cannot be made: a device function nothing defines, 218) */
     job_dump(&J);
     if (!r && getenv("MCUDA_SUBST")) { /* MCUDA_SUBST=DIR: DIR/KERNEL.N.ptx, where there is one, in place of text N */
         for (j = 0; j < J.ntext; j++) {
@@ -2025,6 +2044,8 @@ static void kload(Kern *K, int mod, int item)
         r = hw.ModuleLoadDataEx(&K->module, J.texts[0].p, 2, opt, val);
         if (r)
             fprintf(stderr, "mcuda: %s: the driver does not compile its PTX as a whole program (error %d)\n%s\n", J.kname, r, log);
+        if (r && r != 2 /* (out of memory: not the text's fault) */)
+            built = r;
         else if (verbose())
             fprintf(stderr, "mcuda: %s: compiled as a whole program (setmaxnreg) in %.2f s\n", J.kname, now() - t0);
     } else if (!r && J.have_path) {
@@ -2045,6 +2066,8 @@ static void kload(Kern *K, int mod, int item)
     if (!r && !image && !whole) {
         t0 = now();
         r = job_compile(&J, &link, &cubin, &size);
+        if (r && r != 2)
+            built = r;
         if (!r) {
             r = hw.ModuleLoadData(&K->module, cubin);
             if (r)
@@ -2115,6 +2138,8 @@ static void kload(Kern *K, int mod, int item)
     }
     job_free(&J);
     K->err = r;
+    if (built)
+        load_fatal(J.kname, built);
 }
 
 /* ---- MCUDA_PRECOMPILE=N ----

@@ -23,6 +23,8 @@ int main(int argc, char **argv)
     long n;
     McModule *m;
     int timing = 0;
+    /* (t_diag.ptx's nofunc calls a function nothing defines on purpose, to see the diagnosis; elsewhere that stops the program) */
+    setenv("MCUDA_LOAD_SOFT", "1", 0);
     if (argc > 2 && strcmp(argv[1], "-t") == 0) {
         timing = 1;
         argv++;

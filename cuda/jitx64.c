@@ -212,6 +212,17 @@ static void ld(X *x, int r, s32 slot, int w)
         rm(x, 0, w, 0x8b, r, RBX, sdisp(slot));
 }
 
+/* the register to read the slot from: the pool's own if one holds it (an operand that is only read), else r, loaded */
+static int src(X *x, int r, s32 slot, int w)
+{
+    u64 v;
+    int c;
+    if (!kc(x, slot, &v) && (c = cached(x, slot)) >= 0)
+        return c;
+    ld(x, r, slot, w);
+    return r;
+}
+
 static int is_branch(u32 op);
 
 /* does an instruction after the current one, in its run, name the slot (before setting it)? */
@@ -409,8 +420,7 @@ static void ibin(X *x, Ins *ip, int w, u32 op)
         stv(x, RAX, ip->d);
         return;
     }
-    ld(x, RCX, ip->b, w);
-    rr(x, 0, w, op, RCX, RAX);
+    rr(x, 0, w, op, src(x, RCX, ip->b, w), RAX);
     stv(x, RAX, ip->d);
 }
 
@@ -422,13 +432,10 @@ static void imul(X *x, Ins *ip, int w, int add)
         rr(x, 0, w, 0x69, RAX, RAX); /* imul eax, eax, imm32 */
         b4(x, imm);
     } else {
-        ld(x, RCX, ip->b, w);
-        rr(x, 0, w, 0x0faf, RAX, RCX);
+        rr(x, 0, w, 0x0faf, RAX, src(x, RCX, ip->b, w));
     }
-    if (add) {
-        ld(x, RCX, ip->c, w);
-        rr(x, 0, w, 0x01, RCX, RAX);
-    }
+    if (add)
+        rr(x, 0, w, 0x01, src(x, RCX, ip->c, w), RAX);
     stv(x, RAX, ip->d);
 }
 
@@ -503,15 +510,15 @@ static void icmp(X *x, Ins *ip, int w, int sgn, int cmp)
     static const u8 ucc[6] = {CC_E, CC_NE, CC_B, CC_BE, CC_A, CC_AE}, scc[6] = {CC_E, CC_NE, CC_L, CC_LE, CC_G, CC_GE};
     u32 imm;
     int cc = sgn ? scc[cmp] : ucc[cmp];
-    ld(x, RCX, ip->a, w);
     if (immok(x, ip->b, w, &imm)) {
+        ld(x, RCX, ip->a, w);
         rex(x, w, 0, RCX, 0);
         b1(x, 0x81); /* cmp ecx, imm32 */
         b1(x, 0xf9);
         b4(x, imm);
     } else {
-        ld(x, RDX, ip->b, w);
-        rr(x, 0, w, 0x39, RDX, RCX); /* cmp rcx, rdx */
+        int ra = src(x, RCX, ip->a, w), rb = src(x, RDX, ip->b, w);
+        rr(x, 0, w, 0x39, rb, ra); /* cmp a, b */
     }
     setcc(x, cc, ip->d);
     /* the flags still say it where nothing else is written before a branch on it */

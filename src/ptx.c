@@ -3098,8 +3098,14 @@ static int moves_early(const u8 *live, u32 b, u32 s, u32 t)
     /* (a way back: s numbered no later than b and dominating it. The number alone does not tell: a loop's exit block made
        before the unrolled copies is numbered below them, and an early break out of `#pragma unroll` then made its 32 moves
        on the way on as well, every copy: conv1_bwd_fused_k's co loop, 512 moves a voxel step. Dominance alone admitted
-       later-numbered heads too, and f8s / fwd_s2_f4 lost 6-8 % (R11e 11-26). MCC_LATCHNUM=1: the number test only) */
-    if (s > b || t == s || !sb->phis || (!getenv("MCC_LATCHNUM") && !opt_dominates(s, b)))
+       later-numbered heads too, and f8s / fwd_s2_f4 lost 6-8 % (R11e 11-26). Even "s <= b and dominates" changed 1318
+       kernels and gave f4r / f8s / fwd_s2_f4 300-370 more MOVs (ptxas does better with those forward exits' moves early):
+       so only a join of many breaks (at least MCC_MVJOIN ways in, default 8; conv1's has 17) is held to the real test.
+       MCC_LATCHNUM=1: the number test only) */
+    static int mvjoin = -1;
+    if (mvjoin < 0)
+        mvjoin = getenv("MCC_LATCHNUM") ? 1 << 30 : getenv("MCC_MVJOIN") ? atoi(getenv("MCC_MVJOIN")) : 8;
+    if (s > b || t == s || !sb->phis || (sb->npreds >= (u32)mvjoin && !opt_dominates(s, b)))
         return 0;
     for (k = 0; k < sb->npreds; k++)
         if (sb->preds[k] == b)

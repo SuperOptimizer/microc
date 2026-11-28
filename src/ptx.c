@@ -3102,11 +3102,22 @@ static int moves_early(const u8 *live, u32 b, u32 s, u32 t)
        kernels and gave f4r / f8s / fwd_s2_f4 300-370 more MOVs (ptxas does better with those forward exits' moves early):
        so only a join of many breaks (at least MCC_MVJOIN ways in, default 8; conv1's has 17) is held to the real test.
        MCC_LATCHNUM=1: the number test only) */
-    static int mvjoin = -1;
-    if (mvjoin < 0)
+    static int mvjoin = -1, mvphi = -1;
+    if (mvjoin < 0) {
         mvjoin = getenv("MCC_LATCHNUM") ? 1 << 30 : getenv("MCC_MVJOIN") ? atoi(getenv("MCC_MVJOIN")) : 8;
-    if (s > b || t == s || !sb->phis || (sb->npreds >= (u32)mvjoin && !opt_dominates(s, b)))
+        mvphi = getenv("MCC_MVPHI") ? atoi(getenv("MCC_MVPHI")) : 16;
+    }
+    if (s > b || t == s || !sb->phis)
         return 0;
+    if (sb->npreds >= (u32)mvjoin && !opt_dominates(s, b)) {
+        /* (and only a wide one: at least MCC_MVPHI phis, default 16 (conv1's 32 sums); k_entropy's 17-way join of a few
+           values kept its early moves: its SASS is the pin's) */
+        u32 np = 0, q;
+        for (q = sb->phis; q; q = f->ins[q].next)
+            np += used[q] != 0;
+        if (np >= (u32)mvphi)
+            return 0;
+    }
     for (k = 0; k < sb->npreds; k++)
         if (sb->preds[k] == b)
             pi = k;

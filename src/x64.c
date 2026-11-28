@@ -126,6 +126,8 @@ static const MTarget target = {
     XHI_MASK, 0
 };
 
+static void cs_try(const MTarget *t);
+
 static int vex3; /* scalar float arithmetic as AVX's three-operand instructions (-mavx; MCC_NOVEX3: the SSE ones) */
 
 static const u8 arg_gr[6] = { RDI, RSI, RDX, RCX, R8, R9 };
@@ -7922,6 +7924,56 @@ static int split_loops(void)
    VEX instruction has one if evex_form knows it, and not when a fourth register rides in its immediate byte
    (vblendvps). The legacy 128-bit vector code, the VEX gathers (three registers that must differ, a vector mask)
    and inline assembly keep to xmm0-xmm15. */
+/* Caller-saved registers across calls. A value alive across a call has a callee-saved register, and the function
+   saves and restores that register every time it is entered, though the call may be on a way seldom taken (a table
+   grown when it is full, a recursion past the usual quick answer). When the calls are rare beside the entries, such
+   values get caller-saved registers instead and are saved round each call (ra.c's cs_mode): allocated both ways,
+   and kept if saving round the calls, by the blocks' guessed frequencies, costs less than the saves and restores
+   it spares at entry and return. MCC_NOCSAVE: off; MCC_CSLOG: what was decided. */
+static int cs_cmp(const void *a, const void *b)
+{
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void cs_try(const MTarget *t)
+{
+    static int off = -1;
+    static u64 cs_margin = 100; /* per cent: the guess of the calls' cost counts for that much (MCC_CSMARGIN=N) */
+    u64 callee = ~t->caller_saved & t->allocatable[0], entry, c0, c1;
+    u32 k, k0 = 0, k1 = 0;
+    if (off < 0) {
+        off = getenv("MCC_NOCSAVE") != 0;
+        if (getenv("MCC_CSMARGIN"))
+            cs_margin = (u64)atoi(getenv("MCC_CSMARGIN"));
+    }
+    if (off || opt_level < 2 || opt_size || !mf.nblk || mf.blk[0].freq < 2 || !mf.cs_cost)
+        return;
+    for (k = 0; k < mf.n; k++)
+        if (mf.ins[k].op == X_ASM)
+            return;
+    for (k = 0; k < 16; k++)
+        k0 += (u32)(mf.used & callee) >> k & 1;
+    if (!k0)
+        return;
+    entry = 2 * (u64)mf.blk[0].freq;
+    c0 = mf.cs_cost;
+    if (c0 >= entry * k0)
+        return; /* (the calls are no rarer than that: nothing to gain) */
+    mf.cs_mode = 1;
+    ra_rerun(&mf, t);
+    for (k = 0; k < 16; k++)
+        k1 += (u32)(mf.used & callee) >> k & 1;
+    c1 = mf.cs_cost;
+    if (getenv("MCC_CSLOG"))
+        fprintf(stderr, "csave %s: %lu callee-saved registers -> %lu, round the calls %lu against %lu at entry\n", f->name ? f->name : "?",
+                (unsigned long)k0, (unsigned long)k1, (unsigned long)c1, (unsigned long)(entry * (k0 - (k1 < k0 ? k1 : k0))));
+    if (k1 >= k0 || c1 * cs_margin / 100 >= entry * (k0 - k1)) {
+        mf.cs_mode = 0;
+        ra_rerun(&mf, t);
+    }
+}
+
 static int x16_enc_ok(u32 enc)
 {
     return XE_Z(enc) || evex_form(XE_MAP(enc), XE_PP(enc), XE_OPC(enc));
@@ -8008,7 +8060,9 @@ void x64_gen(Func *fn, Obj *o)
             t.allocatable[1] |= XHI_MASK;
             t.ext_first = 1;
         }
+        mf.cs_mode = 0;
         ra_run(&mf, &t);
+        cs_try(&t);
         if (x16 == 1 && (nsp = x16_spilled()) != 0) {
             /* xmm0-xmm12 were not enough: again with xmm16-xmm31, which the registers that may be there take first
                (the others then find room below; an EVEX encoding is two bytes longer, so only functions that spill
@@ -8163,6 +8217,8 @@ void x64_gen(Func *fn, Obj *o)
         capmoff = mf.n + 1;
         moff = (u32 *)xrealloc(moff, capmoff * sizeof(u32));
     }
+    if (mf.cs_n)
+        qsort(mf.cs_list, mf.cs_n / 3, 3 * sizeof(u32), cs_cmp);
     jt_plan();
     for (k = 0; k < mf.nblk; k++) {
         MBlock *mb = &mf.blk[k];
@@ -8187,6 +8243,30 @@ void x64_gen(Func *fn, Obj *o)
                 }
             }
             ins_start = (u32)text->len;
+            if (mf.cs_n && (mf.ins[n].flags & MF_CALL) && mf.ins[n].op != X_TAIL) {
+                /* the caller-saved registers alive across this call: to their slots, and back after it */
+                u32 lo = 0, hi = mf.cs_n / 3, c;
+                EA ea;
+                while (lo < hi) {
+                    u32 mid = (lo + hi) / 2;
+                    if (mf.cs_list[3 * mid] < n)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+                for (c = lo; c < mf.cs_n / 3 && mf.cs_list[3 * c] == n; c++) {
+                    ea_spill(&ea, SPILL0 + mf.cs_list[3 * c + 2]);
+                    store_reg(mf.cs_list[3 * c + 1], &ea);
+                }
+                ins_start = (u32)text->len;
+                encode(&mf.ins[n]);
+                text = &o->sec[arm64_text_sec];
+                for (c = lo; c < mf.cs_n / 3 && mf.cs_list[3 * c] == n; c++) {
+                    ea_spill(&ea, SPILL0 + mf.cs_list[3 * c + 2]);
+                    load_reg(mf.cs_list[3 * c + 1], &ea);
+                }
+                continue;
+            }
             encode(&mf.ins[n]);
             text = &o->sec[arm64_text_sec];
         }

@@ -949,7 +949,33 @@ static int one(X *x, u32 i)
         stv(x, RAX, ip->d);
         return 1;
     case OP_ATOM:
-    case OP_ATOM_S:
+    case OP_ATOM_S: {
+        u32 aop = ip->aux & 15, at = ip->aux >> 4;
+        int w64 = at == T_B64 || at == T_U64 || at == T_S64;
+        if ((aop == AT_ADD || aop == AT_EXCH || aop == AT_CAS) && (w64 || at == T_B32 || at == T_U32 || at == T_S32)) {
+            /* an integer of 32 or 64 bits added, exchanged or compared and exchanged: the processor's instruction
+               (what mc_atom does with them); the old value is the result */
+            addr(x, ip, op == OP_ATOM_S, i);
+            rr(x, 0, 1, 0x89, RAX, RDX); /* mov rdx, rax */
+            ld(x, RCX, ip->b, w64);
+            if (aop == AT_ADD) {
+                b1(x, 0xf0); /* lock xadd [rdx], rcx */
+                rm(x, 0, w64, 0x0fc1, RCX, RDX, 0);
+                rr(x, 0, w64, 0x89, RCX, RAX); /* mov rax, rcx */
+            } else if (aop == AT_EXCH) {
+                rm(x, 0, w64, 0x87, RCX, RDX, 0); /* xchg [rdx], rcx */
+                rr(x, 0, w64, 0x89, RCX, RAX);
+            } else {
+                rr(x, 0, w64, 0x89, RCX, RAX); /* mov rax, rcx: what it is compared with */
+                ld(x, RCX, ip->e, w64);
+                b1(x, 0xf0); /* lock cmpxchg [rdx], rcx */
+                rm(x, 0, w64, 0x0fb1, RCX, RDX, 0);
+                if (!w64)
+                    rr(x, 0, 0, 0x89, RAX, RAX); /* mov eax, eax */
+            }
+            stv(x, RAX, ip->d);
+            return 1;
+        }
         addr(x, ip, op == OP_ATOM_S, i);
         ld(x, RCX, ip->b, 1);
         ld(x, RDX, ip->e, 1);
@@ -964,6 +990,7 @@ static int one(X *x, u32 i)
         callc(x, (void *)mc_atom);
         stv(x, RAX, ip->d);
         return 1;
+    }
     case OP_CALLB: {
         /* a function the run time has built in (memcpy, the mathematics, printf): mc_builtin_call as the
            interpreter calls it, with the thread's place and frame noted first. It reads and writes the frame, so

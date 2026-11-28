@@ -3301,13 +3301,48 @@ static void prepare(void)
     }
     /* a comparison used only as the condition of branches and selects is
        never made into a value: each of them sets the flags again */
-    for (v = 1; v < f->nins; v++) {
-        int op = f->ins[v].op, cond = fused[v] != FUSE_NOT && uses[v];
-        fused[v] = (u8)(cond && is_compare(op) ? FUSE_CMP : 0);
-        /* a truncation leaves the low half where it is; so does extending
-           what a 32-bit operation produced, since that cleared the upper half */
-        if (uses[v] && f->ins[v].blk && (op == OP_TRUNC || (op == OP_ZEXT32 && clean32(f->ins[f->ins[v].a].op))))
-            fused[v] = FUSE_ALIAS;
+    /* 32-bit values that meet in a phi or are chosen by a select have a clear upper half when all of them do (a
+       loop's counter from 0 and its own sum; constants are loaded as 32 bits): at first every such phi is taken
+       to, then those with an operand that does not are struck until none is left (MCC_NOCLEANPHI: none) */
+    {
+        static int off = -1;
+        u8 *cl = (u8 *)xmalloc(f->nins);
+        int again;
+        if (off < 0)
+            off = getenv("MCC_NOCLEANPHI") != 0;
+#define CLEAN32(x) (cl[x] || f->ins[x].op == OP_CONST)
+        for (v = 1; v < f->nins; v++) {
+            int op = f->ins[v].op;
+            cl[v] = (u8)(f->ins[v].ty == IT_I32 && (clean32(op) || (!off && (op == OP_PHI || op == OP_SELECT))));
+        }
+        do {
+            again = 0;
+            for (v = 1; v < f->nins && !off; v++) {
+                Ins *i = &f->ins[v];
+                u32 n;
+                if (!cl[v])
+                    continue;
+                if (i->op == OP_PHI) {
+                    for (n = 0; n < i->b && CLEAN32(f->xargs[i->a + n]) && f->ins[f->xargs[i->a + n]].ty == IT_I32; n++)
+                        ;
+                    if (n < i->b || !i->blk)
+                        cl[v] = 0, again = 1;
+                } else if (i->op == OP_SELECT) {
+                    if (!CLEAN32(i->b) || !CLEAN32(i->c) || f->ins[i->b].ty != IT_I32 || f->ins[i->c].ty != IT_I32)
+                        cl[v] = 0, again = 1;
+                }
+            }
+        } while (again);
+#undef CLEAN32
+        for (v = 1; v < f->nins; v++) {
+            int op = f->ins[v].op, cond = fused[v] != FUSE_NOT && uses[v];
+            fused[v] = (u8)(cond && is_compare(op) ? FUSE_CMP : 0);
+            /* a truncation leaves the low half where it is; so does extending
+               what a 32-bit operation produced, since that cleared the upper half */
+            if (uses[v] && f->ins[v].blk && (op == OP_TRUNC || (op == OP_ZEXT32 && cl[f->ins[v].a])))
+                fused[v] = FUSE_ALIAS;
+        }
+        free(cl);
     }
     /* -ffp-contract with FMA: a product used only by a sum or difference is rounded with it, in one vfmadd */
     free(fma_sum);

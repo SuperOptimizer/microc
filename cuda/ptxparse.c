@@ -439,11 +439,18 @@ static int type_of(const char *s)
 
 int mc_tbits(int t)
 {
+    /* (asked for every conversion and atomic operation as it runs: a table, made of typetab the first time; the
+       threads that make it at once write the same) */
+    static u8 bits[64];
+    static int made;
     int i;
-    for (i = 0; typetab[i].name; i++)
-        if (typetab[i].t == t)
-            return typetab[i].bits;
-    return 0;
+    if (!made) {
+        for (i = 0; typetab[i].name; i++)
+            if (typetab[i].t >= 0 && typetab[i].t < 64 && !bits[typetab[i].t])
+                bits[typetab[i].t] = (u8)typetab[i].bits;
+        made = 1;
+    }
+    return t >= 0 && t < 64 ? bits[t] : 0;
 }
 
 static const char *tname(int t)

@@ -425,10 +425,15 @@ u64 mc_atom(Blk *b, u32 spec, u8 *p, u64 x, u64 y)
     u64 old, nv;
     Slot o, v, r;
     (void)b;
-    mcuda_lock_addr(p);
-    old = bits == 64 ? *(u64 *)p : bits == 32 ? *(u32 *)p : *(u16 *)p;
     if (bits < 64)
         x &= (1UL << bits) - 1, y &= (1UL << bits) - 1;
+    /* a word of 32 or 64 bits: read, the new value made, and written if the word is still what was read, else again
+       (no lock: the stripe's mutex was most of a histogram's time, and its kernels did not run side by side).
+       16 bits: under the address's lock, as before. */
+    if (bits < 32)
+        mcuda_lock_addr(p);
+again:
+    old = bits == 64 ? __atomic_load_n((u64 *)p, __ATOMIC_SEQ_CST) : bits == 32 ? __atomic_load_n((u32 *)p, __ATOMIC_SEQ_CST) : *(u16 *)p;
     o.u = old;
     v.u = x;
     r.u = 0;
@@ -497,13 +502,18 @@ u64 mc_atom(Blk *b, u32 spec, u8 *p, u64 x, u64 y)
         break;
     }
     }
-    if (bits == 64)
-        *(u64 *)p = nv;
-    else if (bits == 32)
-        *(u32 *)p = (u32)nv;
-    else
+    if (bits == 64) {
+        u64 e = old;
+        if (!__atomic_compare_exchange_n((u64 *)p, &e, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            goto again;
+    } else if (bits == 32) {
+        u32 e = (u32)old;
+        if (!__atomic_compare_exchange_n((u32 *)p, &e, (u32)nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            goto again;
+    } else {
         *(u16 *)p = (u16)nv;
-    mcuda_unlock_addr(p);
+        mcuda_unlock_addr(p);
+    }
     return old;
 }
 
@@ -1851,6 +1861,16 @@ static void do_vprintf(const char *fmt, const u8 *buf, int slots)
     }
 }
 
+/* a double that is a whole number, as a long: what does not fit is the nearest long, a NaN the least (as cvt to
+   .s64, see cvt_do). The cast alone gave what the processor gives: 0x8000000000000000 for all of them on x86-64,
+   the nearest and 0 on arm64. */
+static u64 d2s64(double v)
+{
+    if (v != v || v < -9223372036854775808.0)
+        return 1UL << 63;
+    return v >= 9223372036854775808.0 ? 0x7fffffffffffffffUL : (u64)(s64)v;
+}
+
 int mc_builtin_call(Blk *b, Thr *t, int id, Ins *ip)
 {
     s32 *x = t->f->xtra + ip->a, *rets = x + 4, *args;
@@ -1994,10 +2014,10 @@ int mc_builtin_call(Blk *b, Thr *t, int id, Ins *ip)
         break;
     }
     case BF_LRINT:
-        r = (u64)(s64)mc_rintn(argf(a[0], single));
+        r = d2s64(mc_rintn(argf(a[0], single)));
         break;
     case BF_LROUND:
-        r = (u64)(s64)mc_rinta(argf(a[0], single));
+        r = d2s64(mc_rinta(argf(a[0], single)));
         break;
     case BF_SINCOS: {
         double v = argf(a[0], single), s = sin(v), c = cos(v);

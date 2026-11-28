@@ -272,7 +272,7 @@ int ir_is_fconst(Func *f, u32 v, double *val)
     return 1;
 }
 
-u32 ir_resolve(Func *f, u32 v)
+u32 ir_resolve_(Func *f, u32 v)
 {
     while (f->ins[v].op == OP_COPY)
         v = f->ins[v].a;

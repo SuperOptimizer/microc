@@ -226,7 +226,9 @@ void ir_store(Func *f, int mem, u32 addr, u32 val);
 u32 ir_call(Func *f, int ty, u32 callee, const u32 *args, u32 nargs, u32 nfixed, int flags);
 u32 ir_phi(Func *f, u32 blk, int ty); /* arguments filled in later */
 u32 ir_xi(Func *f, int ty, u32 id, const u32 *args, u32 nargs); /* OP_XI, appended to f->cur */
-u32 ir_resolve(Func *f, u32 v);       /* follow OP_COPY chains */
+u32 ir_resolve_(Func *f, u32 v);      /* follow OP_COPY chains */
+/* (most values are not copies: the test here, and no call in the loops that walk a function's operands) */
+#define ir_resolve(f, v) ((f)->ins[v].op == OP_COPY ? ir_resolve_(f, v) : (u32)(v))
 u32 ir_fold_at(Func *f, u32 v);       /* simplify placed instruction v; returns its replacement or 0 */
 void ir_resolve_all(Func *f);         /* rewrite every operand through OP_COPY */
 void ir_phi_add_arg(Func *f, u32 phi, u32 val);

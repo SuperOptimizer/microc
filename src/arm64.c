@@ -47,6 +47,7 @@ enum {
     A_VDUP, /* scalar s0 into every lane; imm: s0 is a floating point register */
     A_VSUM, /* scalar register d = the lanes of s0 combined; imm as OP_VSUM's flags */
     A_VSEL, /* lane mask s0 ? s1 : s2 */
+    A_VFMA, /* s0 * s1 and s2 in one rounding, lane by lane; imm: 0 s2 + product, 1 s2 - product, 2 product - s2 */
     A_VIOTA /* 0, imm, 2 * imm, ... in the lanes */
 };
 
@@ -898,6 +899,27 @@ static void sel_vec(u32 v)
         m = emit(A_VBIN, 0, d, reg_of(i->a), NOREG);
         m->imm = i->op;
         break;
+    case OP_FMUL:
+        if (fused[v] == FUSE_OPND)
+            return; /* in its user's fmla / fmls */
+        m = emit(A_VBIN, 0, d, reg_of(i->a), reg_of(i->b));
+        m->imm = i->op;
+        break;
+    case OP_FADD:
+    case OP_FSUB: {
+        /* (-ffp-contract=fast) a product used only here is rounded with the sum, as the scalar loop's fmadd does */
+        u32 p = fused[i->a] == FUSE_OPND ? i->a : fused[i->b] == FUSE_OPND ? i->b : 0;
+        if (p) {
+            u32 ra = reg_of(f->ins[p].a), rb = reg_of(f->ins[p].b), rc = reg_of(p == i->b ? i->a : i->b);
+            m = emit(A_VFMA, 0, d, ra, rb);
+            m->s2 = rc;
+            m->imm = i->op == OP_FADD ? 0 : p == i->b ? 1 : 2;
+            break;
+        }
+        m = emit(A_VBIN, 0, d, reg_of(i->a), reg_of(i->b));
+        m->imm = i->op;
+        break;
+    }
     default:
         m = emit(A_VBIN, 0, d, reg_of(i->a), reg_of(i->b));
         m->imm = i->op;
@@ -2258,11 +2280,15 @@ static void prepare(void)
         for (v = bb->first; v; v = f->ins[v].next) {
             Ins *i = &f->ins[v];
             u32 t;
-            if ((i->op != OP_FADD && i->op != OP_FSUB) || (i->ty != IT_F32 && i->ty != IT_F64))
+            /* (vector lanes too: a vectorised loop rounds a * b + c as its scalar remainder and the same loop left scalar
+               do; tests/c/vfma) */
+            int vf = i->ty == IT_V128 && (i->mem == M_F32 || i->mem == M_F64);
+            if ((i->op != OP_FADD && i->op != OP_FSUB) || (i->ty != IT_F32 && i->ty != IT_F64 && !vf))
                 continue;
             for (t = 0; t < 2; t++) {
                 u32 y = t ? i->b : i->a;
-                if (f->ins[y].op == OP_FMUL && f->ins[y].blk && uses[y] == 1 && !fused[y] && i->a != i->b) {
+                if (f->ins[y].op == OP_FMUL && f->ins[y].ty == i->ty && (!vf || f->ins[y].mem == i->mem) && f->ins[y].blk &&
+                    uses[y] == 1 && !fused[y] && i->a != i->b) {
                     fused[y] = FUSE_OPND;
                     break;
                 }
@@ -3203,6 +3229,19 @@ static void encode(MIns *i)
         put(0x9e670000 | (16 << 5) | rd); /* fmov d, x16 */
         mov_imm(16, hi, 1);
         put(0x4e181c00 | (16 << 5) | rd); /* mov v.d[1], x16 */
+        break;
+    }
+    case A_VFMA: {
+        /* fmla / fmls add to (subtract from) their destination: the third operand goes there first, negated for
+           product - s2; in v31 when the destination is one of the factors */
+        u32 rc = s[2] & 31, sz = i->cc == M_F64, acc = rd == rn || rd == rm ? 31 : rd;
+        if (i->imm == 2)
+            put(0x6ea0f800 | (sz << 22) | (rc << 5) | acc); /* fneg */
+        else if (acc != rc)
+            put(0x4ea01c00 | (rc << 16) | (rc << 5) | acc); /* mov */
+        put((i->imm == 1 ? 0x4ea0cc00 : 0x4e20cc00) | (sz << 22) | (rm << 16) | (rn << 5) | acc);
+        if (acc != rd)
+            put(0x4ea01c00 | (acc << 16) | (acc << 5) | rd);
         break;
     }
     case A_VSEL: {

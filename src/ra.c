@@ -249,10 +249,13 @@ void ra_run(MFunc *m, const MTarget *t)
     u32 *same;         /* a register that shares the interval of another: which (itself if none) */
     u32 *avoid;        /* MF_NOTS1: the register whose place this one had better not take (NOREG if none) */
     u32 *copies, ncopy; /* register-to-register copies still to look at: instruction, depth in the top two bits */
+    u32 *callins, *callblk, ncall = 0; /* the calls, in order: instruction and block */
     int changed, dp;
 
     m->nspill = 0;
     m->used = 0;
+    m->cs_n = 0;
+    m->cs_cost = 0;
     /* Instruction selection numbers registers sparsely (one per IR value,
        most never used). Renumber densely: everything below is sized by nv. */
     {
@@ -307,6 +310,8 @@ void ra_run(MFunc *m, const MTarget *t)
     gidx = NEW(u32, nv);
     glist = NEW(u32, nv);
     cc = NEW(u32, nslot + 2);
+    callins = NEW(u32, m->n + 1);
+    callblk = NEW(u32, m->n + 1);
     for (k = 0; k < 64; k++)
         fixed[k].n = fpos[k] = 0;
     memset(head, 0, nv * sizeof(u32));
@@ -336,6 +341,10 @@ void ra_run(MFunc *m, const MTarget *t)
             if (in->d != NOREG && in->d >= VREG0)
                 stamp[in->d - VREG0] = b;
             cc[i + b + 1] = cc[i + b] + ((in->flags & MF_CALL) != 0);
+            if (in->flags & MF_CALL) {
+                callins[ncall] = i;
+                callblk[ncall++] = b;
+            }
         }
         cc[mb->first + mb->n + b + 1] = cc[mb->first + mb->n + b]; /* the gap */
     }
@@ -559,6 +568,8 @@ void ra_run(MFunc *m, const MTarget *t)
                 hi = nslot;
             xcall[v] = cc[hi] > cc[lo];
         }
+        if (m->cs_mode && !(m->vclass[v] & 3))
+            xcall[v] = 0; /* (a general register: saved round the calls where it is caller-saved, see below) */
     }
 
     /* Coalescing: the two sides of a copy whose lifetimes do not overlap become one interval, and the
@@ -842,6 +853,44 @@ void ra_run(MFunc *m, const MTarget *t)
                 m->loc[v] = SPILL0 + renum[sl];
             }
         m->nspill = nn;
+    }
+
+    /* the general registers that calls lie in the ranges of: what saving them round those calls costs, and with
+       cs_mode the list of them for the target (see mir.h) */
+    m->cs_n = 0;
+    m->cs_cost = 0;
+    for (v = 0; v < nv && ncall; v++) {
+        u32 r, slot = NOREG;
+        if (same[v] != v || !head[v] || (m->vclass[v] & 3) || m->loc[v] >= 64)
+            continue;
+        if (m->cs_mode && !(t->caller_saved >> m->loc[v] & 1))
+            continue;
+        for (r = head[v]; r; r = rg_next[r]) {
+            u32 lo = 0, hi = ncall;
+            /* the first call written after the range's start (a call in instruction i of block b writes at
+               2 (i + b) + 3) */
+            while (lo < hi) {
+                u32 mid = (lo + hi) / 2;
+                if (2 * (callins[mid] + callblk[mid]) + 3 <= rg_start[r])
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            for (; lo < ncall && 2 * (callins[lo] + callblk[lo]) + 3 < rg_end[r]; lo++) {
+                m->cs_cost += 2 * (u64)(m->blk[callblk[lo]].freq ? m->blk[callblk[lo]].freq : 1);
+                if (!m->cs_mode)
+                    continue;
+                if (slot == NOREG)
+                    slot = m->nspill++;
+                if (m->cs_n + 3 > m->cs_cap) {
+                    m->cs_cap = m->cs_cap ? m->cs_cap * 2 : 48;
+                    m->cs_list = (u32 *)xrealloc(m->cs_list, m->cs_cap * sizeof(u32));
+                }
+                m->cs_list[m->cs_n++] = callins[lo];
+                m->cs_list[m->cs_n++] = m->loc[v];
+                m->cs_list[m->cs_n++] = slot;
+            }
+        }
     }
 
 #undef BIT

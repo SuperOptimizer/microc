@@ -52,6 +52,15 @@ typedef struct MFunc {
     u32 *loc; /* per virtual register: physical register or SPILL0 + n */
     u32 nspill;
     u64 used; /* physical registers assigned */
+    /* Caller-saved registers across calls (x64.c): with cs_mode set, a general register's range that a call lies in
+       may get a caller-saved register all the same; ra_run then lists, for each such register at each such call,
+       (the call's instruction, the register, a spill slot for it): the target saves it there before the call and
+       loads it after. cs_cost is what those cost, each weighted by its block's frequency, in either mode (without
+       cs_mode: what they would cost for the registers that now have callee-saved ones). */
+    int cs_mode;
+    u32 *cs_list;
+    u32 cs_n, cs_cap;
+    u64 cs_cost;
 } MFunc;
 
 typedef struct MTarget {

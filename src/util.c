@@ -298,3 +298,21 @@ u32 intern_count(void)
 {
     return intern_n ? intern_n : 1;
 }
+
+#undef getenv
+extern char *getenv(const char *name);
+char *mcc_getenv(const char *name)
+{
+    static const char *key[512];
+    static char *val[512];
+    size_t h = ((size_t)name >> 2 ^ (size_t)name >> 11) & 511, n;
+    for (n = 0; n < 8; n++, h = (h + 1) & 511) {
+        if (key[h] == name)
+            return val[h];
+        if (!key[h]) {
+            key[h] = name;
+            return val[h] = getenv(name);
+        }
+    }
+    return getenv(name);
+}

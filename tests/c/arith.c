@@ -7,7 +7,7 @@ int main(void)
     int a = id(7), b = id(-3);
     unsigned u = uid(4000000000u);
     long l = lid(123456789012345L);
-    char c = (char)id(200);
+    signed char c = (signed char)id(200); /* (plain char is unsigned on aarch64 Linux) */
     unsigned char uc = (unsigned char)id(200);
     short s = (short)id(70000);
     CHECK(a + b == 4);

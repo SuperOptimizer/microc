@@ -126,6 +126,8 @@ static const MTarget target = {
     XHI_MASK, 0
 };
 
+static void cs_try(const MTarget *t);
+
 static int vex3; /* scalar float arithmetic as AVX's three-operand instructions (-mavx; MCC_NOVEX3: the SSE ones) */
 
 static const u8 arg_gr[6] = { RDI, RSI, RDX, RCX, R8, R9 };
@@ -3301,13 +3303,48 @@ static void prepare(void)
     }
     /* a comparison used only as the condition of branches and selects is
        never made into a value: each of them sets the flags again */
-    for (v = 1; v < f->nins; v++) {
-        int op = f->ins[v].op, cond = fused[v] != FUSE_NOT && uses[v];
-        fused[v] = (u8)(cond && is_compare(op) ? FUSE_CMP : 0);
-        /* a truncation leaves the low half where it is; so does extending
-           what a 32-bit operation produced, since that cleared the upper half */
-        if (uses[v] && f->ins[v].blk && (op == OP_TRUNC || (op == OP_ZEXT32 && clean32(f->ins[f->ins[v].a].op))))
-            fused[v] = FUSE_ALIAS;
+    /* 32-bit values that meet in a phi or are chosen by a select have a clear upper half when all of them do (a
+       loop's counter from 0 and its own sum; constants are loaded as 32 bits): at first every such phi is taken
+       to, then those with an operand that does not are struck until none is left (MCC_NOCLEANPHI: none) */
+    {
+        static int off = -1;
+        u8 *cl = (u8 *)xmalloc(f->nins);
+        int again;
+        if (off < 0)
+            off = getenv("MCC_NOCLEANPHI") != 0;
+#define CLEAN32(x) (cl[x] || f->ins[x].op == OP_CONST)
+        for (v = 1; v < f->nins; v++) {
+            int op = f->ins[v].op;
+            cl[v] = (u8)(f->ins[v].ty == IT_I32 && (clean32(op) || (!off && (op == OP_PHI || op == OP_SELECT))));
+        }
+        do {
+            again = 0;
+            for (v = 1; v < f->nins && !off; v++) {
+                Ins *i = &f->ins[v];
+                u32 n;
+                if (!cl[v])
+                    continue;
+                if (i->op == OP_PHI) {
+                    for (n = 0; n < i->b && CLEAN32(f->xargs[i->a + n]) && f->ins[f->xargs[i->a + n]].ty == IT_I32; n++)
+                        ;
+                    if (n < i->b || !i->blk)
+                        cl[v] = 0, again = 1;
+                } else if (i->op == OP_SELECT) {
+                    if (!CLEAN32(i->b) || !CLEAN32(i->c) || f->ins[i->b].ty != IT_I32 || f->ins[i->c].ty != IT_I32)
+                        cl[v] = 0, again = 1;
+                }
+            }
+        } while (again);
+#undef CLEAN32
+        for (v = 1; v < f->nins; v++) {
+            int op = f->ins[v].op, cond = fused[v] != FUSE_NOT && uses[v];
+            fused[v] = (u8)(cond && is_compare(op) ? FUSE_CMP : 0);
+            /* a truncation leaves the low half where it is; so does extending
+               what a 32-bit operation produced, since that cleared the upper half */
+            if (uses[v] && f->ins[v].blk && (op == OP_TRUNC || (op == OP_ZEXT32 && cl[f->ins[v].a])))
+                fused[v] = FUSE_ALIAS;
+        }
+        free(cl);
     }
     /* -ffp-contract with FMA: a product used only by a sum or difference is rounded with it, in one vfmadd */
     free(fma_sum);
@@ -4318,6 +4355,11 @@ static u32 use(u32 r, u32 scratch)
         return l;
     if (spill_cached(l, scratch))
         return scratch;
+    if (l == sp_loc && sp_end == ins_start && text->len == ins_start && sp_reg != scratch && sp_reg < XMM0 && scratch < XMM0) {
+        /* just stored from the other scratch register: a copy of that, not a load of what is on its way to memory */
+        op_rr(0x89, 1, sp_reg, scratch);
+        return scratch;
+    }
     ea_spill(&ea, l);
     load_regw(scratch, &ea, vw_of(r));
     return scratch;
@@ -4395,7 +4437,9 @@ static void mov_locw(u32 dr, u32 l, int vw)
 static void mov_loc(u32 dr, u32 l)
 {
     EA ea;
-    if (is_spill(l)) {
+    if (is_spill(l) && l == sp_loc && sp_end == ins_start && text->len == ins_start && sp_reg < XMM0 && dr < XMM0) {
+        mov_rr(dr, sp_reg); /* (just stored from that register, see use()) */
+    } else if (is_spill(l)) {
         ea_spill(&ea, l);
         load_reg(dr, &ea);
     } else {
@@ -6139,6 +6183,365 @@ static u32 fx_len(const Fixup *fx)
     return fx->state == 2 ? 0 : fx->state == 1 ? 2 : fx_long(fx);
 }
 
+/* ---- jump tables ----
+   A switch comes here as a tree of blocks that each compare one value with a constant and branch (the IR has two
+   ways out of a block). After allocation, a block that ends "cmp L, c; jcc" whose ways lead through blocks that are
+   nothing but such a comparison of the same location is the root of one: when the constants are dense enough, the
+   root ends instead with an indexed jump through a table of the places the tree would have led to, one for each
+   value from the least constant to the greatest, and the tree's inner blocks, reached by nothing else, are not
+   written. The table follows the function's code: 32-bit distances from itself, so nothing is relocated.
+   (An interpreter's switch: eight compares and branches a turn, and its time went with the branch predictor's luck
+   in where the function was placed.) MCC_NOJTAB: off. */
+#define JT_NONE 0xffffffffU
+typedef struct JTab {
+    u32 root, loc, n, ncut, lea_off;
+    u32 *tgt;
+    u32 below, above; /* where the values under and over the table go (below JT_NONE: where those over go) */
+    i64 lo;
+    int w, uns;
+} JTab;
+static JTab *jtabs;
+static u32 njtab, capjtab;
+static u32 *jt_of; /* per block: its table's index + 1 */
+static u8 *jt_dead;
+
+/* Block k ends (strict: is nothing but) a comparison of a location with a constant and a branch on it: the location,
+   the constant, the condition, and where it goes when the condition holds and when not; the number of instructions. */
+static u32 jt_node(u32 k, int strict, u32 *loc, int *w, i64 *c, int *cc, u32 *taken, u32 *fall)
+{
+    const MBlock *mb = &mf.blk[k];
+    const MIns *e = mf.ins + mb->first + mb->n, *j, *cm;
+    u32 n = 2;
+    if (mb->n < 2)
+        return 0;
+    j = e - 1;
+    if (j->op == X_JMP) {
+        if (mb->n < 3)
+            return 0;
+        *fall = (u32)j->imm;
+        j--;
+        n = 3;
+    } else {
+        if (k + 1 >= mf.nblk)
+            return 0;
+        *fall = k + 1;
+    }
+    cm = j - 1;
+    if (j->op != X_JCC || (strict && mb->n != n))
+        return 0;
+    if (cm->op == X_CMPI && cm->s0 != NOREG) {
+        *c = cm->imm;
+    } else if (cm->op == X_TEST && cm->s0 == cm->s1 && cm->s0 != NOREG) {
+        *c = 0;
+    } else {
+        return 0;
+    }
+    *cc = j->cc;
+    if (cm->op == X_TEST) {
+        if (*cc == CC_S)
+            *cc = CC_L;
+        else if (*cc == CC_NS)
+            *cc = CC_GE;
+        else if (*cc != CC_E && *cc != CC_NE && *cc != CC_L && *cc != CC_GE && *cc != CC_LE && *cc != CC_G)
+            return 0; /* (after a test the unsigned conditions say other things: no carry) */
+    }
+    switch (*cc) {
+    case CC_E: case CC_NE: case CC_L: case CC_GE: case CC_LE: case CC_G: case CC_B: case CC_AE: case CC_BE: case CC_A:
+        break;
+    default:
+        return 0;
+    }
+    *loc = loc_of(cm->s0);
+    if (*loc == NOREG || (!is_spill(*loc) && *loc >= XMM0))
+        return 0;
+    *w = cm->w;
+    *taken = (u32)j->imm;
+    return n;
+}
+
+static int jt_holds(int cc, i64 v, i64 c)
+{
+    switch (cc) {
+    case CC_E: return v == c;
+    case CC_NE: return v != c;
+    case CC_L: case CC_B: return v < c;
+    case CC_GE: case CC_AE: return v >= c;
+    case CC_LE: case CC_BE: return v <= c;
+    }
+    return v > c;
+}
+
+/* where the tree under root sends the value v */
+static u32 jt_dest(u32 root, u32 loc, int w, i64 v)
+{
+    u32 k = root, l, t, fl, hops;
+    int w2, cc;
+    i64 c;
+    for (hops = 0; hops < 64; hops++) {
+        if (k >= mf.nblk)
+            return JT_NONE;
+        if (k == root && hops)
+            return k; /* (round a loop to the switch again) */
+        if (k != root) {
+            /* a block of nothing (copies between a place and itself, a jump): where it goes */
+            const MBlock *mb = &mf.blk[k];
+            u32 i, e = mb->first + mb->n;
+            for (i = mb->first; i < e; i++) {
+                const MIns *m = &mf.ins[i];
+                if (!(m->op == X_MOV && m->d != NOREG && m->s0 != NOREG && loc_of(m->d) == loc_of(m->s0)) &&
+                    !(m->op == X_JMP && i + 1 == e))
+                    break;
+            }
+            if (i == e) {
+                k = mb->n && mf.ins[e - 1].op == X_JMP ? (u32)mf.ins[e - 1].imm : k + 1;
+                continue;
+            }
+        }
+        if (!jt_node(k, k != root, &l, &w2, &c, &cc, &t, &fl) || l != loc || w2 != w)
+            return k;
+        k = jt_holds(cc, v, c) ? t : fl;
+    }
+    return JT_NONE;
+}
+
+static void jt_plan(void)
+{
+    static int off = -1;
+    /* comparisons in the tree, at least (MCC_JTMIN=N). Cases at random on a Xeon (their bodies made selects, so two
+       or three cases a comparison): the table is 12 % faster than a tree of 7 comparisons, 6 to 13 % slower than one
+       of 5 or 3; cases in a fixed order (bench.c interp: 15 comparisons) and mcc itself run the same either way */
+    static u32 jt_min = 7;
+    u32 k, n, *stack, *seen, nstamp = 0;
+    u8 *child;
+    njtab = 0;
+    free(jt_of);
+    free(jt_dead);
+    jt_of = 0;
+    jt_dead = 0;
+    if (off < 0) {
+        off = getenv("MCC_NOJTAB") != 0;
+        if (getenv("MCC_JTMIN"))
+            jt_min = (u32)atoi(getenv("MCC_JTMIN"));
+    }
+    if (off || mf.nblk < 6 || opt_level < 2)
+        return;
+    for (n = 0; n < mf.n; n++)
+        if (mf.ins[n].op == X_ASM)
+            return; /* (the assembler keeps places in the text: nothing moves, see relax) */
+    child = (u8 *)xmalloc(mf.nblk);
+    memset(child, 0, mf.nblk);
+    stack = (u32 *)xmalloc(mf.nblk * sizeof(u32));
+    seen = (u32 *)xmalloc(mf.nblk * sizeof(u32));
+    memset(seen, 0, mf.nblk * sizeof(u32));
+    /* the blocks that another comparison of the same location leads to are not roots */
+    for (k = 0; k < mf.nblk; k++) {
+        u32 loc, t[2], l2, t2, f2, j;
+        int w, w2, cc;
+        i64 c;
+        if (!jt_node(k, 0, &loc, &w, &c, &cc, &t[0], &t[1]))
+            continue;
+        for (j = 0; j < 2; j++)
+            if (t[j] < mf.nblk && t[j] != k && jt_node(t[j], 1, &l2, &w2, &c, &cc, &t2, &f2) && l2 == loc && w2 == w)
+                child[t[j]] = 1;
+    }
+    for (k = 0; k < mf.nblk; k++) {
+        u32 loc, t, fl, sp = 0, nodes = 0, ncut, i, below, above, *tg;
+        int w, cc, sgn = 0, uns = 0, ok = 1;
+        i64 c, lo = 0, hi = 0, v;
+        JTab *jt;
+        if (child[k] || !(ncut = jt_node(k, 0, &loc, &w, &c, &cc, &t, &fl)))
+            continue;
+        /* the tree: its constants, and whether it compares as signed or as unsigned values */
+        nstamp++;
+        stack[sp++] = k;
+        seen[k] = nstamp;
+        while (sp && ok) {
+            u32 b = stack[--sp], l2, j, tt[2];
+            int w2;
+            if (!jt_node(b, b != k, &l2, &w2, &c, &cc, &tt[0], &tt[1]) || l2 != loc || w2 != w)
+                continue; /* a way out */
+            sgn |= cc == CC_L || cc == CC_GE || cc == CC_LE || cc == CC_G;
+            uns |= cc == CC_B || cc == CC_AE || cc == CC_BE || cc == CC_A;
+            if (!nodes || c < lo)
+                lo = c;
+            if (!nodes || c > hi)
+                hi = c;
+            if (++nodes > 200)
+                ok = 0;
+            for (j = 0; j < 2; j++) {
+                if (tt[j] >= mf.nblk)
+                    ok = 0;
+                else if (seen[tt[j]] != nstamp) {
+                    seen[tt[j]] = nstamp;
+                    stack[sp++] = tt[j];
+                }
+            }
+        }
+        /* unsigned: as numbers from 0 up, so the constants must be ones that are the same either way */
+        if (!ok || nodes < jt_min || (sgn && uns) || (uns && lo < 0) || hi - lo >= 1024 || hi - lo + 1 > (i64)nodes * 6 ||
+            lo < -0x7fffffffL || hi > 0x7ffffff0L || (!w && uns && hi >= 0x7fffffffL))
+            continue;
+        n = (u32)(hi - lo + 1);
+        tg = (u32 *)xmalloc(n * sizeof(u32));
+        for (i = 0, v = lo; i < n && ok; i++, v++)
+            ok = (tg[i] = jt_dest(k, loc, w, v)) != JT_NONE;
+        above = jt_dest(k, loc, w, hi + 1);
+        below = uns && lo == 0 ? above : jt_dest(k, loc, w, lo - 1);
+        if (getenv("MCC_JTLOG"))
+            fprintf(stderr, "jtab: root %lu lo %ld n %lu nodes %lu below %lu (n %lu) above %lu (n %lu) ok %d\n", (unsigned long)k, (long)lo, (unsigned long)n,
+                    (unsigned long)nodes, (unsigned long)below, below < mf.nblk ? (unsigned long)mf.blk[below].n : 0, (unsigned long)above,
+                    above < mf.nblk ? (unsigned long)mf.blk[above].n : 0, ok);
+        if (!ok || above == JT_NONE || below == JT_NONE) {
+            free(tg);
+            continue;
+        }
+        /* a place that reads the flags as it is come to wants the comparison before it */
+        for (i = 0; i < n + 2 && ok; i++) {
+            u32 d = i < n ? tg[i] : i == n ? above : below;
+            const MBlock *db = &mf.blk[d];
+            if (db->n && (mf.ins[db->first].op == X_JCC || mf.ins[db->first].op == X_SETCC || mf.ins[db->first].op == X_CMOV ||
+                          mf.ins[db->first].op == X_FSEL))
+                ok = 0;
+        }
+        if (!ok) {
+            free(tg);
+            continue;
+        }
+        if (njtab == capjtab) {
+            capjtab = capjtab ? capjtab * 2 : 8;
+            jtabs = (JTab *)xrealloc(jtabs, capjtab * sizeof(JTab));
+        }
+        jt = &jtabs[njtab++];
+        jt->root = k;
+        jt->loc = loc;
+        jt->n = n;
+        jt->ncut = ncut;
+        jt->tgt = tg;
+        jt->below = below == above ? JT_NONE : below;
+        jt->above = above;
+        jt->lo = lo;
+        jt->w = w;
+        jt->uns = uns;
+        jt->lea_off = 0;
+    }
+    if (njtab) {
+        /* what is still reached: the inner blocks of the trees that are not, are not written */
+        u32 sp = 0;
+        jt_of = (u32 *)xmalloc(mf.nblk * sizeof(u32));
+        memset(jt_of, 0, mf.nblk * sizeof(u32));
+        for (k = 0; k < njtab; k++)
+            jt_of[jtabs[k].root] = k + 1;
+        jt_dead = (u8 *)xmalloc(mf.nblk);
+        memset(jt_dead, 1, mf.nblk);
+#define JT_REACH(x) \
+    if ((x) < mf.nblk && jt_dead[x]) { \
+        jt_dead[x] = 0; \
+        stack[sp++] = (x); \
+    }
+        JT_REACH(0)
+        while (sp) {
+            u32 b = stack[--sp], i, end = mf.blk[b].first + mf.blk[b].n;
+            const JTab *jt = jt_of[b] ? &jtabs[jt_of[b] - 1] : 0;
+            if (jt) {
+                end -= jt->ncut;
+                for (i = 0; i < jt->n; i++)
+                    JT_REACH(jt->tgt[i])
+                JT_REACH(jt->above)
+                if (jt->below != JT_NONE)
+                    JT_REACH(jt->below)
+            } else {
+                for (i = 0; i < mf.blk[b].nsucc; i++)
+                    JT_REACH(mf.blk[b].succ[i])
+                if (b + 1 < mf.nblk && (!mf.blk[b].n || (mf.ins[end - 1].op != X_JMP && mf.ins[end - 1].op != X_RET && mf.ins[end - 1].op != X_TAIL)))
+                    JT_REACH(b + 1)
+            }
+            for (i = mf.blk[b].first; i < end; i++)
+                if (mf.ins[i].op == X_JCC || mf.ins[i].op == X_JMP)
+                    JT_REACH((u32)mf.ins[i].imm)
+        }
+#undef JT_REACH
+        /* (only a block that is nothing but a comparison is left out: what else is not reached stays as it was) */
+        for (k = 0; k < mf.nblk; k++)
+            if (jt_dead[k]) {
+                u32 loc, t, fl;
+                int w, cc;
+                i64 c;
+                if (!jt_node(k, 1, &loc, &w, &c, &cc, &t, &fl))
+                    jt_dead[k] = 0;
+            }
+    }
+    free(child);
+    free(stack);
+    free(seen);
+}
+
+/* The end of a root: the value less the least constant as an index, the values outside sent where the tree sent
+   them, and the jump. r10 and r11 are free here (no instruction is under way). */
+static void jt_emit(JTab *jt)
+{
+    if (jt->below != JT_NONE) {
+        EA ea;
+        int small = jt->lo >= -128 && jt->lo <= 127;
+        if (is_spill(jt->loc)) {
+            ea_spill(&ea, jt->loc);
+            op_mem(small ? 0x83 : 0x81, jt->w, 7, &ea, small ? 1 : 4);
+        } else {
+            op_rr(small ? 0x83 : 0x81, jt->w, 7, jt->loc);
+        }
+        if (small)
+            b1((u32)jt->lo);
+        else
+            b4((u32)jt->lo);
+        b1(0x0f);
+        b1(0x80 | (jt->uns ? CC_B : CC_L));
+        add_fixup(jt->below, FK_JCC);
+    }
+    op_loc(0x8b, jt->w, SCR0, jt->loc); /* (32 bits: the upper half cleared) */
+    if (jt->lo) {
+        op_rr(0x81, jt->w, 0, SCR0); /* add */
+        b4((u32)(0 - jt->lo));
+    }
+    op_rr(0x81, jt->w, 7, SCR0); /* cmp */
+    b4(jt->n - 1);
+    b1(0x0f);
+    b1(0x80 | CC_A);
+    add_fixup(jt->above, FK_JCC);
+    b1(0x4c); /* lea table(%rip), %r11 */
+    b1(0x8d);
+    b1(0x1d);
+    jt->lea_off = (u32)text->len;
+    b4(0);
+    b1(0x4f); /* movslq (%r11,%r10,4), %r10 */
+    b1(0x63);
+    b1(0x14);
+    b1(0x93);
+    b1(0x4d); /* add %r11, %r10 */
+    b1(0x01);
+    b1(0xda);
+    b1(0x41); /* jmp *%r10 */
+    b1(0xff);
+    b1(0xe2);
+}
+
+/* After relax: the tables, behind the code. */
+static void jt_tables(const u32 *blk_off)
+{
+    u32 k, i;
+    for (k = 0; k < njtab; k++) {
+        JTab *jt = &jtabs[k];
+        u32 tab;
+        while (text->len & 3)
+            b1(0xcc);
+        tab = (u32)text->len;
+        put_u32le(text->p + jt->lea_off, tab - (jt->lea_off + 4));
+        for (i = 0; i < jt->n; i++)
+            b4(blk_off[jt->tgt[i]] - tab);
+        free(jt->tgt);
+        jt->tgt = 0;
+    }
+    njtab = 0;
+}
+
 static int opt_nojj = -1; /* MCC_NOJJ: jumps to a jump stay */
 static int opt_nojccj = -1;
 
@@ -6305,6 +6708,12 @@ static void relax(u32 *blk_off, u32 first_rel, int fixed)
                 bi++;
             moff[k] -= cut[bi];
         }
+    for (k = 0, bi = 0; k < njtab; k++) {
+        while (bi < nfixups && fx_start(&fixups[bi]) < jtabs[k].lea_off)
+            bi++;
+        jtabs[k].lea_off -= cut[bi];
+    }
+    memcpy(blk_off, nb, mf.nblk * sizeof(u32)); /* (jt_tables: where the blocks are now) */
     free(cut);
     free(nb);
 }
@@ -7515,6 +7924,56 @@ static int split_loops(void)
    VEX instruction has one if evex_form knows it, and not when a fourth register rides in its immediate byte
    (vblendvps). The legacy 128-bit vector code, the VEX gathers (three registers that must differ, a vector mask)
    and inline assembly keep to xmm0-xmm15. */
+/* Caller-saved registers across calls. A value alive across a call has a callee-saved register, and the function
+   saves and restores that register every time it is entered, though the call may be on a way seldom taken (a table
+   grown when it is full, a recursion past the usual quick answer). When the calls are rare beside the entries, such
+   values get caller-saved registers instead and are saved round each call (ra.c's cs_mode): allocated both ways,
+   and kept if saving round the calls, by the blocks' guessed frequencies, costs less than the saves and restores
+   it spares at entry and return. MCC_NOCSAVE: off; MCC_CSLOG: what was decided. */
+static int cs_cmp(const void *a, const void *b)
+{
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void cs_try(const MTarget *t)
+{
+    static int off = -1;
+    static u64 cs_margin = 100; /* per cent: the guess of the calls' cost counts for that much (MCC_CSMARGIN=N) */
+    u64 callee = ~t->caller_saved & t->allocatable[0], entry, c0, c1;
+    u32 k, k0 = 0, k1 = 0;
+    if (off < 0) {
+        off = getenv("MCC_NOCSAVE") != 0;
+        if (getenv("MCC_CSMARGIN"))
+            cs_margin = (u64)atoi(getenv("MCC_CSMARGIN"));
+    }
+    if (off || opt_level < 2 || opt_size || !mf.nblk || mf.blk[0].freq < 2 || !mf.cs_cost)
+        return;
+    for (k = 0; k < mf.n; k++)
+        if (mf.ins[k].op == X_ASM)
+            return;
+    for (k = 0; k < 16; k++)
+        k0 += (u32)(mf.used & callee) >> k & 1;
+    if (!k0)
+        return;
+    entry = 2 * (u64)mf.blk[0].freq;
+    c0 = mf.cs_cost;
+    if (c0 >= entry * k0)
+        return; /* (the calls are no rarer than that: nothing to gain) */
+    mf.cs_mode = 1;
+    ra_rerun(&mf, t);
+    for (k = 0; k < 16; k++)
+        k1 += (u32)(mf.used & callee) >> k & 1;
+    c1 = mf.cs_cost;
+    if (getenv("MCC_CSLOG"))
+        fprintf(stderr, "csave %s: %lu callee-saved registers -> %lu, round the calls %lu against %lu at entry\n", f->name ? f->name : "?",
+                (unsigned long)k0, (unsigned long)k1, (unsigned long)c1, (unsigned long)(entry * (k0 - (k1 < k0 ? k1 : k0))));
+    if (k1 >= k0 || c1 * cs_margin / 100 >= entry * (k0 - k1)) {
+        mf.cs_mode = 0;
+        ra_rerun(&mf, t);
+    }
+}
+
 static int x16_enc_ok(u32 enc)
 {
     return XE_Z(enc) || evex_form(XE_MAP(enc), XE_PP(enc), XE_OPC(enc));
@@ -7601,7 +8060,9 @@ void x64_gen(Func *fn, Obj *o)
             t.allocatable[1] |= XHI_MASK;
             t.ext_first = 1;
         }
+        mf.cs_mode = 0;
         ra_run(&mf, &t);
+        cs_try(&t);
         if (x16 == 1 && (nsp = x16_spilled()) != 0) {
             /* xmm0-xmm12 were not enough: again with xmm16-xmm31, which the registers that may be there take first
                (the others then find room below; an EVEX encoding is two bytes longer, so only functions that spill
@@ -7756,12 +8217,22 @@ void x64_gen(Func *fn, Obj *o)
         capmoff = mf.n + 1;
         moff = (u32 *)xrealloc(moff, capmoff * sizeof(u32));
     }
+    if (mf.cs_n)
+        qsort(mf.cs_list, mf.cs_n / 3, 3 * sizeof(u32), cs_cmp);
+    jt_plan();
     for (k = 0; k < mf.nblk; k++) {
         MBlock *mb = &mf.blk[k];
+        u32 lim = mb->first + mb->n;
         blk_off[k] = (u32)text->len;
         sp_loc = NOREG; /* a branch may come here */
         zf_end = 0xffffffffU;
-        for (n = mb->first; n < mb->first + mb->n; n++) {
+        if (njtab && (jt_dead[k] || jt_of[k])) {
+            /* an inner block of a switch's tree is not written; its root ends with the jump through the table */
+            lim = jt_dead[k] ? mb->first : lim - jtabs[jt_of[k] - 1].ncut;
+            for (n = lim; opt_debug && n < mb->first + mb->n; n++)
+                moff[n] = 0xffffffffU; /* (set below: where the next instruction that is written begins) */
+        }
+        for (n = mb->first; n < lim; n++) {
             if (mf.ins[n].op == X_ASM)
                 has_asm = 1;
             if (opt_debug) {
@@ -7772,13 +8243,48 @@ void x64_gen(Func *fn, Obj *o)
                 }
             }
             ins_start = (u32)text->len;
+            if (mf.cs_n && (mf.ins[n].flags & MF_CALL) && mf.ins[n].op != X_TAIL) {
+                /* the caller-saved registers alive across this call: to their slots, and back after it */
+                u32 lo = 0, hi = mf.cs_n / 3, c;
+                EA ea;
+                while (lo < hi) {
+                    u32 mid = (lo + hi) / 2;
+                    if (mf.cs_list[3 * mid] < n)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+                for (c = lo; c < mf.cs_n / 3 && mf.cs_list[3 * c] == n; c++) {
+                    ea_spill(&ea, SPILL0 + mf.cs_list[3 * c + 2]);
+                    store_reg(mf.cs_list[3 * c + 1], &ea);
+                }
+                ins_start = (u32)text->len;
+                encode(&mf.ins[n]);
+                text = &o->sec[arm64_text_sec];
+                for (c = lo; c < mf.cs_n / 3 && mf.cs_list[3 * c] == n; c++) {
+                    ea_spill(&ea, SPILL0 + mf.cs_list[3 * c + 2]);
+                    load_reg(mf.cs_list[3 * c + 1], &ea);
+                }
+                continue;
+            }
             encode(&mf.ins[n]);
             text = &o->sec[arm64_text_sec];
         }
+        if (njtab && jt_of[k] && !jt_dead[k]) {
+            for (n = lim; opt_debug && n < mb->first + mb->n; n++)
+                moff[n] = (u32)text->len;
+            ins_start = (u32)text->len;
+            jt_emit(&jtabs[jt_of[k] - 1]);
+        }
     }
-    if (opt_debug)
+    if (opt_debug) {
         moff[mf.n] = (u32)text->len;
+        for (n = mf.n; n-- > 0;)
+            if (moff[n] == 0xffffffffU)
+                moff[n] = moff[n + 1];
+    }
     relax(blk_off, first_rel, has_asm);
+    jt_tables(blk_off);
     o->syms[f->sym].size = text->len - start;
     if (opt_debug)
         var_places(start);

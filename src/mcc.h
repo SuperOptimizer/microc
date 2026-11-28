@@ -16,6 +16,10 @@ typedef long i64;
 /* ---- util.c ---- */
 
 void die(const char *fmt, ...);
+/* getenv with the answers remembered by the address of the name: the switches read in inner loops (MCC_NO...) cost a
+   walk of the environment each time. The environment does not change while mcc runs. */
+char *mcc_getenv(const char *name);
+#define getenv mcc_getenv
 void *xmalloc(size_t n);
 void *xrealloc(void *p, size_t n);
 

@@ -2254,38 +2254,47 @@ static int uses_beyond(u32 b, u32 x, u32 skip)
 {
     Block *bb = &f->blk[b];
     u32 c, v, k, n, *ops, s[2];
-    int res = 0, side;
+    int good[2], side;
     if (f->nins > 200000)
         return 0;
     s[0] = bb->succ[0];
     s[1] = bb->succ[1];
-    for (side = 0; side < 2; side++) {
-        int good = s[side] != b && s[0] != s[1] && f->blk[s[side]].npreds == 1;
-        for (c = 1; c < f->nblk && good; c++) {
-            Block *cb = &f->blk[c];
-            if (cb->term == TERM_NONE)
+    for (side = 0; side < 2; side++)
+        good[side] = s[side] != b && s[0] != s[1] && f->blk[s[side]].npreds == 1;
+    /* (one walk for both sides: each reader of x strikes the sides it is not beyond) */
+#define UB_USE(blk) \
+    for (side = 0; side < 2; side++) \
+        if (good[side] && !only_through(blk, s[side])) \
+            good[side] = 0;
+    for (c = 1; c < f->nblk && (good[0] || good[1]); c++) {
+        Block *cb = &f->blk[c];
+        if (cb->term == TERM_NONE)
+            continue;
+        for (v = cb->phis; v; v = f->ins[v].next)
+            for (k = 0; k < f->ins[v].b; k++)
+                if (ir_resolve(f, f->xargs[f->ins[v].a + k]) == x) {
+                    if (v == x)
+                        good[0] = good[1] = 0;
+                    else
+                        UB_USE(cb->preds[k])
+                }
+        for (v = cb->first; v; v = f->ins[v].next) {
+            int r = 0;
+            if (v == skip)
                 continue;
-            for (v = cb->phis; v && good; v = f->ins[v].next)
-                for (k = 0; k < f->ins[v].b && good; k++)
-                    if (ir_resolve(f, f->xargs[f->ins[v].a + k]) == x && (v == x || !only_through(cb->preds[k], s[side])))
-                        good = 0;
-            for (v = cb->first; v && good; v = f->ins[v].next) {
-                if (v == skip)
-                    continue;
-                IR_OPS(f, &f->ins[v], ops, n);
-                for (k = 0; k < n && good; k++)
-                    if (ir_resolve(f, ops[k]) == x && !only_through(c, s[side]))
-                        good = 0;
-                if (f->ins[v].op == OP_CALL && ir_resolve(f, f->ins[v].c) == x && !only_through(c, s[side]))
-                    good = 0;
-            }
-            if (good && cb->arg && ir_resolve(f, cb->arg) == x && !only_through(c, s[side]))
-                good = 0;
+            IR_OPS(f, &f->ins[v], ops, n);
+            for (k = 0; k < n; k++)
+                r |= ir_resolve(f, ops[k]) == x;
+            if (f->ins[v].op == OP_CALL)
+                r |= ir_resolve(f, f->ins[v].c) == x;
+            if (r)
+                UB_USE(c)
         }
-        if (good)
-            res |= 1 << side;
+        if (cb->arg && ir_resolve(f, cb->arg) == x)
+            UB_USE(c)
     }
-    return res;
+#undef UB_USE
+    return good[0] | good[1] << 1;
 }
 
 /* The phis of block b other than p: bit s set when all their uses are beyond successor s of b (reached only through

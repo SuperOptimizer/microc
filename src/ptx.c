@@ -3105,13 +3105,14 @@ static int moves_early(const u8 *live, u32 b, u32 s, u32 t)
     static int mvjoin = -1, mvphi = -1;
     if (mvjoin < 0) {
         mvjoin = getenv("MCC_LATCHNUM") ? 1 << 30 : getenv("MCC_MVJOIN") ? atoi(getenv("MCC_MVJOIN")) : 8;
-        mvphi = getenv("MCC_MVPHI") ? atoi(getenv("MCC_MVPHI")) : 16;
+        mvphi = getenv("MCC_MVPHI") ? atoi(getenv("MCC_MVPHI")) : 0;
     }
     if (s > b || t == s || !sb->phis)
         return 0;
     if (sb->npreds >= (u32)mvjoin && !opt_dominates(s, b)) {
-        /* (and only a wide one: at least MCC_MVPHI phis, default 16 (conv1's 32 sums); k_entropy's 17-way join of a few
-           values kept its early moves: its SASS is the pin's) */
+        /* MCC_MVPHI=N (opt-in; default 0: every such join, as before): only a wide one, at least N used phis (16 for
+           conv1's 32 sums), so that k_entropy's 17-way join of a few values keeps its early moves. Untimed: with 16 it
+           changes 21 of ufsm's 132 units' PTX (lp_mx_conv1, the f4 / f8 wgrad family, lp_s2, nn_vwt_fast ...) */
         u32 np = 0, q;
         for (q = sb->phis; q; q = f->ins[q].next)
             np += used[q] != 0;
